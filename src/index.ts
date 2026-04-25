@@ -50,6 +50,13 @@ export {
   loadConfigFromEnv,
   loadConfigFromPluginCfg,
 } from "./config.js";
+export { loadConfig, type LoadedConfig } from "./load-config.js";
+export {
+  createAdapter,
+  type CreatedAdapter,
+  type ForkLoaderOpts,
+  type ForkDispatchArgs,
+} from "./create-adapter.js";
 export type {
   AgentCatalogEntry,
   ApprovalMeta,

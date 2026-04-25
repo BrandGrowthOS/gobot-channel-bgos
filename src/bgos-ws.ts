@@ -127,7 +127,9 @@ export class BgosWs {
   async triggerBackfill(): Promise<void> {
     try {
       const { messages } = await this.api.inboundSince(this.lastSeenMessageId);
-      for (const m of messages) {
+      for (const raw of messages) {
+        const m = this.normalizeInbound(raw);
+        if (!m) continue;
         if (m.messageId > this.lastSeenMessageId) {
           this.lastSeenMessageId = m.messageId;
         }
