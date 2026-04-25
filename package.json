@@ -1,0 +1,42 @@
+{
+  "name": "gobot-channel-bgos",
+  "version": "0.1.0",
+  "description": "BGOS channel adapter for Gobot — WS + REST client, outbound modalities, pair CLI",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "type": "module",
+  "bin": {
+    "gobot-pair-bgos": "./dist/pair-cli.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node scripts/finalize-daemon.mjs",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "tsc --noEmit -p tsconfig.json"
+  },
+  "keywords": [
+    "gobot",
+    "gobot-channel",
+    "bgos"
+  ],
+  "author": "BrandGrowthOS",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/BrandGrowthOS/gobot-channel-bgos"
+  },
+  "dependencies": {
+    "axios": "^1.13.2",
+    "socket.io-client": "^4.8.1",
+    "zod": "^4.3.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.5",
+    "typescript": "^5.7.3",
+    "vitest": "^2.1.8"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ]
+}
