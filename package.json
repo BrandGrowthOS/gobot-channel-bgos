@@ -1,6 +1,6 @@
 {
   "name": "gobot-channel-bgos",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "description": "BGOS channel adapter for Gobot — WS + REST client, outbound modalities, pair CLI",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",

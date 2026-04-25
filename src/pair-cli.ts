@@ -41,6 +41,10 @@ export async function pairBgos(opts: PairCliOptions): Promise<PairResult> {
     code: opts.code,
     deviceLabel: label,
     agentCatalog: opts.agentCatalog,
+    // Tag the pairing so it lands under the Gobot card (and assistants
+    // get created with code='gobot'). Without this, the backend defaults
+    // to 'openclaw' and the pairing surfaces in the wrong card.
+    integration: "gobot",
   });
 
   const secretsDir =

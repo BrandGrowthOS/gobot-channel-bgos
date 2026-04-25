@@ -76,6 +76,13 @@ export class BgosApi {
       code: string;
       deviceLabel: string;
       agentCatalog?: AgentCatalogEntry[];
+      /**
+       * Channel label persisted on the pairing row. MUST be `'gobot'` for
+       * Gobot pairings — without it, the backend falls back to `'openclaw'`
+       * and the pairing surfaces under the OpenClaw card with assistants
+       * created as code='openclaw' (wrong UI gates, wrong slash picker).
+       */
+      integration?: string;
     },
   ): Promise<PairExchangeResponse> {
     const base = baseUrl.replace(/\/+$/, "") + "/api/v1";
