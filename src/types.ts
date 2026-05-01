@@ -126,6 +126,15 @@ export interface OutboundMessagePayload {
     fileData?: string; // inline base64 (<500 KB path)
     s3Key?: string; // presigned-put path
   }>;
+  /**
+   * When set, the backend stores `messages.reply_to_id = replyToId` and the
+   * UI renders this as a quoted reply. REQUIRED in agent-to-agent (a2a)
+   * side-thread chats: the originator's pollForReply correlates the target's
+   * reply with the inbound peer message via this field. Without it the
+   * backend falls back to positional matching, which works for 1:1 side
+   * threads but is less precise.
+   */
+  replyToId?: number;
 }
 
 export interface CommandManifestEntry {
