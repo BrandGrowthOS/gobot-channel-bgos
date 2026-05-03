@@ -180,3 +180,69 @@ export interface BgosMessageEnvelope {
     createdAt: string;
   };
 }
+
+// ─── Peer (cross-channel agent-to-agent) types — see capabilities §11 ────────
+
+export type PeerSendStatus = "sent" | "requires_introduction";
+export type PeerTurnState = "expecting_reply" | "more_coming" | "final";
+
+export interface PeerEntry {
+  assistantId: number;
+  name: string;
+  avatarUrl?: string | null;
+  color?: string | null;
+  /** True ONLY if the user has enabled this caller→target row in the BGOS
+   *  Agent Permissions matrix. False means `sendToPeer` will return
+   *  `requires_introduction`. */
+  introduced: boolean;
+  /** Non-null = ephemeral allow-once expiry. */
+  expiresAt?: string | null;
+}
+
+export interface PeerStatus {
+  online: boolean;
+  lastSeenAt: string | null;
+  hasOpenConversation: boolean;
+  conversationId: number | null;
+  turnHolderId: number | null;
+}
+
+export interface PeerSendInput {
+  /** Assistant id of the caller (this agent). Sent as `X-Caller-Assistant-Id`
+   *  header. */
+  callerAssistantId: number;
+  targetAssistantId: number;
+  text: string;
+  /** A message id in the caller's chat that the SideConversationCard
+   *  visually anchors against. Typically the id of a "Looping in <peer>..."
+   *  reply the caller posted just before this call. */
+  parentMessageId: number;
+  waitForReply?: boolean;
+  /** When `waitForReply=true`, server cap is 85s. Default 60s. */
+  timeoutSeconds?: number;
+  turnState?: PeerTurnState;
+}
+
+export interface PeerSendResult {
+  status: PeerSendStatus;
+  sideThreadChatId: number | null;
+  messageId: number | null;
+  conversationId: number | null;
+  turnState: PeerTurnState | null;
+  reply?: { id: number; text: string } | null;
+}
+
+export interface PeerCompleteThreadInput {
+  callerAssistantId: number;
+  peerAssistantId?: number;
+  parentMessageId?: number;
+  summary?: string;
+}
+
+export interface PeerInbox {
+  chats: Array<{
+    id: number;
+    assistantId: number;
+    kind: "main" | "a2a";
+  }>;
+}

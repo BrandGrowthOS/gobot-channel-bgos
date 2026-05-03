@@ -168,4 +168,122 @@ export class BgosApi {
     const r = await this.http.get("integrations/pairings");
     return r.data;
   }
+
+  // ─── Peer (cross-channel a2a) endpoints — see capabilities §11 ────────────
+  //
+  // Every peer call sends `X-Caller-Assistant-Id` IN ADDITION to the
+  // standard `X-BGOS-Pairing` header. Caller id is per-call so a single
+  // Gobot host can serve multiple bound assistants on the same pairing.
+
+  private peerHeaders(callerAssistantId: number): Record<string, string> {
+    return { "X-Caller-Assistant-Id": String(callerAssistantId) };
+  }
+
+  /** GET /peers — discovery. */
+  async listPeers(callerAssistantId: number): Promise<unknown[]> {
+    const r = await this.http.get("peers", {
+      headers: this.peerHeaders(callerAssistantId),
+    });
+    if (Array.isArray(r.data)) return r.data;
+    if (Array.isArray((r.data as { peers?: unknown[] })?.peers)) {
+      return (r.data as { peers: unknown[] }).peers;
+    }
+    return [];
+  }
+
+  /** GET /peers/:peerAssistantId/status — presence + open conversation. */
+  async peerStatus(
+    callerAssistantId: number,
+    peerAssistantId: number,
+  ): Promise<unknown> {
+    const r = await this.http.get(`peers/${peerAssistantId}/status`, {
+      headers: this.peerHeaders(callerAssistantId),
+    });
+    return r.data;
+  }
+
+  /** POST /peers/:targetAssistantId/send — send to peer.
+   *
+   *  Idempotency: do NOT retry on 504 / network timeout — the message is
+   *  already saved server-side. */
+  async sendToPeer(input: {
+    callerAssistantId: number;
+    targetAssistantId: number;
+    text: string;
+    parentMessageId: number;
+    waitForReply?: boolean;
+    timeoutSeconds?: number;
+    turnState?: "expecting_reply" | "more_coming" | "final";
+  }): Promise<unknown> {
+    const body: Record<string, unknown> = {
+      text: input.text,
+      parentMessageId: input.parentMessageId,
+      waitForReply: input.waitForReply ?? false,
+    };
+    if (input.timeoutSeconds !== undefined) {
+      body.timeoutSeconds = input.timeoutSeconds;
+    }
+    if (input.turnState !== undefined) {
+      body.turnState = input.turnState;
+    }
+    const r = await this.http.post(
+      `peers/${input.targetAssistantId}/send`,
+      body,
+      { headers: this.peerHeaders(input.callerAssistantId) },
+    );
+    return r.data;
+  }
+
+  /** POST /peers/conversations/close — close active conversation. */
+  async completePeerThread(input: {
+    callerAssistantId: number;
+    peerAssistantId: number;
+    summary?: string;
+  }): Promise<unknown> {
+    const body: Record<string, unknown> = {
+      peerAssistantId: input.peerAssistantId,
+    };
+    if (input.summary && input.summary.trim().length > 0) {
+      body.summary = input.summary.trim();
+    }
+    const r = await this.http.post("peers/conversations/close", body, {
+      headers: this.peerHeaders(input.callerAssistantId),
+    });
+    return r.data;
+  }
+
+  /** POST /peers/threads/:parentMessageId/complete — flip the
+   *  SideConversationCard to completed-collapsed. */
+  async completeSideThread(input: {
+    callerAssistantId: number;
+    parentMessageId: number;
+    summary: string;
+  }): Promise<unknown> {
+    const r = await this.http.post(
+      `peers/threads/${input.parentMessageId}/complete`,
+      { summary: input.summary },
+      { headers: this.peerHeaders(input.callerAssistantId) },
+    );
+    return r.data;
+  }
+
+  /** GET /peers/threads/:parentMessageId — fetch a side-thread. */
+  async getSideThread(
+    callerAssistantId: number,
+    parentMessageId: number,
+  ): Promise<unknown> {
+    const r = await this.http.get(`peers/threads/${parentMessageId}`, {
+      headers: this.peerHeaders(callerAssistantId),
+    });
+    return r.data;
+  }
+
+  /** GET /peers/inbox — list main + a2a chats where this assistant is the
+   *  recipient. */
+  async getPeerInbox(callerAssistantId: number): Promise<unknown> {
+    const r = await this.http.get("peers/inbox", {
+      headers: this.peerHeaders(callerAssistantId),
+    });
+    return r.data;
+  }
 }
