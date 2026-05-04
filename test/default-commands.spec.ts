@@ -1,7 +1,8 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
 
 import {
   DEFAULT_COMMANDS,
+  resolveCommandSeedMode,
   shouldSeedDefaults,
 } from "../src/default-commands.js";
 
@@ -46,7 +47,7 @@ describe("default-commands", () => {
   });
 
   describe("shouldSeedDefaults", () => {
-    it("returns true only when count is exactly 0", () => {
+    it("returns true only when count is exactly 0 (default mode=auto)", () => {
       expect(shouldSeedDefaults(0)).toBe(true);
     });
     it("returns false for any positive count", () => {
@@ -54,8 +55,53 @@ describe("default-commands", () => {
       expect(shouldSeedDefaults(7)).toBe(false);
       expect(shouldSeedDefaults(100)).toBe(false);
     });
-    it("returns false when count is undefined (older backend, can't tell — play safe)", () => {
+    it("returns false when count is undefined and mode=auto (older backend, conservative)", () => {
       expect(shouldSeedDefaults(undefined)).toBe(false);
+      expect(shouldSeedDefaults(undefined, "auto")).toBe(false);
+    });
+    it("mode=safe also seeds when count is undefined (covers older deploys)", () => {
+      expect(shouldSeedDefaults(undefined, "safe")).toBe(true);
+      expect(shouldSeedDefaults(0, "safe")).toBe(true);
+      expect(shouldSeedDefaults(3, "safe")).toBe(false);
+    });
+    it("mode=always seeds regardless of count (used by force-reseed flows)", () => {
+      expect(shouldSeedDefaults(undefined, "always")).toBe(true);
+      expect(shouldSeedDefaults(0, "always")).toBe(true);
+      expect(shouldSeedDefaults(7, "always")).toBe(true);
+    });
+    it("mode=never never seeds", () => {
+      expect(shouldSeedDefaults(undefined, "never")).toBe(false);
+      expect(shouldSeedDefaults(0, "never")).toBe(false);
+      expect(shouldSeedDefaults(7, "never")).toBe(false);
+    });
+  });
+
+  describe("resolveCommandSeedMode", () => {
+    const original = process.env.GOBOT_BGOS_RESEED_COMMANDS;
+    beforeEach(() => {
+      delete process.env.GOBOT_BGOS_RESEED_COMMANDS;
+    });
+    afterEach(() => {
+      if (original === undefined) {
+        delete process.env.GOBOT_BGOS_RESEED_COMMANDS;
+      } else {
+        process.env.GOBOT_BGOS_RESEED_COMMANDS = original;
+      }
+    });
+    it("defaults to auto when unset", () => {
+      expect(resolveCommandSeedMode()).toBe("auto");
+    });
+    it("accepts the four valid modes (case-insensitive)", () => {
+      process.env.GOBOT_BGOS_RESEED_COMMANDS = "SAFE";
+      expect(resolveCommandSeedMode()).toBe("safe");
+      process.env.GOBOT_BGOS_RESEED_COMMANDS = "always";
+      expect(resolveCommandSeedMode()).toBe("always");
+      process.env.GOBOT_BGOS_RESEED_COMMANDS = "Never";
+      expect(resolveCommandSeedMode()).toBe("never");
+    });
+    it("falls back to auto on invalid values (logged warning)", () => {
+      process.env.GOBOT_BGOS_RESEED_COMMANDS = "yolo";
+      expect(resolveCommandSeedMode()).toBe("auto");
     });
   });
 });

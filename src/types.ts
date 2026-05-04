@@ -107,6 +107,34 @@ export interface ApprovalMeta {
   expired?: boolean;
 }
 
+/**
+ * Inline agent identity. When present, the backend resolves it to
+ * `messages.from_agent_inline` (or `from_agent_peer_id` if `peerId`/
+ * `assistantId` matches a peer in the registry) and the BGOS frontend
+ * renders the bubble with this name + color + avatar instead of the
+ * bound assistant's identity.
+ *
+ * Used by `/board` to render each agent's contribution as a visually
+ * distinct bubble even though they all originate from the single bound
+ * Gobot assistant. Mirrors `FromAgentInputDto` in the backend.
+ */
+export interface FromAgentInput {
+  /** AgentPeer.id from the BGOS registry (preferred when available). */
+  peerId?: number;
+  /** Source assistant id — for BGOS-native cross-assistant peers. */
+  assistantId?: number;
+  /** Stable string id (max 128 chars) used to look up the peer. */
+  externalId?: string;
+  /** Display name (inline fallback). Max 80 chars. */
+  name?: string;
+  /** Bubble accent color, hex e.g. "#0EA5E9". */
+  color?: string;
+  /** Avatar URL (https only). Max 2048 chars. */
+  avatarUrl?: string;
+  /** Agent type. `[a-z0-9_-]+`, max 32 chars. */
+  type?: "n8n" | "bgos" | "external" | "gobot" | string;
+}
+
 /** Outbound message payload we POST to /api/v1/messages. */
 export interface OutboundMessagePayload {
   assistantId: number;
@@ -135,6 +163,15 @@ export interface OutboundMessagePayload {
    * threads but is less precise.
    */
   replyToId?: number;
+  /**
+   * Inline-agent identity override. When set, the backend's
+   * agent-peer resolver maps it to `messages.from_agent_peer_id` (registry
+   * hit) or `messages.from_agent_inline` (free-form), and the BGOS UI
+   * renders the bubble with the supplied name/avatar/color. Required for
+   * Gobot's `/board` flow so each agent's contribution shows as its own
+   * sender even though they share one bound assistant.
+   */
+  fromAgent?: FromAgentInput;
 }
 
 export interface CommandManifestEntry {

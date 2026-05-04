@@ -1,12 +1,14 @@
 // Post-build: ensure the bin entries are executable.
 //
-// This package ships a single bin (`gobot-pair-bgos` → `dist/pair-cli.js`).
+// This package ships two bins:
+//   - `gobot-pair-bgos`              → `dist/pair-cli.js`
+//   - `gobot-bgos-reseed-commands`   → `dist/reseed-cli.js`
 // Node strips the shebang on TS compile, so we re-add it here and chmod
-// the file. chmod is best-effort on Windows where the bit is meaningless.
+// the files. chmod is best-effort on Windows where the bit is meaningless.
 import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 
-const BIN_FILES = ["dist/pair-cli.js"];
+const BIN_FILES = ["dist/pair-cli.js", "dist/reseed-cli.js"];
 
 let exitCode = 0;
 for (const rel of BIN_FILES) {
