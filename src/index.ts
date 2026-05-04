@@ -18,8 +18,17 @@ export { BgosOutbound, BGOSOutbound } from "./outbound.js";
 export { BGOS_AGENT_HINTS, buildSystemPromptWithHints } from "./agent-hints.js";
 export {
   DEFAULT_COMMANDS,
+  resolveCommandSeedMode,
   shouldSeedDefaults,
+  type CommandSeedMode,
 } from "./default-commands.js";
+export {
+  BgosProactiveClient,
+  type ProactiveClientInit,
+  type ProactiveSendParams,
+  type ProactiveSendResult,
+} from "./proactive.js";
+export { runReseedCli } from "./reseed-cli.js";
 export {
   resolveHomeChannel,
   type HomeChannel,
@@ -66,6 +75,7 @@ export type {
   ChatMessage,
   CommandManifestEntry,
   CommandsUpdatedPayload,
+  FromAgentInput,
   InboundFile,
   InboundMessagePayload,
   IntegrationDirection,

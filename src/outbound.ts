@@ -2,6 +2,7 @@ import type { BgosApi } from "./bgos-api.js";
 import { publishMediaPath } from "./attachment-bridge.js";
 import type {
   ApprovalMeta,
+  FromAgentInput,
   MessageOption,
   OutboundMessagePayload,
 } from "./types.js";
@@ -52,6 +53,7 @@ export class BgosOutbound {
     assistantId: number;
     chatId: number;
     text: string;
+    fromAgent?: FromAgentInput;
   }): Promise<{ id: number }> {
     const payload: OutboundMessagePayload = {
       assistantId: params.assistantId,
@@ -59,6 +61,48 @@ export class BgosOutbound {
       sender: "assistant",
       text: params.text,
       messageType: "standard",
+      ...(params.fromAgent ? { fromAgent: params.fromAgent } : {}),
+    };
+    return this.api.postMessage(payload);
+  }
+
+  /**
+   * Send a text message stamped with an inline-agent identity.
+   *
+   * Each call produces a distinct bubble in the BGOS UI labeled with the
+   * supplied name / color / avatar — used by Gobot's `/board` so the
+   * Research, Finance, Strategy, etc. agents each render as their own
+   * sender even though they share one bound assistant.
+   *
+   * The backend's hybrid resolver tries `peerId` (registry id) →
+   * `assistantId` (cross-assistant peer) → `externalId` (string lookup),
+   * falling back to inline `{name,color,avatarUrl}` when no peer is found.
+   * For Gobot, pass `name` + `color` (and optionally `avatarUrl`) — the
+   * inline path is what we need.
+   */
+  sendAsAgent(params: {
+    assistantId: number;
+    chatId: number;
+    text: string;
+    agent: FromAgentInput;
+    options?: MessageOption[];
+  }): Promise<{ id: number }> {
+    if (
+      params.options !== undefined &&
+      params.options.length > INLINE_OPTION_LIMIT
+    ) {
+      throw new Error(
+        `sendAsAgent: ${params.options.length} options exceeds inline limit (${INLINE_OPTION_LIMIT})`,
+      );
+    }
+    const payload: OutboundMessagePayload = {
+      assistantId: params.assistantId,
+      chatId: params.chatId,
+      sender: "assistant",
+      text: params.text,
+      messageType: "standard",
+      fromAgent: params.agent,
+      ...(params.options ? { options: params.options } : {}),
     };
     return this.api.postMessage(payload);
   }

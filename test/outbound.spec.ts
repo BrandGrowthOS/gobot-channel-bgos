@@ -170,4 +170,64 @@ describe("BgosOutbound (Gobot)", () => {
       out.sendTyping({ assistantId: 1, chatId: 2 }),
     ).resolves.toBeUndefined();
   });
+
+  it("sendAsAgent stamps fromAgent on the outbound payload", async () => {
+    server.stage("POST", "/api/v1/messages", 201, { id: 16 });
+    const out = new BgosOutbound(makeApi(baseUrl));
+    await out.sendAsAgent({
+      assistantId: 1,
+      chatId: 2,
+      text: "From research perspective, ARR is up 23%.",
+      agent: {
+        name: "Research",
+        color: "#0EA5E9",
+        avatarUrl: "https://example.com/research.png",
+        type: "gobot",
+      },
+    });
+    const body = server.requests.at(-1)!.body as Record<string, unknown>;
+    expect(body.messageType).toBe("standard");
+    expect(body.sender).toBe("assistant");
+    expect(body.fromAgent).toEqual({
+      name: "Research",
+      color: "#0EA5E9",
+      avatarUrl: "https://example.com/research.png",
+      type: "gobot",
+    });
+  });
+
+  it("sendText with fromAgent is also stamped (proactive agent-tagged sends)", async () => {
+    server.stage("POST", "/api/v1/messages", 201, { id: 17 });
+    const out = new BgosOutbound(makeApi(baseUrl));
+    await out.sendText({
+      assistantId: 1,
+      chatId: 2,
+      text: "morning briefing",
+      fromAgent: { name: "Briefing", color: "#FFD900", type: "gobot" },
+    });
+    const body = server.requests.at(-1)!.body as Record<string, unknown>;
+    expect(body.fromAgent).toMatchObject({
+      name: "Briefing",
+      color: "#FFD900",
+      type: "gobot",
+    });
+  });
+
+  it("sendAsAgent rejects > 6 options synchronously", () => {
+    const out = new BgosOutbound(makeApi(baseUrl));
+    const tooMany = Array.from({ length: 7 }, (_, i) => ({
+      text: `Opt ${i}`,
+      callbackData: `opt:${i}`,
+    }));
+    expect(() =>
+      out.sendAsAgent({
+        assistantId: 1,
+        chatId: 2,
+        text: "agent says",
+        agent: { name: "X" },
+        options: tooMany,
+      }),
+    ).toThrow(/exceeds inline limit/);
+    expect(server.requests).toHaveLength(0);
+  });
 });

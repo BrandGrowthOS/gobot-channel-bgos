@@ -28,7 +28,9 @@ import { CommandsSync } from "./commands-sync.js";
 import { syncCatalog, type CatalogAgent } from "./catalog-sync.js";
 import {
   DEFAULT_COMMANDS,
+  resolveCommandSeedMode,
   shouldSeedDefaults,
+  type CommandSeedMode,
 } from "./default-commands.js";
 import {
   createInboundHandler,
@@ -65,6 +67,16 @@ export interface BgosConfig {
   /** Optional system-prompt prefix per agent_route. Adapter appends
    *  `BGOS_AGENT_HINTS` to whatever this returns at dispatch time. */
   getSystemPrompt?: (agentRoute: string) => string;
+  /**
+   * Override the default-commands seed strategy. Defaults to whatever
+   * `GOBOT_BGOS_RESEED_COMMANDS` resolves to (which itself defaults to
+   * `"auto"`).
+   *
+   * Use `"safe"` to also seed when the backend's `whoami` doesn't return
+   * `command_count` (older deploys), or `"always"` to force a reseed
+   * after fixing a stuck manifest.
+   */
+  commandSeedMode?: CommandSeedMode;
 }
 
 export class BGOSAdapter {
@@ -88,6 +100,7 @@ export class BGOSAdapter {
   private dispatch: DispatchFn | null = null;
   private catalog: CatalogAgent[];
   private getSystemPrompt: (route: string) => string;
+  private commandSeedModeOverride: CommandSeedMode | null = null;
   private pairingId: number | null = null;
   private pollTimer: NodeJS.Timeout | null = null;
   private started = false;
@@ -106,6 +119,12 @@ export class BGOSAdapter {
     const inputCfg = (input as BgosConfig | undefined) ?? {};
     this.catalog = inputCfg.agents ?? [];
     this.getSystemPrompt = inputCfg.getSystemPrompt ?? (() => "");
+    this.commandSeedModeOverride = inputCfg.commandSeedMode ?? null;
+  }
+
+  /** Resolve the effective seed mode — explicit override wins over env. */
+  private getCommandSeedMode(): CommandSeedMode {
+    return this.commandSeedModeOverride ?? resolveCommandSeedMode();
   }
 
   /** The fork calls this at boot to install Gobot's dispatch function.
@@ -141,6 +160,7 @@ export class BGOSAdapter {
     this.started = true;
 
     // 1. whoami — populate route map + capture pairing id
+    const seedMode = this.getCommandSeedMode();
     const emptyManifestAssistantIds: number[] = [];
     try {
       const me = await this.api.whoami();
@@ -149,10 +169,24 @@ export class BGOSAdapter {
         if (a.agent_route) {
           this.assistantToRoute.set(a.assistant_id, a.agent_route);
         }
-        if (shouldSeedDefaults(a.command_count)) {
+        if (shouldSeedDefaults(a.command_count, seedMode)) {
           emptyManifestAssistantIds.push(a.assistant_id);
         }
       }
+      // eslint-disable-next-line no-console
+      console.log(
+        "[gobot-channel-bgos] whoami complete",
+        {
+          assistantCount: me.assistants?.length ?? 0,
+          seedMode,
+          willSeed: emptyManifestAssistantIds.length,
+          assistants: (me.assistants ?? []).map((a) => ({
+            id: a.assistant_id,
+            route: a.agent_route,
+            commandCount: a.command_count,
+          })),
+        },
+      );
     } catch (err) {
       // eslint-disable-next-line no-console
       console.warn(
@@ -255,6 +289,56 @@ export class BGOSAdapter {
     } catch {
       /* swallow on shutdown — best effort */
     }
+  }
+
+  /**
+   * Force-replace the slash-command manifest with `DEFAULT_COMMANDS` for
+   * every bound assistant (or just the ones in `assistantIds`). Useful
+   * when the BGOS slash picker is missing commands and you need to reset
+   * without re-pairing.
+   *
+   * Idempotent — safe to call repeatedly. Returns the per-assistant
+   * outcome so callers can log / surface failures.
+   */
+  async reseedAllCommands(
+    assistantIds?: ReadonlyArray<number>,
+  ): Promise<Array<{ assistantId: number; ok: boolean; error?: string }>> {
+    let ids: number[] = assistantIds ? [...assistantIds] : [];
+    if (ids.length === 0) {
+      try {
+        const me = await this.api.whoami();
+        for (const a of me.assistants ?? []) {
+          ids.push(a.assistant_id);
+        }
+      } catch (err) {
+        return [
+          {
+            assistantId: -1,
+            ok: false,
+            error:
+              err instanceof Error ? err.message : String(err),
+          },
+        ];
+      }
+    }
+    const results: Array<{
+      assistantId: number;
+      ok: boolean;
+      error?: string;
+    }> = [];
+    for (const id of ids) {
+      try {
+        await this.api.putCommands(id, [...DEFAULT_COMMANDS]);
+        results.push({ assistantId: id, ok: true });
+      } catch (err) {
+        results.push({
+          assistantId: id,
+          ok: false,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    return results;
   }
 
   // -------------------------------------------------------------------
