@@ -1,0 +1,338 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Gobot ↔ BGOS — Slash commands, /board, proactive briefings</title>
+    <meta name="description" content="Visual demo of the gobot-channel-bgos fixes: slash picker seeded, /board renders per-agent identity bubbles, proactive briefings route via GOBOT_HOME_CHANNEL." />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="logo-dot"></span>
+        BrandGrowthOS
+        <span class="brand-divider">·</span>
+        <span class="brand-sub">Gobot integration demo</span>
+      </div>
+      <nav>
+        <a href="#fix-1">Slash picker</a>
+        <a href="#fix-2">/board fan-out</a>
+        <a href="#fix-3">Proactive briefings</a>
+        <a class="github" href="https://github.com/BrandGrowthOS/gobot-channel-bgos" target="_blank" rel="noopener">Source ↗</a>
+      </nav>
+    </header>
+
+    <main>
+      <section class="hero">
+        <h1>Three fixes, one paired Gobot.</h1>
+        <p class="lede">
+          Diagnose, before / after, and an interactive mock of how each fix
+          renders in the BGOS desktop app — so you can confirm the UX before
+          you ship the patch.
+        </p>
+        <div class="hero-pills">
+          <span class="pill"><span class="dot ok"></span>1 — Slash picker seeded</span>
+          <span class="pill"><span class="dot ok"></span>2 — /board per-agent identity</span>
+          <span class="pill"><span class="dot ok"></span>3 — Proactive routing via home channel</span>
+        </div>
+      </section>
+
+      <!-- ============================================================== -->
+      <!-- FIX 1: Slash commands -->
+      <!-- ============================================================== -->
+      <section class="fix" id="fix-1">
+        <div class="fix-head">
+          <span class="fix-num">01</span>
+          <h2>Slash picker — force-reseed when stuck</h2>
+          <p>
+            <code>shouldSeedDefaults()</code> only fires when
+            <code>command_count === 0</code>. On older BGOS deploys
+            <code>whoami</code> doesn't return the field at all → the seed
+            never runs, picker stays empty.
+          </p>
+        </div>
+
+        <div class="fix-grid">
+          <div class="card">
+            <header>Before</header>
+            <div class="bgos-window slim">
+              <div class="bgos-input">
+                <span class="bgos-input-slash">/</span>
+                <span class="bgos-input-cursor">|</span>
+              </div>
+              <div class="bgos-picker empty">
+                <div class="bgos-picker-empty-msg">No slash commands</div>
+                <div class="bgos-picker-empty-hint">Configure under Integrations → Assistant</div>
+              </div>
+            </div>
+          </div>
+          <div class="card">
+            <header>After</header>
+            <div class="bgos-window slim">
+              <div class="bgos-input">
+                <span class="bgos-input-slash">/</span>
+                <span class="bgos-input-cursor">|</span>
+              </div>
+              <ul class="bgos-picker" id="slashPicker">
+                <li><span class="cmd">/remember</span><span class="desc">Save a fact to memory</span></li>
+                <li><span class="cmd">/track</span><span class="desc">Track a new goal with optional deadline</span></li>
+                <li><span class="cmd">/done</span><span class="desc">Mark a goal as completed</span></li>
+                <li><span class="cmd">/forget</span><span class="desc">Forget a stored fact</span></li>
+                <li><span class="cmd">/cancel</span><span class="desc">Cancel an in-flight goal</span></li>
+                <li><span class="cmd">/critic</span><span class="desc">Ask the critic agent for a devil's advocate take</span></li>
+                <li><span class="cmd">/board</span><span class="desc">Run a multi-agent board meeting on a topic</span></li>
+              </ul>
+            </div>
+          </div>
+        </div>
+
+        <details class="fix-detail">
+          <summary>How the fix works</summary>
+          <pre class="code"><code><span class="c"># Before: shouldSeedDefaults(undefined) returns false → no seed.</span>
+<span class="c"># After: new GOBOT_BGOS_RESEED_COMMANDS env knob + a CLI you can run on demand.</span>
+
+<span class="k">$</span> npx gobot-bgos-reseed-commands
+✔ assistant=42 reseeded 7 commands
+✔ assistant=43 reseeded 7 commands
+
+<span class="c"># Or set in your launchd plist / VPS env:</span>
+<span class="k">$</span> GOBOT_BGOS_RESEED_COMMANDS=safe bun run src/bot.ts</code></pre>
+          <ul class="bullets">
+            <li><code>auto</code> — seed only when count is 0 <em>(default — safe for prod)</em></li>
+            <li><code>safe</code> — also seed when count is missing (covers older deploys)</li>
+            <li><code>always</code> — force every startup (emergency fix)</li>
+            <li><code>never</code> — manage exclusively from Integrations UI</li>
+          </ul>
+        </details>
+      </section>
+
+      <!-- ============================================================== -->
+      <!-- FIX 2: /board fan-out -->
+      <!-- ============================================================== -->
+      <section class="fix" id="fix-2">
+        <div class="fix-head">
+          <span class="fix-num">02</span>
+          <h2>/board — six agents, one bound assistant, six labeled bubbles</h2>
+          <p>
+            The fork's <code>runBoardMeeting</code> already fans out via
+            seven Telegram bot identities. In BGOS there's only one bound
+            assistant — but the backend already supports
+            <code>from_agent_inline</code>. We stamp each agent's bubble
+            with their name + accent color so the thread reads as a
+            multi-voice debate, not a wall of generic assistant text.
+          </p>
+        </div>
+
+        <div class="bgos-window">
+          <div class="bgos-window-header">
+            <div class="bgos-tab">
+              <span class="bgos-avatar" style="background:#FFD900;color:#262624">A</span>
+              Ava · Gobot
+            </div>
+            <div class="bgos-window-controls">
+              <span></span><span></span><span></span>
+            </div>
+          </div>
+
+          <div class="bgos-thread" id="boardThread">
+            <!-- User trigger -->
+            <div class="bubble user">
+              <div class="bubble-text"><span class="slash-token">/board</span> Should we launch a paid newsletter?</div>
+              <div class="bubble-meta">9:42 AM</div>
+            </div>
+
+            <!-- Orchestrator announcement -->
+            <div class="bubble agent" data-agent="general">
+              <div class="bubble-header">
+                <span class="bubble-avatar" style="background:#FFD900;color:#262624">G</span>
+                <span class="bubble-name">General</span>
+                <span class="bubble-tag">orchestrator</span>
+              </div>
+              <div class="bubble-text"><strong>Board Meeting Starting</strong><br/>Gathering perspectives from all agents…</div>
+              <div class="bubble-meta">9:42 AM</div>
+            </div>
+          </div>
+
+          <div class="bgos-actionbar">
+            <button id="runBoardBtn" class="btn primary">▶ Play /board run</button>
+            <button id="resetBoardBtn" class="btn ghost">Reset</button>
+            <span class="bgos-actionbar-hint">Each bubble is a single <code>POST /api/v1/messages</code> with <code>fromAgent.name</code> + <code>fromAgent.color</code></span>
+          </div>
+        </div>
+
+        <details class="fix-detail">
+          <summary>Wire format — how each bubble gets its identity</summary>
+          <pre class="code"><code><span class="c">// channel-bgos: outbound.ts</span>
+<span class="k">await</span> bgos.outbound.<span class="fn">sendAsAgent</span>({
+  assistantId, chatId,
+  text: cleanResponse,
+  agent: { name: <span class="s">"Research"</span>, color: <span class="s">"#0EA5E9"</span>, type: <span class="s">"gobot"</span> },
+});
+
+<span class="c">// → backend stores messages.from_agent_inline = { name, color }</span>
+<span class="c">// → frontend renders bubble with that name + colored accent</span></code></pre>
+          <table class="agent-palette">
+            <thead><tr><th>Agent</th><th>Color</th><th>Hex</th></tr></thead>
+            <tbody>
+              <tr><td><span class="dot" style="background:#FFD900"></span> general</td><td><span class="swatch" style="background:#FFD900"></span></td><td>#FFD900</td></tr>
+              <tr><td><span class="dot" style="background:#0EA5E9"></span> research</td><td><span class="swatch" style="background:#0EA5E9"></span></td><td>#0EA5E9</td></tr>
+              <tr><td><span class="dot" style="background:#A855F7"></span> content</td><td><span class="swatch" style="background:#A855F7"></span></td><td>#A855F7</td></tr>
+              <tr><td><span class="dot" style="background:#22C55E"></span> finance</td><td><span class="swatch" style="background:#22C55E"></span></td><td>#22C55E</td></tr>
+              <tr><td><span class="dot" style="background:#F97316"></span> strategy</td><td><span class="swatch" style="background:#F97316"></span></td><td>#F97316</td></tr>
+              <tr><td><span class="dot" style="background:#06B6D4"></span> cto</td><td><span class="swatch" style="background:#06B6D4"></span></td><td>#06B6D4</td></tr>
+              <tr><td><span class="dot" style="background:#EC4899"></span> coo</td><td><span class="swatch" style="background:#EC4899"></span></td><td>#EC4899</td></tr>
+              <tr><td><span class="dot" style="background:#EF4444"></span> critic</td><td><span class="swatch" style="background:#EF4444"></span></td><td>#EF4444</td></tr>
+            </tbody>
+          </table>
+        </details>
+      </section>
+
+      <!-- ============================================================== -->
+      <!-- FIX 3: Proactive routing -->
+      <!-- ============================================================== -->
+      <section class="fix" id="fix-3">
+        <div class="fix-head">
+          <span class="fix-num">03</span>
+          <h2>Proactive sends — fan out via <code>GOBOT_HOME_CHANNEL</code></h2>
+          <p>
+            Cron scripts (<code>morning-briefing.ts</code>,
+            <code>smart-checkin.ts</code>) used to hardcode
+            <code>bot.api.sendMessage(...)</code>. They now consult the
+            home channel and call the new
+            <code>BgosProactiveClient</code> when BGOS is in scope.
+          </p>
+        </div>
+
+        <div class="channel-toggle" role="tablist">
+          <button class="channel-tab" data-channel="telegram" role="tab">GOBOT_HOME_CHANNEL=<strong>telegram</strong></button>
+          <button class="channel-tab active" data-channel="both" role="tab">=<strong>both</strong> <span class="default">default</span></button>
+          <button class="channel-tab" data-channel="bgos" role="tab">=<strong>bgos</strong></button>
+        </div>
+
+        <div class="dual-pane">
+          <div class="card client-card telegram-card">
+            <header>
+              <span class="client-icon" aria-hidden="true">✈️</span>
+              Telegram
+            </header>
+            <div class="tg-thread" id="tgThread">
+              <div class="tg-bubble">
+                <div class="tg-name">Gobot</div>
+                <div class="tg-text">
+                  ☀️ <strong>GOOD MORNING SARAH</strong><br/>
+                  <em>Sunday, May 4</em><br/><br/>
+                  📅 <strong>CALENDAR</strong> (3)<br/>
+                  • 10:00 — Investor sync (Zoom)<br/>
+                  • 13:30 — Content review w/ Lin<br/>
+                  • 19:00 — Dinner @ Bouchon<br/><br/>
+                  ✉️ <strong>GMAIL</strong> (12 unread)<br/>
+                  • Q2 board pack — please review<br/>
+                  • Stripe payout completed<br/>
+                  • Notion subscription renewal<br/><br/>
+                  🎯 <strong>GOALS</strong> (2 active)<br/>
+                  • Ship paid-newsletter MVP — due May 15<br/>
+                  • Hire 2 SDRs — due May 31
+                </div>
+                <div class="tg-meta">8:00 AM</div>
+              </div>
+            </div>
+            <footer><span class="status-dot ok"></span><span class="status-text">Delivered via <code>bot.api.sendMessage</code></span></footer>
+          </div>
+
+          <div class="card client-card bgos-card">
+            <header>
+              <span class="client-icon">
+                <span class="logo-dot" style="margin:0;vertical-align:middle"></span>
+              </span>
+              BGOS · Ava
+            </header>
+            <div class="bgos-thread compact" id="bgosBriefingThread">
+              <div class="bubble agent">
+                <div class="bubble-header">
+                  <span class="bubble-avatar" style="background:#FFD900;color:#262624">A</span>
+                  <span class="bubble-name">Ava</span>
+                </div>
+                <div class="bubble-text">
+                  ☀️ <strong>GOOD MORNING SARAH</strong><br/>
+                  <em>Sunday, May 4</em><br/><br/>
+                  📅 <strong>CALENDAR</strong> (3)<br/>
+                  • 10:00 — Investor sync (Zoom)<br/>
+                  • 13:30 — Content review w/ Lin<br/>
+                  • 19:00 — Dinner @ Bouchon<br/><br/>
+                  ✉️ <strong>GMAIL</strong> (12 unread)<br/>
+                  • Q2 board pack — please review<br/>
+                  • Stripe payout completed<br/>
+                  • Notion subscription renewal<br/><br/>
+                  🎯 <strong>GOALS</strong> (2 active)<br/>
+                  • Ship paid-newsletter MVP — due May 15<br/>
+                  • Hire 2 SDRs — due May 31
+                </div>
+                <div class="bubble-meta">8:00 AM</div>
+              </div>
+            </div>
+            <footer><span class="status-dot ok"></span><span class="status-text">Delivered via <code>BgosProactiveClient.sendProactive</code></span></footer>
+          </div>
+        </div>
+
+        <details class="fix-detail">
+          <summary>Decision tree</summary>
+          <pre class="code"><code><span class="k">async function</span> <span class="fn">runMorningBriefing</span>() {
+  <span class="k">const</span> channel = <span class="fn">resolveHomeChannel</span>(); <span class="c">// reads GOBOT_HOME_CHANNEL</span>
+
+  <span class="k">if</span> (channel !== <span class="s">"bgos"</span>) {
+    <span class="k">await</span> <span class="fn">sendTelegramMessage</span>(BOT_TOKEN, CHAT_ID, briefing);
+  }
+  <span class="k">if</span> (channel !== <span class="s">"telegram"</span>) {
+    <span class="k">await</span> <span class="fn">sendProactiveToBgos</span>(briefing);
+  }
+}</code></pre>
+        </details>
+      </section>
+
+      <!-- ============================================================== -->
+      <!-- TEST PLAN -->
+      <!-- ============================================================== -->
+      <section class="fix" id="testplan">
+        <div class="fix-head">
+          <span class="fix-num">✓</span>
+          <h2>Test plan after deploy</h2>
+        </div>
+        <ol class="testplan">
+          <li>
+            <strong>Slash picker</strong> — open BGOS, focus the composer for
+            your bound assistant, type <code>/</code>. Picker shows the 7
+            Gobot commands. If empty, run
+            <code>npx gobot-bgos-reseed-commands</code>.
+          </li>
+          <li>
+            <strong>/board run</strong> — send <code>/board Should we launch
+            a paid newsletter?</code> Expect the orchestrator
+            announcement, 7 agent bubbles (Research, Content, Finance,
+            Strategy, CTO, COO, Critic — each with its own name + accent
+            color), and one synthesis bubble. All from the single bound
+            assistant.
+          </li>
+          <li>
+            <strong>/track</strong> — send <code>/track Test goal | tomorrow</code>.
+            Goal saved to memory; assistant confirms inline.
+          </li>
+          <li>
+            <strong>Morning briefing</strong> — wait for the next launchd
+            briefing trigger (or run <code>bun run briefing</code> manually).
+            With <code>GOBOT_HOME_CHANNEL=both</code>, the briefing
+            arrives in Telegram AND in your BGOS Ava chat. With
+            <code>=bgos</code>, BGOS only.
+          </li>
+        </ol>
+      </section>
+    </main>
+
+    <footer class="sitefoot">
+      <span>Mock UI — not connected to a live BGOS instance.</span>
+      <span>Source: <a href="https://github.com/BrandGrowthOS/gobot-channel-bgos">gobot-channel-bgos</a> · <a href="https://github.com/BrandGrowthOS/gobot-bgos-fork">gobot-bgos-fork</a> · <a href="https://github.com/BrandGrowthOS/bgos-claude-plugin">bgos-claude-plugin</a></span>
+    </footer>
+
+    <script src="/demo.js"></script>
+  </body>
+</html>
