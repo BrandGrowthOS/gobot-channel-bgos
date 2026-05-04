@@ -35,16 +35,59 @@ const _DEFAULT_COMMANDS: ReadonlyArray<{
 ] as const;
 
 /**
+ * Bridge-local slash commands handled directly by the BGOS adapter —
+ * intercepted before they reach Gobot's command parser. Includes the
+ * peer (a2a) commands from `bgos-agent-capabilities.md` §11.
+ *
+ * Listed AFTER Gobot's natives in the seeded manifest so the picker
+ * surfaces familiar commands first.
+ */
+const _BRIDGE_LOCAL_COMMANDS: ReadonlyArray<{
+  name: string;
+  description: string;
+}> = [
+  { name: "new", description: "Start a fresh conversation in this chat (bridge)" },
+  { name: "retry", description: "Resend the last message (bridge)" },
+  { name: "status", description: "Show adapter health (bridge)" },
+  { name: "peers", description: "List discoverable peer assistants (bridge)" },
+  {
+    name: "peer-status",
+    description: "Check whether a peer is online (bridge)",
+  },
+  {
+    name: "peer-send",
+    description: "Send a one-shot message to a peer (bridge)",
+  },
+  {
+    name: "peer-complete",
+    description: "Close the most recent open peer conversation (bridge)",
+  },
+] as const;
+
+/** Names of bridge-local commands the BGOS adapter intercepts. Lookup
+ *  is case-insensitive on the leading `/` strip; entries are stored
+ *  lowercase. */
+export const BRIDGE_LOCAL_COMMAND_NAMES: ReadonlySet<string> = new Set(
+  _BRIDGE_LOCAL_COMMANDS.map((c) => c.name),
+);
+
+/**
  * Manifest entries ready to PUT to `/api/v1/integrations/assistants/:id/commands`.
  *
  * `order_index` is set so the order seen above is preserved on the picker.
  */
-export const DEFAULT_COMMANDS: ReadonlyArray<CommandManifestEntry> =
-  _DEFAULT_COMMANDS.map((c, i) => ({
+export const DEFAULT_COMMANDS: ReadonlyArray<CommandManifestEntry> = [
+  ..._DEFAULT_COMMANDS.map((c, i) => ({
     command: c.name,
     description: c.description,
     order_index: i,
-  }));
+  })),
+  ..._BRIDGE_LOCAL_COMMANDS.map((c, i) => ({
+    command: c.name,
+    description: c.description,
+    order_index: _DEFAULT_COMMANDS.length + i,
+  })),
+];
 
 /**
  * Seed-mode controls how aggressively the adapter reseeds the default

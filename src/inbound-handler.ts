@@ -27,13 +27,45 @@ import {
   type BgosInboundAttachment,
 } from "./attachment-bridge.js";
 import { buildSystemPromptWithHints } from "./agent-hints.js";
+import {
+  BgosPeerClient,
+  extractPeerDirectives,
+} from "./bgos-peer-client.js";
+import { BRIDGE_LOCAL_COMMAND_NAMES } from "./default-commands.js";
 import { saveLastId } from "./last-id-store.js";
 import type { BgosOutbound } from "./outbound.js";
 import type {
   ApprovalMeta,
   InboundMessagePayload,
   MessageOption,
+  PeerCompleteThreadInput,
+  PeerEntry,
+  PeerSendInput,
+  PeerSendResult,
+  PeerStatus,
 } from "./types.js";
+
+/**
+ * Peer (cross-channel a2a) namespace exposed on the ReplyHandle. Lets a
+ * Gobot agent handler discover, message, and synthesize with the user's
+ * other BGOS assistants without ever touching HTTP. See
+ * `docs/bgos-agent-capabilities.md` §11.
+ *
+ * `parentMessageId` for `send` is normally provided by the agent (the id
+ * of its own "Looping in <peer>..." reply) — without one, the side-thread
+ * card has nothing to anchor to. The handler does NOT auto-create an
+ * anchor message: that's a UX decision the agent owns. The bridge-local
+ * `/peer-send` does auto-create one for ergonomics; the programmatic
+ * surface is more explicit.
+ */
+export interface PeerHandle {
+  list(): Promise<PeerEntry[]>;
+  status(input: { peerAssistantId: number }): Promise<PeerStatus>;
+  send(input: Omit<PeerSendInput, "callerAssistantId">): Promise<PeerSendResult>;
+  complete(
+    input: Omit<PeerCompleteThreadInput, "callerAssistantId">,
+  ): Promise<{ closed: boolean; conversationId: number | null }>;
+}
 
 /**
  * Reply handle the fork's `processMessageForAgent` calls into.
@@ -79,6 +111,10 @@ export interface ReplyHandle {
     filePath: string,
     opts?: { fileName?: string; mimeType?: string },
   ) => Promise<{ fileName: string; fileMimeType: string; size: number }>;
+  /** Peer (cross-channel a2a) operations. See PeerHandle for the four
+   *  methods. The `callerAssistantId` is closure-captured here so the
+   *  agent doesn't have to thread it through every call. */
+  peers: PeerHandle;
 }
 
 /**
@@ -149,6 +185,25 @@ export function createInboundHandler(
     // Hermes behavior — see hermes_integration_shipped.md).
     saveLastId(event.messageId);
 
+    // Bridge-local intercept — `/new`, `/retry`, `/status`, `/peers`,
+    // `/peer-status`, `/peer-send`, `/peer-complete`. Handled by the
+    // adapter; never reach the agent. Mirrors the Hermes adapter's pattern.
+    if (
+      event.messageType === "slash_command" &&
+      event.commandName &&
+      BRIDGE_LOCAL_COMMAND_NAMES.has(event.commandName.toLowerCase())
+    ) {
+      await handleBridgeLocalCommand({
+        outbound: deps.outbound,
+        peerClient: new BgosPeerClient(deps.outbound.api),
+        assistantId: event.assistantId,
+        chatId: event.chatId,
+        command: event.commandName.toLowerCase(),
+        args: event.commandArgs ?? "",
+      });
+      return;
+    }
+
     // Translate BGOS attachments to local file paths. Failures are
     // surfaced as a single agent_error and the message is still
     // dispatched without attachments — better degraded behavior than
@@ -176,17 +231,133 @@ export function createInboundHandler(
       }
     }
 
+    // Peer (a2a) handle — closure-captures the caller assistant id so
+    // the agent code doesn't have to thread it through every call.
+    const peerClient = new BgosPeerClient(deps.outbound.api);
+    const peerHandle: PeerHandle = {
+      list: () => peerClient.listPeers(event.assistantId),
+      status: ({ peerAssistantId }) =>
+        peerClient.peerStatus(event.assistantId, peerAssistantId),
+      send: (input) =>
+        peerClient.sendToPeer({
+          ...input,
+          callerAssistantId: event.assistantId,
+        }),
+      complete: (input) =>
+        peerClient.completePeerThread({
+          ...input,
+          callerAssistantId: event.assistantId,
+        }),
+    };
+
+    // Track the most recent open peer conversation per chat for the
+    // [[BGOS_PEER_COMPLETE]] marker (which doesn't carry the peer id).
+    let trackedPeerForChat:
+      | { peerAssistantId: number; conversationId: number }
+      | null = null;
+
+    /** Wrap deps.outbound.sendText so it auto-extracts inline peer
+     *  collaboration markers from the agent's reply text. The user-
+     *  visible reply is the cleaned text; markers are dispatched AFTER
+     *  the post (so the SideConversationCard has a parent to anchor to). */
+    const sendTextWithPeerMarkers = async (
+      text: string,
+    ): Promise<{ id: number }> => {
+      const { cleaned, sends, completes } = extractPeerDirectives(text);
+      const sent = await deps.outbound.sendText({
+        assistantId: event.assistantId,
+        chatId: event.chatId,
+        text: cleaned || text,
+      });
+      if (sends.length === 0 && completes.length === 0) return sent;
+      // Dispatch in order. Failures are surfaced as a follow-up assistant
+      // message rather than thrown; never crash the reply path.
+      for (const attrs of sends) {
+        try {
+          const nameOrId = attrs.name ?? attrs.id ?? "";
+          if (!nameOrId || !attrs.text) {
+            continue;
+          }
+          let peer: PeerEntry | null = null;
+          if (/^\d+$/.test(nameOrId)) {
+            peer = {
+              assistantId: Number(nameOrId),
+              name: `#${nameOrId}`,
+              introduced: false,
+            };
+          } else {
+            const list = await peerClient.listPeers(event.assistantId);
+            peer = list.find(
+              (p) => p.name.toLowerCase() === nameOrId.toLowerCase(),
+            ) ?? null;
+          }
+          if (!peer) continue;
+          const result = await peerClient.sendToPeer({
+            callerAssistantId: event.assistantId,
+            targetAssistantId: peer.assistantId,
+            text: attrs.text,
+            parentMessageId: sent.id,
+            waitForReply: (attrs.wait ?? "false").toLowerCase() === "true",
+            turnState: attrs.turn as
+              | "expecting_reply"
+              | "more_coming"
+              | "final"
+              | undefined,
+          });
+          if (result.status === "requires_introduction") {
+            await deps.outbound.sendText({
+              assistantId: event.assistantId,
+              chatId: event.chatId,
+              text: `**Cannot send to ${peer.name}** — the user has not enabled this direction in the BGOS Agent Permissions matrix.`,
+            });
+            continue;
+          }
+          if (result.conversationId) {
+            trackedPeerForChat = {
+              peerAssistantId: peer.assistantId,
+              conversationId: result.conversationId,
+            };
+          }
+        } catch (err) {
+          const reason = err instanceof Error ? err.message : String(err);
+          await deps.outbound
+            .sendText({
+              assistantId: event.assistantId,
+              chatId: event.chatId,
+              text: `**Peer send failed:** ${reason}`,
+            })
+            .catch(() => {});
+        }
+      }
+      for (const attrs of completes) {
+        if (!trackedPeerForChat) continue;
+        try {
+          await peerClient.completePeerThread({
+            callerAssistantId: event.assistantId,
+            peerAssistantId: trackedPeerForChat.peerAssistantId,
+            summary: attrs.summary || undefined,
+          });
+          trackedPeerForChat = null;
+        } catch (err) {
+          const reason = err instanceof Error ? err.message : String(err);
+          await deps.outbound
+            .sendText({
+              assistantId: event.assistantId,
+              chatId: event.chatId,
+              text: `**Peer complete failed:** ${reason}`,
+            })
+            .catch(() => {});
+        }
+      }
+      return sent;
+    };
+
     // Build the BGOS-scoped ReplyHandle. Closure-captures the outbound
     // adapter + identifiers so the agent code never needs to know the
     // chat/assistant ids — it just calls `replyHandle.sendText("...")`.
     const replyHandle: ReplyHandle = {
       origin: "bgos",
-      sendText: (text) =>
-        deps.outbound.sendText({
-          assistantId: event.assistantId,
-          chatId: event.chatId,
-          text,
-        }),
+      sendText: sendTextWithPeerMarkers,
       sendButtons: (text, options) =>
         deps.outbound.sendButtons({
           assistantId: event.assistantId,
@@ -237,6 +408,7 @@ export function createInboundHandler(
         }),
       uploadFile: (filePath, opts) =>
         publishMediaPath(deps.outbound.api, filePath, opts),
+      peers: peerHandle,
     };
 
     const dispatch = deps.getDispatch();
@@ -301,4 +473,239 @@ export function createInboundHandler(
       }
     }
   };
+}
+
+// ─── Bridge-local handler (adapter-side, never reaches the agent) ───────────
+//
+// Per-chat tracking for `/peer-complete`. Module-scoped because the
+// adapter runs as a singleton inside the Gobot host process; multiple
+// handlers all share this map.
+const peerConversationByChat = new Map<
+  number,
+  { peerAssistantId: number; conversationId: number }
+>();
+/** Last assistant message id we posted, per chat. Used as the
+ *  parentMessageId for `/peer-send` so the SideConversationCard has
+ *  something to anchor to. */
+const lastAssistantMessageByChat = new Map<number, number>();
+
+async function resolvePeerArg(
+  peerClient: BgosPeerClient,
+  callerAssistantId: number,
+  arg: string,
+): Promise<PeerEntry | null> {
+  if (!arg) return null;
+  if (/^\d+$/.test(arg)) {
+    return { assistantId: Number(arg), name: `#${arg}`, introduced: false };
+  }
+  try {
+    const list = await peerClient.listPeers(callerAssistantId);
+    const target = arg.toLowerCase();
+    return list.find((p) => p.name.toLowerCase() === target) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function handleBridgeLocalCommand(input: {
+  outbound: BgosOutbound;
+  peerClient: BgosPeerClient;
+  assistantId: number;
+  chatId: number;
+  command: string;
+  args: string;
+}): Promise<void> {
+  const { outbound, peerClient, assistantId, chatId, command, args } = input;
+  try {
+    if (command === "new") {
+      await outbound.sendText({
+        assistantId,
+        chatId,
+        text: "Conversation reset. Next message starts fresh.",
+      });
+      return;
+    }
+    if (command === "retry") {
+      await outbound.sendText({
+        assistantId,
+        chatId,
+        text: "Retry — re-send your last message manually for now.",
+      });
+      return;
+    }
+    if (command === "status") {
+      await outbound.sendText({
+        assistantId,
+        chatId,
+        text: `**BGOS adapter status**\n- Open peer conversations: ${peerConversationByChat.size}`,
+      });
+      return;
+    }
+    if (command === "peers") {
+      const list = await peerClient.listPeers(assistantId);
+      if (list.length === 0) {
+        await outbound.sendText({
+          assistantId,
+          chatId,
+          text: "No peer assistants on this account.",
+        });
+        return;
+      }
+      const lines = ["**Peer assistants:**", ""];
+      for (const p of list) {
+        const mark = p.introduced ? "✓" : "✗";
+        lines.push(`- ${mark} **${p.name}** (id \`${p.assistantId}\`)`);
+      }
+      lines.push("");
+      lines.push(
+        "_✓ = introduced. ✗ = enable in BGOS Settings → Agent Permissions._",
+      );
+      await outbound.sendText({
+        assistantId,
+        chatId,
+        text: lines.join("\n"),
+      });
+      return;
+    }
+    if (command === "peer-status") {
+      const peer = await resolvePeerArg(peerClient, assistantId, args.trim());
+      if (!peer) {
+        await outbound.sendText({
+          assistantId,
+          chatId,
+          text: "Usage: `/peer-status <name|id>`. Run `/peers` first.",
+        });
+        return;
+      }
+      const status = await peerClient.peerStatus(assistantId, peer.assistantId);
+      await outbound.sendText({
+        assistantId,
+        chatId,
+        text:
+          `**${peer.name} (#${peer.assistantId}):** ` +
+          (status.online ? "🟢 online" : "⚪ offline") +
+          `\n- Last seen: ${status.lastSeenAt ?? "never"}\n` +
+          `- Open conversation: ${status.hasOpenConversation ? "yes" : "no"}`,
+      });
+      return;
+    }
+    if (command === "peer-send") {
+      let wait = false;
+      let trimmed = args;
+      if (trimmed.startsWith("--wait ")) {
+        wait = true;
+        trimmed = trimmed.slice("--wait ".length);
+      } else if (trimmed.endsWith(" --wait")) {
+        wait = true;
+        trimmed = trimmed.slice(0, -" --wait".length);
+      }
+      const sep = trimmed.indexOf(" ");
+      if (sep === -1) {
+        await outbound.sendText({
+          assistantId,
+          chatId,
+          text: "Usage: `/peer-send <name|id> <text>` (append `--wait` to block).",
+        });
+        return;
+      }
+      const peer = await resolvePeerArg(
+        peerClient,
+        assistantId,
+        trimmed.slice(0, sep),
+      );
+      if (!peer) {
+        await outbound.sendText({
+          assistantId,
+          chatId,
+          text: `No peer matches \`${trimmed.slice(0, sep)}\`.`,
+        });
+        return;
+      }
+      let parentMessageId = lastAssistantMessageByChat.get(chatId);
+      if (!parentMessageId) {
+        const anchor = await outbound.sendText({
+          assistantId,
+          chatId,
+          text: `Looping in ${peer.name}…`,
+        });
+        if (anchor?.id) {
+          parentMessageId = anchor.id;
+          lastAssistantMessageByChat.set(chatId, anchor.id);
+        }
+      }
+      if (!parentMessageId) {
+        await outbound.sendText({
+          assistantId,
+          chatId,
+          text: "Could not anchor the side-thread — try a normal reply first.",
+        });
+        return;
+      }
+      const result = await peerClient.sendToPeer({
+        callerAssistantId: assistantId,
+        targetAssistantId: peer.assistantId,
+        text: trimmed.slice(sep + 1).trim(),
+        parentMessageId,
+        waitForReply: wait,
+      });
+      if (result.status === "requires_introduction") {
+        await outbound.sendText({
+          assistantId,
+          chatId,
+          text: `**Cannot send to ${peer.name}** — open BGOS Settings → Agent Permissions to enable this direction first.`,
+        });
+        return;
+      }
+      if (result.conversationId) {
+        peerConversationByChat.set(chatId, {
+          peerAssistantId: peer.assistantId,
+          conversationId: result.conversationId,
+        });
+      }
+      const reply = result.reply;
+      await outbound.sendText({
+        assistantId,
+        chatId,
+        text: reply
+          ? `${peer.name} replied: ${reply.text}`
+          : `Sent to ${peer.name} (message \`${result.messageId}\`).`,
+      });
+      return;
+    }
+    if (command === "peer-complete") {
+      const tracked = peerConversationByChat.get(chatId);
+      if (!tracked) {
+        await outbound.sendText({
+          assistantId,
+          chatId,
+          text: "No open peer conversation in this chat. Send via `/peer-send` first.",
+        });
+        return;
+      }
+      const summary = args.trim() || undefined;
+      await peerClient.completePeerThread({
+        callerAssistantId: assistantId,
+        peerAssistantId: tracked.peerAssistantId,
+        summary,
+      });
+      peerConversationByChat.delete(chatId);
+      await outbound.sendText({
+        assistantId,
+        chatId,
+        text: `Closed conversation with peer #${tracked.peerAssistantId}${summary ? `: ${summary}` : "."}`,
+      });
+      return;
+    }
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    // eslint-disable-next-line no-console
+    console.warn("[gobot-channel-bgos] bridge-local failed", { command, reason });
+    await outbound
+      .sendText({
+        assistantId,
+        chatId,
+        text: `**/${command} failed:** ${reason}`,
+      })
+      .catch(() => {});
+  }
 }
