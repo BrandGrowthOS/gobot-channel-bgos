@@ -25,6 +25,7 @@ import { BgosWs } from "./bgos-ws.js";
 import { BgosOutbound } from "./outbound.js";
 import { ApprovalHandler } from "./approval-handler.js";
 import { CommandsSync } from "./commands-sync.js";
+import { ToolProgressOrchestrator } from "./tool-progress.js";
 import { syncCatalog, type CatalogAgent } from "./catalog-sync.js";
 import {
   DEFAULT_COMMANDS,
@@ -93,6 +94,13 @@ export class BGOSAdapter {
    *  `commandsSync.schedule(assistantId, commands)` whenever Gobot's
    *  user-defined commands change. */
   readonly commandsSync: CommandsSync;
+  /** Tool-progress card orchestrator — wired into `ReplyHandle`
+   *  (sendToolStart + finalizeTurn). The fork's BGOS dispatch should
+   *  call replyHandle.sendToolStart(toolName) per LIVE tool_use event
+   *  (via callClaudeStreaming's onToolStart hook) and finalizeTurn()
+   *  after the agent's text reply lands. Public so proactive paths can
+   *  also emit cards if they ever run tools server-side. */
+  readonly toolProgress: ToolProgressOrchestrator;
 
   private readonly cfg: PluginConfig;
   private readonly ws: BgosWs;
@@ -115,6 +123,7 @@ export class BGOSAdapter {
     this.outbound = new BgosOutbound(this.api);
     this.approvals = new ApprovalHandler(this.outbound);
     this.commandsSync = new CommandsSync(this.api);
+    this.toolProgress = new ToolProgressOrchestrator(this.api);
 
     const inputCfg = (input as BgosConfig | undefined) ?? {};
     this.catalog = inputCfg.agents ?? [];
@@ -203,6 +212,7 @@ export class BGOSAdapter {
       getRouteForAssistant: (id) => this.getRouteForAssistant(id),
       getDispatch: () => this.dispatch,
       getSystemPrompt: (route) => this.getSystemPrompt(route),
+      toolProgress: this.toolProgress,
     });
     this.ws.on("inbound_message", (msg) => {
       void inboundHandler(msg);
@@ -284,6 +294,7 @@ export class BGOSAdapter {
     }
     this.approvals.shutdown();
     this.ws.disconnect();
+    this.toolProgress.dispose();
     try {
       await this.commandsSync.flushAll();
     } catch {
