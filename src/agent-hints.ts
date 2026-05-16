@@ -105,6 +105,17 @@ const BGOS_AGENT_HINTS_BODY = [
   "commands the user can pick are declared via the host's catalog push;",
   "Gobot's seven built-ins (`/remember`, `/track`, `/done`, `/forget`,",
   "`/cancel`, `/critic`, `/board`) are seeded automatically.",
+  "",
+  "## Tool-progress card (auto-emitted)",
+  "When you call tools (Bash, Read, Edit, Grep, etc.), BGOS renders a live",
+  "'TOOL CALLS' card above your eventual text reply — pulsing dot while",
+  "tools fire, auto-collapses to 'Used N tools · …' when the turn ends.",
+  "This is handled NATIVELY by the host: Claude's streaming tool_use",
+  "events are forwarded to the plugin via the `onToolStart` hook in",
+  "`callClaudeStreaming` → `replyHandle.sendToolStart(toolName)`. You",
+  "don't emit any marker block — just call tools the way you always have.",
+  "The card stays in sync as tools fire, and finalizes when your text",
+  "reply lands via `sendText`. No additional contract on your end.",
 ].join("\n");
 
 /**
