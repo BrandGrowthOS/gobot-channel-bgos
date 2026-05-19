@@ -146,8 +146,27 @@ export interface OutboundMessagePayload {
     | "standard"
     | "slash_command"
     | "approval_request"
-    | "agent_error";
+    | "agent_error"
+    | "tool_progress";
   approvalMeta?: ApprovalMeta;
+  /**
+   * tool_progress card payload — required when messageType="tool_progress".
+   * Gobot agents stream tool_use events from Claude's API in real time
+   * (src/lib/claude.ts:391 in the fork), so unlike OpenClaw we emit LIVE
+   * cards: POST first card with state="running" on the first tool, PATCH
+   * to add tools, then PATCH state="done" at end-of-turn. Channel-agnostic
+   * wire format documented at
+   *   docs/superpowers/specs/2026-05-15-tool-progress-message-type-design.md
+   */
+  toolProgress?: {
+    state: "running" | "done";
+    tools: Array<{
+      icon: string;
+      name: string;
+      args?: string;
+      status: "running" | "done" | "error";
+    }>;
+  };
   files?: Array<{
     fileName: string;
     fileMimeType: string;

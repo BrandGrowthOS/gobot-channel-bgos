@@ -145,6 +145,35 @@ export class BgosApi {
     return r.data;
   }
 
+  /**
+   * PATCH an existing message. Used by the tool_progress card flow to
+   * update a card in place — adding new tools as they fire, transitioning
+   * state running → done at end-of-turn.
+   *
+   * The backend (BGOS PR #200, deployed 2026-05-16) auto-fills userId from
+   * the authenticated principal when omitted from the body. We always omit
+   * it from this client — pairing auth on the request itself carries the
+   * identity. Returns the updated message dto.
+   */
+  async patchMessage(
+    messageId: number,
+    payload: {
+      text?: string;
+      toolProgress?: {
+        state: "running" | "done";
+        tools: Array<{
+          icon: string;
+          name: string;
+          args?: string;
+          status: "running" | "done" | "error";
+        }>;
+      };
+    },
+  ): Promise<{ id: number }> {
+    const r = await this.http.patch(`messages/${messageId}`, payload);
+    return r.data;
+  }
+
   /** Request a presigned PUT for a file ≥500 KB that the agent wants to send. */
   async createUploadUrl(params: {
     filename: string;

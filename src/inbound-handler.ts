@@ -79,6 +79,30 @@ export interface ReplyHandle {
     filePath: string,
     opts?: { fileName?: string; mimeType?: string },
   ) => Promise<{ fileName: string; fileMimeType: string; size: number }>;
+  /**
+   * Record that a tool just started executing in the current agent turn.
+   * The plugin emits a live `tool_progress` card in BGOS — POSTing on the
+   * first call per turn, PATCHing on subsequent calls (debounced).
+   *
+   * Gobot fork wiring: call this from `callClaudeStreaming`'s `onToolStart`
+   * hook on the BGOS dispatch path:
+   *
+   *   onToolStart: (toolName) => replyHandle.sendToolStart(toolName)
+   *
+   * No-op when the adapter wasn't constructed with a tool-progress
+   * orchestrator (old host code) — safe to call unconditionally.
+   * `args` is optional, ≤120 chars (truncated by the plugin).
+   */
+  sendToolStart: (toolName: string, args?: string) => Promise<void>;
+  /**
+   * End-of-turn signal — transitions the active tool_progress card from
+   * state="running" to "done" so the frontend auto-collapses it. The
+   * fork should call this AFTER the agent's text reply has been sent
+   * via `sendText` (or even if the turn ends without a reply). Idempotent
+   * — safe to call multiple times. No-op when no card exists for this
+   * chat (turn used no tools).
+   */
+  finalizeTurn: () => Promise<void>;
 }
 
 /**
@@ -123,6 +147,11 @@ export interface InboundHandlerDeps {
   /** Optional system-prompt prefix (e.g. agent persona). The handler
    *  appends `BGOS_AGENT_HINTS` to whatever this returns. */
   getSystemPrompt?(agentRoute: string): string;
+  /** Tool-progress card orchestrator — adapter-provided. The factory
+   *  wires `replyHandle.sendToolStart` + `replyHandle.finalizeTurn`
+   *  through this. Optional for back-compat; older host code that
+   *  doesn't call these methods continues to work, just without cards. */
+  toolProgress?: import("./tool-progress.js").ToolProgressOrchestrator;
 }
 
 /**
@@ -237,6 +266,22 @@ export function createInboundHandler(
         }),
       uploadFile: (filePath, opts) =>
         publishMediaPath(deps.outbound.api, filePath, opts),
+      // tool_progress wiring — gracefully no-ops when older host code
+      // constructed the adapter without an orchestrator. New host code
+      // (fork v2026-05-16+) passes the orchestrator via adapter.toolProgress.
+      sendToolStart: async (toolName, args) => {
+        if (!deps.toolProgress) return;
+        await deps.toolProgress.sendToolStart({
+          assistantId: event.assistantId,
+          chatId: event.chatId,
+          toolName,
+          args,
+        });
+      },
+      finalizeTurn: async () => {
+        if (!deps.toolProgress) return;
+        await deps.toolProgress.finalizeTurn(event.chatId);
+      },
     };
 
     const dispatch = deps.getDispatch();
