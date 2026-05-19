@@ -54,6 +54,14 @@ export class BgosOutbound {
     chatId: number;
     text: string;
     fromAgent?: FromAgentInput;
+    /** Anchor this reply to an earlier message — BGOS renders a slim
+     *  Telegram-style quoted header inside the bubble (tap → jump to
+     *  source) and persists a frozen text/sender snapshot. Use when
+     *  answering a stale question, following up on a past commitment,
+     *  or surfacing a cron-triggered nudge tied to an older message.
+     *  Same-chat constraint enforced server-side (400 otherwise). See
+     *  bgos-agent-capabilities.md §9. */
+    replyToId?: number;
   }): Promise<{ id: number }> {
     const payload: OutboundMessagePayload = {
       assistantId: params.assistantId,
@@ -62,6 +70,7 @@ export class BgosOutbound {
       text: params.text,
       messageType: "standard",
       ...(params.fromAgent ? { fromAgent: params.fromAgent } : {}),
+      ...(params.replyToId !== undefined && { replyToId: params.replyToId }),
     };
     return this.api.postMessage(payload);
   }
@@ -112,6 +121,8 @@ export class BgosOutbound {
     chatId: number;
     text: string;
     options: MessageOption[];
+    /** See sendText.replyToId. */
+    replyToId?: number;
   }): Promise<{ id: number }> {
     if (params.options.length > INLINE_OPTION_LIMIT) {
       // Throw rather than truncate — the agent should be told it sent
@@ -129,6 +140,7 @@ export class BgosOutbound {
       text: params.text,
       options: params.options,
       messageType: "standard",
+      ...(params.replyToId !== undefined && { replyToId: params.replyToId }),
     };
     return this.api.postMessage(payload);
   }
@@ -152,6 +164,9 @@ export class BgosOutbound {
     text: string;
     meta: ApprovalMeta;
     options?: MessageOption[];
+    /** See sendText.replyToId — anchor an approval bubble to the user's
+     *  earlier request the agent is now asking permission to act on. */
+    replyToId?: number;
   }): Promise<{ id: number }> {
     const reqId = params.meta.request_id;
     const defaults: MessageOption[] = [
@@ -180,6 +195,7 @@ export class BgosOutbound {
       options: params.options ?? defaults,
       messageType: "approval_request",
       approvalMeta: params.meta,
+      ...(params.replyToId !== undefined && { replyToId: params.replyToId }),
     };
     return this.api.postMessage(payload);
   }
@@ -244,6 +260,8 @@ export class BgosOutbound {
     caption?: string;
     fileName?: string;
     mimeType?: string;
+    /** See sendText.replyToId. */
+    replyToId?: number;
   }): Promise<{ id: number }> {
     const fileRef = await publishMediaPath(this.api, params.filePath, {
       fileName: params.fileName,
@@ -256,6 +274,7 @@ export class BgosOutbound {
       text: params.caption ?? "",
       messageType: "standard",
       files: [fileRef],
+      ...(params.replyToId !== undefined && { replyToId: params.replyToId }),
     };
     return this.api.postMessage(payload);
   }
