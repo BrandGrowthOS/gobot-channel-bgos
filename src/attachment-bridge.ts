@@ -25,6 +25,7 @@ import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 
 import type { BgosApi } from "./bgos-api.js";
+import { resolveAllowedMediaPath } from "./media-guard.js";
 
 /** Threshold below which we inline base64 in a single POST. Mirrors the
  *  policy in `openclaw-channel-bgos` and the memory note
@@ -168,13 +169,23 @@ export async function publishMediaPath(
   filePath: string,
   opts: { fileName?: string; mimeType?: string } = {},
 ): Promise<BgosOutboundFileRef> {
-  const stat = await fsp.stat(filePath);
+  // SECURITY: validate the agent-supplied path against the allowlist
+  // BEFORE reading any bytes. Throws (does not publish) on traversal,
+  // out-of-root paths, sensitive locations, or escaping symlinks. This is
+  // the single choke point for every outbound send path (sendFile /
+  // sendImage / sendVideo / uploadFile), so the guard lives here. The
+  // returned value is the resolved, symlink-free real path we read from.
+  const safePath = resolveAllowedMediaPath(filePath);
+
+  const stat = await fsp.stat(safePath);
   const size = stat.size;
+  // Derive the display name from the ORIGINAL request (the real path may
+  // differ after symlink resolution) unless the caller overrode it.
   const fileName = opts.fileName ?? filePath.split(/[\\/]/).pop() ?? "file";
   const mimeType = opts.mimeType ?? guessMimeType(fileName);
 
   if (size < S3_THRESHOLD) {
-    const bytes = await fsp.readFile(filePath);
+    const bytes = await fsp.readFile(safePath);
     return {
       fileName,
       fileMimeType: mimeType,
@@ -188,7 +199,7 @@ export async function publishMediaPath(
     mimeType,
     size,
   });
-  const bytes = await fsp.readFile(filePath);
+  const bytes = await fsp.readFile(safePath);
   const putRes = await fetch(presigned.upload_url, {
     method: "PUT",
     body: new Uint8Array(bytes),

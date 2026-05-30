@@ -37,6 +37,8 @@ The adapter resolves config in order: explicit constructor arg → env var → `
 | `GOBOT_HOME` | `~/.gobot` | Where the adapter persists state (`bgos_last_id` cursor + secrets dir). |
 | `GOBOT_HOME_CHANNEL` | `both` | Destination for proactive (no-origin) messages: `telegram` \| `bgos` \| `both`. |
 | `GOBOT_POLL_INTERVAL` | `5` (seconds) | REST backfill interval. Set to `0` to disable polling once the server-side WS push gap is fixed. |
+| `GOBOT_MEDIA_ROOT` | `<cwd>/media` (else `<cwd>`) | **Security allowlist root for outbound files.** Every `sendFile`/`sendImage`/`sendVideo`/`uploadFile` path is realpath-resolved and must live under this root; traversal (`..`), escaping symlinks, and sensitive locations (`/etc`, `~/.ssh`, …) are rejected before any bytes are read. Set it to pin a narrow directory the agent is allowed to send from. |
+| `GOBOT_ALLOW_INLINE_AGENT_NAME` | `false` | **Anti-spoof gate.** When off, the plugin drops any agent-supplied inline `fromAgent` display `name`/`avatarUrl`/`color` and forwards only resolvable handles (`peerId`/`assistantId`/`externalId`/`type`), letting the backend resolve identity. Set truthy (`1`/`true`) only when the matching backend per-user inline-identity toggle is on (e.g. Gobot `/board`). |
 
 ## Prerequisites
 

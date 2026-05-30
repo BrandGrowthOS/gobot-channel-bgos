@@ -21,6 +21,8 @@
  *   - Injecting `BGOS_AGENT_HINTS` into the system prompt before
  *     dispatching
  */
+import { randomUUID } from "node:crypto";
+
 import {
   ingestBgosAttachment,
   publishMediaPath,
@@ -74,7 +76,10 @@ export interface ReplyHandle {
   ) => Promise<{ id: number }>;
   sendTyping: () => Promise<void>;
   /** Publish a local file path to BGOS as a `files[]` entry; useful when
-   *  the agent emits structured tool output rather than a `MEDIA:` line. */
+   *  the agent emits structured tool output rather than a `MEDIA:` line.
+   *  The `filePath` is validated against the `GOBOT_MEDIA_ROOT` allowlist
+   *  (see media-guard.ts) before any bytes are read — paths outside the
+   *  root, traversal, escaping symlinks, and sensitive locations throw. */
   uploadFile: (
     filePath: string,
     opts?: { fileName?: string; mimeType?: string },
@@ -228,7 +233,12 @@ export function createInboundHandler(
           assistantId: event.assistantId,
           chatId: event.chatId,
           text,
-          meta,
+          // SECURITY: ignore any agent-supplied request_id and mint a
+          // fork-generated UUID. The request_id keys the approval-callback
+          // correlation map (ea:<decision>:<reqId>); an agent that picks
+          // its own value could collide with another in-flight approval
+          // and steal/clobber its decision. A v4 UUID is collision-free.
+          meta: { ...meta, request_id: randomUUID() },
         }),
       sendAskUserInput: (prompt, options, modal) =>
         deps.outbound.sendAskUserInput({

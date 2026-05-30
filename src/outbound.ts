@@ -1,5 +1,6 @@
 import type { BgosApi } from "./bgos-api.js";
 import { publishMediaPath } from "./attachment-bridge.js";
+import { sanitizeFromAgent } from "./agent-identity.js";
 import type {
   ApprovalMeta,
   FromAgentInput,
@@ -63,13 +64,14 @@ export class BgosOutbound {
      *  bgos-agent-capabilities.md §9. */
     replyToId?: number;
   }): Promise<{ id: number }> {
+    const fromAgent = sanitizeFromAgent(params.fromAgent);
     const payload: OutboundMessagePayload = {
       assistantId: params.assistantId,
       chatId: params.chatId,
       sender: "assistant",
       text: params.text,
       messageType: "standard",
-      ...(params.fromAgent ? { fromAgent: params.fromAgent } : {}),
+      ...(fromAgent ? { fromAgent } : {}),
       ...(params.replyToId !== undefined && { replyToId: params.replyToId }),
     };
     return this.api.postMessage(payload);
@@ -104,13 +106,14 @@ export class BgosOutbound {
         `sendAsAgent: ${params.options.length} options exceeds inline limit (${INLINE_OPTION_LIMIT})`,
       );
     }
+    const fromAgent = sanitizeFromAgent(params.agent);
     const payload: OutboundMessagePayload = {
       assistantId: params.assistantId,
       chatId: params.chatId,
       sender: "assistant",
       text: params.text,
       messageType: "standard",
-      fromAgent: params.agent,
+      ...(fromAgent ? { fromAgent } : {}),
       ...(params.options ? { options: params.options } : {}),
     };
     return this.api.postMessage(payload);

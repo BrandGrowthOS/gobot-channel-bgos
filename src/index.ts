@@ -41,6 +41,14 @@ export {
   type BgosOutboundFileRef,
   type AttachmentKind,
 } from "./attachment-bridge.js";
+export {
+  resolveAllowedMediaPath,
+  MediaPathError,
+} from "./media-guard.js";
+export {
+  sanitizeFromAgent,
+  inlineAgentNameAllowed,
+} from "./agent-identity.js";
 export { syncCatalog, type CatalogAgent } from "./catalog-sync.js";
 export {
   createInboundHandler,
