@@ -171,7 +171,11 @@ describe("BgosOutbound (Gobot)", () => {
     ).resolves.toBeUndefined();
   });
 
-  it("sendAsAgent stamps fromAgent on the outbound payload", async () => {
+  it("sendAsAgent strips the free-form name/color/avatar by default (anti-spoof)", async () => {
+    // SECURITY: with GOBOT_ALLOW_INLINE_AGENT_NAME off (default), the
+    // plugin must NOT forward the agent-supplied display name — only the
+    // resolvable handles survive, and the backend resolves identity.
+    delete process.env.GOBOT_ALLOW_INLINE_AGENT_NAME;
     server.stage("POST", "/api/v1/messages", 201, { id: 16 });
     const out = new BgosOutbound(makeApi(baseUrl));
     await out.sendAsAgent({
@@ -179,6 +183,7 @@ describe("BgosOutbound (Gobot)", () => {
       chatId: 2,
       text: "From research perspective, ARR is up 23%.",
       agent: {
+        peerId: 9,
         name: "Research",
         color: "#0EA5E9",
         avatarUrl: "https://example.com/research.png",
@@ -188,15 +193,39 @@ describe("BgosOutbound (Gobot)", () => {
     const body = server.requests.at(-1)!.body as Record<string, unknown>;
     expect(body.messageType).toBe("standard");
     expect(body.sender).toBe("assistant");
-    expect(body.fromAgent).toEqual({
-      name: "Research",
-      color: "#0EA5E9",
-      avatarUrl: "https://example.com/research.png",
-      type: "gobot",
-    });
+    expect(body.fromAgent).toEqual({ peerId: 9, type: "gobot" });
   });
 
-  it("sendText with fromAgent is also stamped (proactive agent-tagged sends)", async () => {
+  it("sendAsAgent forwards the full identity when GOBOT_ALLOW_INLINE_AGENT_NAME is on", async () => {
+    process.env.GOBOT_ALLOW_INLINE_AGENT_NAME = "1";
+    try {
+      server.stage("POST", "/api/v1/messages", 201, { id: 16 });
+      const out = new BgosOutbound(makeApi(baseUrl));
+      await out.sendAsAgent({
+        assistantId: 1,
+        chatId: 2,
+        text: "From research perspective, ARR is up 23%.",
+        agent: {
+          name: "Research",
+          color: "#0EA5E9",
+          avatarUrl: "https://example.com/research.png",
+          type: "gobot",
+        },
+      });
+      const body = server.requests.at(-1)!.body as Record<string, unknown>;
+      expect(body.fromAgent).toEqual({
+        name: "Research",
+        color: "#0EA5E9",
+        avatarUrl: "https://example.com/research.png",
+        type: "gobot",
+      });
+    } finally {
+      delete process.env.GOBOT_ALLOW_INLINE_AGENT_NAME;
+    }
+  });
+
+  it("sendText with fromAgent strips the inline name by default but keeps the type", async () => {
+    delete process.env.GOBOT_ALLOW_INLINE_AGENT_NAME;
     server.stage("POST", "/api/v1/messages", 201, { id: 17 });
     const out = new BgosOutbound(makeApi(baseUrl));
     await out.sendText({
@@ -206,11 +235,7 @@ describe("BgosOutbound (Gobot)", () => {
       fromAgent: { name: "Briefing", color: "#FFD900", type: "gobot" },
     });
     const body = server.requests.at(-1)!.body as Record<string, unknown>;
-    expect(body.fromAgent).toMatchObject({
-      name: "Briefing",
-      color: "#FFD900",
-      type: "gobot",
-    });
+    expect(body.fromAgent).toEqual({ type: "gobot" });
   });
 
   it("sendAsAgent rejects > 6 options synchronously", () => {

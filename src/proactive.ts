@@ -22,6 +22,7 @@
  *   Failures here NEVER abort the Telegram path — they're best-effort.
  */
 import { BgosApi } from "./bgos-api.js";
+import { sanitizeFromAgent } from "./agent-identity.js";
 import { resolveHomeChannel, type HomeChannel } from "./home-channel.js";
 import type {
   FromAgentInput,
@@ -225,6 +226,7 @@ export class BgosProactiveClient {
         continue;
       }
       try {
+        const fromAgent = sanitizeFromAgent(params.fromAgent);
         await this.api.postMessage({
           assistantId: t.assistantId,
           chatId: t.chatId,
@@ -232,7 +234,7 @@ export class BgosProactiveClient {
           text: params.text,
           messageType: "standard",
           ...(params.options ? { options: params.options } : {}),
-          ...(params.fromAgent ? { fromAgent: params.fromAgent } : {}),
+          ...(fromAgent ? { fromAgent } : {}),
         });
         delivered += 1;
       } catch (err) {
