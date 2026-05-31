@@ -170,8 +170,18 @@ export interface OutboundMessagePayload {
   files?: Array<{
     fileName: string;
     fileMimeType: string;
-    fileData?: string; // inline base64 (<500 KB path)
+    size?: number;
+    fileData?: string; // inline data URI / base64 (<500 KB path)
     s3Key?: string; // presigned-put path
+    // Classification flags — the backend stores these verbatim and the
+    // frontend renders an image/video as such ONLY when the flag is true
+    // (else a document card). Required for outbound media to render.
+    isImage?: boolean;
+    isVideo?: boolean;
+    isAudio?: boolean;
+    isDocument?: boolean;
+    width?: number;
+    height?: number;
   }>;
   /**
    * When set, the backend stores `messages.reply_to_id = replyToId` and the

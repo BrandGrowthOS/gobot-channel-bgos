@@ -174,7 +174,15 @@ export class BgosApi {
     return r.data;
   }
 
-  /** Request a presigned PUT for a file ≥500 KB that the agent wants to send. */
+  /** Request a presigned PUT for a file ≥500 KB that the agent wants to send.
+   *
+   * Route is `POST /api/v1/files/upload-url` (FileController) — NOT under
+   * `/integrations/`; the old `integrations/files/upload-url` path 404'd,
+   * silently breaking every ≥500 KB media send. The request DTO is camelCase
+   * `{ fileName, contentType, size }` and the response is `{ uploadUrl, key }`
+   * — both diverged from the snake_case shape this client used. We send the
+   * right keys and normalize the response to the `{ upload_url, s3_key }`
+   * shape `publishMediaPath` consumes. */
   async createUploadUrl(params: {
     filename: string;
     mimeType: string;
@@ -182,14 +190,13 @@ export class BgosApi {
   }): Promise<{
     upload_url: string;
     s3_key: string;
-    expires_at: string;
   }> {
-    const r = await this.http.post("integrations/files/upload-url", {
-      filename: params.filename,
-      mime_type: params.mimeType,
+    const r = await this.http.post("files/upload-url", {
+      fileName: params.filename,
+      contentType: params.mimeType,
       size: params.size,
     });
-    return r.data;
+    return { upload_url: r.data.uploadUrl, s3_key: r.data.key };
   }
 
   /** List this pairing's active/paired state. Mostly used in setup wizard. */

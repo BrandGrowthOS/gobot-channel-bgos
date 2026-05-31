@@ -25,6 +25,11 @@ import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 
 import type { BgosApi } from "./bgos-api.js";
+import {
+  classifyMedia,
+  sniffImageDimensions,
+  toInlineDataUri,
+} from "./media-classify.js";
 import { resolveAllowedMediaPath } from "./media-guard.js";
 
 /** Threshold below which we inline base64 in a single POST. Mirrors the
@@ -59,6 +64,15 @@ export interface BgosOutboundFileRef {
   size: number;
   fileData?: string;
   s3Key?: string;
+  // Classification flags — REQUIRED for the frontend to render an image/video
+  // as such rather than a document card (backend stores them verbatim).
+  isImage?: boolean;
+  isVideo?: boolean;
+  isAudio?: boolean;
+  isDocument?: boolean;
+  // Intrinsic image dimensions (px), when sniffable — drives aspect layout.
+  width?: number;
+  height?: number;
 }
 
 /** Coarse inbound classifier for Gobot's existing pipelines. */
@@ -184,13 +198,21 @@ export async function publishMediaPath(
   const fileName = opts.fileName ?? filePath.split(/[\\/]/).pop() ?? "file";
   const mimeType = opts.mimeType ?? guessMimeType(fileName);
 
+  // Read once up front: we need the bytes for both the inline path AND the
+  // dimension sniff (images only). Files here are bounded by the media-guard.
+  const bytes = await fsp.readFile(safePath);
+  const flags = classifyMedia(mimeType);
+  const dims = flags.isImage ? sniffImageDimensions(bytes) : {};
+
   if (size < S3_THRESHOLD) {
-    const bytes = await fsp.readFile(safePath);
     return {
       fileName,
       fileMimeType: mimeType,
       size,
-      fileData: bytes.toString("base64"),
+      // data: URI so the client's <Image> can load it (bare base64 won't).
+      fileData: toInlineDataUri(mimeType, bytes.toString("base64")),
+      ...flags,
+      ...dims,
     };
   }
 
@@ -199,7 +221,6 @@ export async function publishMediaPath(
     mimeType,
     size,
   });
-  const bytes = await fsp.readFile(safePath);
   const putRes = await fetch(presigned.upload_url, {
     method: "PUT",
     body: new Uint8Array(bytes),
@@ -215,6 +236,8 @@ export async function publishMediaPath(
     fileMimeType: mimeType,
     size,
     s3Key: presigned.s3_key,
+    ...flags,
+    ...dims,
   };
 }
 
