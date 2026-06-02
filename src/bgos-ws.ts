@@ -1,7 +1,7 @@
 import { io, type Socket } from "socket.io-client";
 import { EventEmitter } from "node:events";
 
-import type { BgosApi } from "./bgos-api.js";
+import { NOT_MODIFIED, type BgosApi } from "./bgos-api.js";
 import {
   PairingRevokedError,
   type AssistantBoundPayload,
@@ -126,7 +126,12 @@ export class BgosWs {
   /** Explicit reconnect-triggered backfill. Also callable on startup. */
   async triggerBackfill(): Promise<void> {
     try {
-      const { messages } = await this.api.inboundSince(this.lastSeenMessageId);
+      const res = await this.api.inboundSince(this.lastSeenMessageId);
+      // Conditional-GET fast path: Stage-3 backend answers an unchanged poll
+      // with a 0-byte 304, surfaced as NOT_MODIFIED. Nothing to replay; leave
+      // the cursor untouched (egress fix).
+      if (res === NOT_MODIFIED) return;
+      const { messages } = res;
       for (const raw of messages) {
         const m = this.normalizeInbound(raw);
         if (!m) continue;

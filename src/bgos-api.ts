@@ -20,8 +20,25 @@ import {
  * (WS client, outbound adapter) can short-circuit and let the setup
  * wizard prompt for re-pair.
  */
+/**
+ * Sentinel returned by conditional GETs when the server replies 304 Not
+ * Modified. Distinct from any real body so callers can tell "nothing changed,
+ * skip work" apart from a normal response. Egress fix (Stage 4): conditional
+ * GET on the inbound poll lets the Stage-3 backend answer the tight poll loop
+ * with a 0-byte 304 instead of re-serializing the message list every few
+ * seconds.
+ */
+export const NOT_MODIFIED = Symbol("bgos.notModified");
+
 export class BgosApi {
   private readonly http: AxiosInstance;
+  /**
+   * Last ETag seen per conditional-GET cache key, so the next poll can send
+   * `If-None-Match`. In-process only — on restart we re-fetch the full payload
+   * once (the backend still returns 200 + body for a missing/non-matching
+   * ETag), so losing this is harmless and backward-safe.
+   */
+  private readonly etagByKey = new Map<string, string>();
 
   constructor(cfg: PluginConfig) {
     this.http = axios.create({
@@ -29,6 +46,11 @@ export class BgosApi {
       headers: {
         "X-BGOS-Pairing": cfg.pairingToken,
         "Content-Type": "application/json",
+        // Defensive: axios already injects this in Node (decompress defaults
+        // to true), but pinning it makes the Stage-1 gzip win explicit and
+        // robust against future axios/proxy changes. Server gzips; axios
+        // transparently decompresses.
+        "Accept-Encoding": "gzip, deflate, br",
       },
       timeout: 30_000,
     });
@@ -113,26 +135,61 @@ export class BgosApi {
     );
   }
 
-  /** REST backfill after a WS reconnect. */
-  async inboundSince(sinceMessageId: number): Promise<{
-    messages: InboundMessagePayload[];
-  }> {
+  /** REST backfill after a WS reconnect AND the steady-state poll loop.
+   *
+   * Conditional-GET aware (egress fix): when we hold an ETag for this cursor
+   * we send `If-None-Match`; a 304 surfaces as the `NOT_MODIFIED` sentinel so
+   * the caller can skip work entirely. Against an older backend that doesn't
+   * emit ETags this is identical to the prior behavior (always 200 + full
+   * body). The ETag bucket is keyed by cursor so a validator minted for one
+   * cursor is never replayed against a different one.
+   */
+  async inboundSince(
+    sinceMessageId: number,
+  ): Promise<{ messages: InboundMessagePayload[] } | typeof NOT_MODIFIED> {
+    const cacheKey = `inbound:${sinceMessageId}`;
+    const prevEtag = this.etagByKey.get(cacheKey);
     const r = await this.http.get("integrations/inbound", {
       params: { since_message_id: sinceMessageId },
+      headers: prevEtag ? { "If-None-Match": prevEtag } : undefined,
+      // 304 is not 2xx; tell axios to resolve (not throw) so we can branch.
+      validateStatus: (s) => (s >= 200 && s < 300) || s === 304,
     });
+    if (r.status === 304) return NOT_MODIFIED;
+    const etag = r.headers?.etag ?? r.headers?.ETag;
+    if (typeof etag === "string" && etag) {
+      this.etagByKey.set(cacheKey, etag);
+    } else {
+      this.etagByKey.delete(cacheKey);
+    }
     return r.data;
   }
 
   /** Fetch the recent message history for a chat — used by the daemon to
    *  rebuild conversation context before dispatching to a stateless
-   *  gateway. Backend returns up to 100 entries ASC by created_at. */
+   *  gateway. Backend returns up to 100 entries ASC by created_at.
+   *
+   *  Egress fix (Stage 2/4) — both opts are additive and opt-in so older
+   *  backends ignore them harmlessly:
+   *   - `afterId`: ask the backend for only messages newer than the last one
+   *     we've already seen (`?afterId=<lastSeenId>`), turning a full re-fetch
+   *     into a delta.
+   *   - `lite`: request audio-by-URL instead of inline base64 `audioData`
+   *     (`?lite=1`), so voice notes don't bloat the response.
+   */
   async getMessages(
     chatId: number,
     userId: string,
+    opts?: { afterId?: number; lite?: boolean },
   ): Promise<BgosMessageEnvelope[]> {
-    const r = await this.http.get(`chats/${chatId}/messages`, {
-      params: { userId },
-    });
+    const params: Record<string, string | number> = { userId };
+    if (opts?.afterId !== undefined && Number.isFinite(opts.afterId)) {
+      params.afterId = opts.afterId;
+    }
+    if (opts?.lite) {
+      params.lite = 1;
+    }
+    const r = await this.http.get(`chats/${chatId}/messages`, { params });
     const rows = r.data?.messages;
     return Array.isArray(rows) ? (rows as BgosMessageEnvelope[]) : [];
   }
