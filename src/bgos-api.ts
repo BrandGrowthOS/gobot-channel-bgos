@@ -146,6 +146,31 @@ export class BgosApi {
   }
 
   /**
+   * Agent reply via `POST /api/v1/send-message` — the SAME wire payload as
+   * `postMessage`, but the endpoint the backend runs its peer-reply bridge
+   * (`bridgePeerReplyIfApplicable`) on. For an a2a side-thread chat that
+   * bridge stamps `peer_conversation_id` on the reply, which is what
+   * resolves the initiating peer's `wait_for_reply`. `/messages` has no
+   * such bridge, so peer replies sent there never resolve the wait — hence
+   * a dedicated method (see inbound-handler.ts; reference impl
+   * bgos-claude-plugin/server.ts uses `bgosPost('send-message', …)`).
+   *
+   * Response shape differs from `/messages`: the controller returns the
+   * created message nested under `message` (HTTP 200) rather than a bare
+   * `{ id }` (HTTP 201), so unwrap both shapes.
+   */
+  async sendMessage(
+    payload: OutboundMessagePayload,
+  ): Promise<{ id: number }> {
+    const r = await this.http.post("send-message", payload);
+    const data = (r.data ?? {}) as {
+      id?: number;
+      message?: { id?: number };
+    };
+    return { id: data.message?.id ?? data.id ?? 0 };
+  }
+
+  /**
    * PATCH an existing message. Used by the tool_progress card flow to
    * update a card in place — adding new tools as they fire, transitioning
    * state running → done at end-of-turn.

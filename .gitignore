@@ -7,3 +7,4 @@ dist/
 
 # Bun lockfile (npm-published pkg uses package-lock)
 bun.lock
+.worktrees/

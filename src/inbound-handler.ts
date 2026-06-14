@@ -120,6 +120,10 @@ export interface DispatchArgs {
   agentRoute: string;
   assistantId: number;
   chatId: number;
+  /** The BGOS message id of this inbound. Surfaced so the fork can correlate
+   *  / log; the reply anchoring (reply_to_id) is handled automatically by
+   *  the ReplyHandle for a2a side-threads. */
+  messageId: number;
   userId: string;
   text: string;
   /** Local file paths the user attached (already downloaded). Empty
@@ -138,6 +142,15 @@ export interface DispatchArgs {
   /** Slash-command metadata if `messageType==='slash_command'`. */
   command?: { name: string; args: string };
   messageType: InboundMessagePayload["messageType"];
+  /** Present when this inbound is a peer agent's a2a side-thread message.
+   *  The reply is auto-routed back to the peer (via `/send-message` with
+   *  `reply_to_id`) so the peer's `wait_for_reply` resolves — the agent
+   *  does NOT need to do anything special. Surfaced for awareness / future
+   *  use (e.g. tailoring the reply to `turnState`). */
+  peerConversationId?: number;
+  /** Turn state on the peer side-thread (`expecting_reply` | `more_coming`
+   *  | `final`) when `peerConversationId` is set. */
+  turnState?: string;
 }
 
 export type DispatchFn = (args: DispatchArgs) => Promise<void>;
@@ -166,6 +179,13 @@ export interface InboundHandlerDeps {
 export function createInboundHandler(
   deps: InboundHandlerDeps,
 ): (event: InboundMessagePayload) => Promise<void> {
+  // Chats known to be a2a (peer) side-threads. A chat is learned the first
+  // time an inbound arrives carrying `peerConversationId` (the WS event
+  // stamps it). We remember it so a later message in the same thread that
+  // arrives WITHOUT markers — e.g. a REST `integrations/inbound` poll
+  // backfill, which strips them — still gets its reply routed correctly.
+  const a2aChats = new Set<number>();
+
   return async function handleInbound(event): Promise<void> {
     const route = deps.getRouteForAssistant(event.assistantId);
     if (!route) {
@@ -210,6 +230,24 @@ export function createInboundHandler(
       }
     }
 
+    // a2a peer detection. If this inbound carries a peerConversationId it
+    // is a peer agent's side-thread message; remember the chat so later
+    // (marker-less) messages in it are still treated as a2a. For any reply
+    // into a known a2a chat we (a) route via `/send-message` so the backend
+    // peer-reply bridge fires and the initiator's `wait_for_reply`
+    // resolves, and (b) anchor the reply to the inbound's messageId via
+    // `reply_to_id` for precise correlation (same-chat, so no 400). Normal
+    // user replies are untouched: `replyVia`/`replyToId` stay undefined and
+    // the outbound falls through to `/messages` exactly as before.
+    if (event.peerConversationId !== undefined) a2aChats.add(event.chatId);
+    const isPeerReply = a2aChats.has(event.chatId);
+    const replyVia: "send-message" | undefined = isPeerReply
+      ? "send-message"
+      : undefined;
+    const replyToId: number | undefined = isPeerReply
+      ? event.messageId
+      : undefined;
+
     // Build the BGOS-scoped ReplyHandle. Closure-captures the outbound
     // adapter + identifiers so the agent code never needs to know the
     // chat/assistant ids — it just calls `replyHandle.sendText("...")`.
@@ -220,6 +258,8 @@ export function createInboundHandler(
           assistantId: event.assistantId,
           chatId: event.chatId,
           text,
+          replyVia,
+          replyToId,
         }),
       sendButtons: (text, options) =>
         deps.outbound.sendButtons({
@@ -227,6 +267,8 @@ export function createInboundHandler(
           chatId: event.chatId,
           text,
           options,
+          replyVia,
+          replyToId,
         }),
       sendApprovalRequest: (text, meta) =>
         deps.outbound.sendApprovalRequest({
@@ -239,6 +281,8 @@ export function createInboundHandler(
           // its own value could collide with another in-flight approval
           // and steal/clobber its decision. A v4 UUID is collision-free.
           meta: { ...meta, request_id: randomUUID() },
+          replyVia,
+          replyToId,
         }),
       sendAskUserInput: (prompt, options, modal) =>
         deps.outbound.sendAskUserInput({
@@ -254,6 +298,8 @@ export function createInboundHandler(
           chatId: event.chatId,
           filePath,
           caption,
+          replyVia,
+          replyToId,
         }),
       sendImage: (filePath, caption) =>
         deps.outbound.sendImage({
@@ -261,6 +307,8 @@ export function createInboundHandler(
           chatId: event.chatId,
           filePath,
           caption,
+          replyVia,
+          replyToId,
         }),
       sendVideo: (filePath, caption) =>
         deps.outbound.sendVideo({
@@ -268,6 +316,8 @@ export function createInboundHandler(
           chatId: event.chatId,
           filePath,
           caption,
+          replyVia,
+          replyToId,
         }),
       sendTyping: () =>
         deps.outbound.sendTyping({
@@ -325,6 +375,7 @@ export function createInboundHandler(
         agentRoute: route,
         assistantId: event.assistantId,
         chatId: event.chatId,
+        messageId: event.messageId,
         userId: event.userId,
         text: event.text,
         attachments,
@@ -332,6 +383,12 @@ export function createInboundHandler(
         replyHandle,
         command,
         messageType: event.messageType,
+        ...(event.peerConversationId !== undefined
+          ? { peerConversationId: event.peerConversationId }
+          : {}),
+        ...(event.turnState !== undefined
+          ? { turnState: event.turnState }
+          : {}),
       });
     } catch (err) {
       // Fork's dispatch should never throw — but if it does, surface

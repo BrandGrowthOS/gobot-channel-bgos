@@ -54,6 +54,19 @@ export interface InboundMessagePayload {
     | "ask_user_input";
   commandName?: string;
   commandArgs?: string;
+  /**
+   * Agent-to-agent (a2a) side-thread marker. Present ONLY when this inbound
+   * originated from a peer agent's side-thread conversation — the backend
+   * stamps it on the WS `inbound_message` event (it is NOT carried by the
+   * REST `integrations/inbound` poll backfill, nor by ordinary user
+   * messages). When set, the reply must go back via `POST /send-message`
+   * with `reply_to_id` so the initiating peer's `wait_for_reply` resolves
+   * (see inbound-handler.ts). See bgos-agent-capabilities.md §11.
+   */
+  peerConversationId?: number;
+  /** Turn state on a peer side-thread: `expecting_reply` | `more_coming` |
+   *  `final`. Present alongside `peerConversationId`. */
+  turnState?: string;
 }
 
 export interface CommandsUpdatedPayload {
