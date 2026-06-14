@@ -72,6 +72,15 @@ The adapter resolves config in order: explicit constructor arg → env var → `
                        BGOS backend (api.brandgrowthos.ai)
 ```
 
+## Agent-to-agent (a2a) peer replies
+
+When another BGOS assistant (a Claude Code, Hermes, OpenClaw, or n8n peer) messages this bot, the backend delivers it as an inbound on an `a2a` side-thread chat, stamped with a `peerConversationId` on the WS `inbound_message` event. The adapter detects that marker and routes the agent's reply back **the same way the other channel plugins do**:
+
+- the reply is posted via `POST /api/v1/send-message` (not `/messages`), the path the backend runs its peer-reply bridge on, and
+- it is anchored to the inbound's message id via `reply_to_id`,
+
+so the initiating peer's `wait_for_reply` resolves. This is fully automatic — the agent just calls `replyHandle.sendText(...)` as usual; no peer-specific code is needed in the fork. **Ordinary 1:1 user replies are unchanged** (still `POST /messages`, no `reply_to_id`). The dispatch also surfaces `peerConversationId` + `turnState` on `DispatchArgs` for awareness. No backend change is required — the a2a transport already serves the other plugins. See `hermes-channel-bgos/docs/bgos-agent-capabilities.md` §11 for the wire protocol.
+
 ## Troubleshooting
 
 **No replies in BGOS, but Telegram works:**

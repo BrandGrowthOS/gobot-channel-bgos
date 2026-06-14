@@ -46,6 +46,24 @@ export class BgosOutbound {
     this.api = api;
   }
 
+  /**
+   * Pick the reply endpoint. Default `messages` (POST /api/v1/messages) is
+   * the historical path used for every normal reply, proactive send, and
+   * `/board` fan-out — UNCHANGED. `send-message` (POST /api/v1/send-message)
+   * is used ONLY for a2a peer replies, where the backend's peer-reply
+   * bridge must fire to resolve the initiator's `wait_for_reply`. Keeping
+   * this opt-in means non-a2a behavior (and its push-notification profile)
+   * is untouched.
+   */
+  private deliver(
+    payload: OutboundMessagePayload,
+    replyVia?: "messages" | "send-message",
+  ): Promise<{ id: number }> {
+    return replyVia === "send-message"
+      ? this.api.sendMessage(payload)
+      : this.api.postMessage(payload);
+  }
+
   // -------------------------------------------------------------------
   // Text + buttons
   // -------------------------------------------------------------------
@@ -63,6 +81,10 @@ export class BgosOutbound {
      *  Same-chat constraint enforced server-side (400 otherwise). See
      *  bgos-agent-capabilities.md §9. */
     replyToId?: number;
+    /** Route via `/send-message` instead of `/messages`. Set only for a2a
+     *  peer replies so the backend's peer-reply bridge resolves the
+     *  initiator's `wait_for_reply`. Defaults to `/messages` (unchanged). */
+    replyVia?: "messages" | "send-message";
   }): Promise<{ id: number }> {
     const fromAgent = sanitizeFromAgent(params.fromAgent);
     const payload: OutboundMessagePayload = {
@@ -74,7 +96,7 @@ export class BgosOutbound {
       ...(fromAgent ? { fromAgent } : {}),
       ...(params.replyToId !== undefined && { replyToId: params.replyToId }),
     };
-    return this.api.postMessage(payload);
+    return this.deliver(payload, params.replyVia);
   }
 
   /**
@@ -126,6 +148,8 @@ export class BgosOutbound {
     options: MessageOption[];
     /** See sendText.replyToId. */
     replyToId?: number;
+    /** See sendText.replyVia. */
+    replyVia?: "messages" | "send-message";
   }): Promise<{ id: number }> {
     if (params.options.length > INLINE_OPTION_LIMIT) {
       // Throw rather than truncate — the agent should be told it sent
@@ -145,7 +169,7 @@ export class BgosOutbound {
       messageType: "standard",
       ...(params.replyToId !== undefined && { replyToId: params.replyToId }),
     };
-    return this.api.postMessage(payload);
+    return this.deliver(payload, params.replyVia);
   }
 
   // -------------------------------------------------------------------
@@ -170,6 +194,8 @@ export class BgosOutbound {
     /** See sendText.replyToId — anchor an approval bubble to the user's
      *  earlier request the agent is now asking permission to act on. */
     replyToId?: number;
+    /** See sendText.replyVia. */
+    replyVia?: "messages" | "send-message";
   }): Promise<{ id: number }> {
     const reqId = params.meta.request_id;
     const defaults: MessageOption[] = [
@@ -200,7 +226,7 @@ export class BgosOutbound {
       approvalMeta: params.meta,
       ...(params.replyToId !== undefined && { replyToId: params.replyToId }),
     };
-    return this.api.postMessage(payload);
+    return this.deliver(payload, params.replyVia);
   }
 
   // -------------------------------------------------------------------
@@ -265,6 +291,8 @@ export class BgosOutbound {
     mimeType?: string;
     /** See sendText.replyToId. */
     replyToId?: number;
+    /** See sendText.replyVia. */
+    replyVia?: "messages" | "send-message";
   }): Promise<{ id: number }> {
     const fileRef = await publishMediaPath(this.api, params.filePath, {
       fileName: params.fileName,
@@ -279,7 +307,7 @@ export class BgosOutbound {
       files: [fileRef],
       ...(params.replyToId !== undefined && { replyToId: params.replyToId }),
     };
-    return this.api.postMessage(payload);
+    return this.deliver(payload, params.replyVia);
   }
 
   /** Image — enforces image/* MIME if provided; otherwise lets MIME
@@ -291,6 +319,10 @@ export class BgosOutbound {
     caption?: string;
     fileName?: string;
     mimeType?: string;
+    /** See sendText.replyToId. */
+    replyToId?: number;
+    /** See sendText.replyVia. */
+    replyVia?: "messages" | "send-message";
   }): Promise<{ id: number }> {
     if (params.mimeType && !params.mimeType.startsWith("image/")) {
       throw new Error(
@@ -308,6 +340,10 @@ export class BgosOutbound {
     caption?: string;
     fileName?: string;
     mimeType?: string;
+    /** See sendText.replyToId. */
+    replyToId?: number;
+    /** See sendText.replyVia. */
+    replyVia?: "messages" | "send-message";
   }): Promise<{ id: number }> {
     if (params.mimeType && !params.mimeType.startsWith("video/")) {
       throw new Error(

@@ -172,6 +172,12 @@ export class BgosWs {
     const chatId = toInt(r.chatId ?? r.chat_id);
     const messageId = toInt(r.messageId ?? r.message_id);
     if (!assistantId || !chatId || !messageId) return null;
+    // a2a side-thread markers — present only on peer-agent inbounds (the
+    // backend stamps them on the WS event). `toInt` yields 0 when absent;
+    // collapse that to undefined so ordinary user messages stay clean.
+    const peerConversationId =
+      toInt(r.peerConversationId ?? r.peer_conversation_id) || undefined;
+    const turnStateRaw = r.turnState ?? r.turn_state;
     return {
       assistantId,
       chatId,
@@ -185,6 +191,10 @@ export class BgosWs {
         string | undefined,
       commandArgs: (r.commandArgs ?? r.command_args ?? undefined) as
         string | undefined,
+      ...(peerConversationId !== undefined ? { peerConversationId } : {}),
+      ...(typeof turnStateRaw === "string" && turnStateRaw
+        ? { turnState: turnStateRaw }
+        : {}),
     };
   }
 }
