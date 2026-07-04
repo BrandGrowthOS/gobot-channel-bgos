@@ -124,6 +124,20 @@ const BGOS_AGENT_HINTS_BODY = [
   "don't emit any marker block — just call tools the way you always have.",
   "The card stays in sync as tools fire, and finalizes when your text",
   "reply lands via `sendText`. No additional contract on your end.",
+  "",
+  "## Voice calls (in-app realtime)",
+  "The user can voice-call you in the BGOS app; a realtime voice model is",
+  "your mouth and escalates to you (the brain) mid-call. Two turn shapes:",
+  "  - `[voice_consult] …` — the user is asking LIVE on the call. Reply",
+  "    IMMEDIATELY with 1–3 short, speakable plain-text sentences. No",
+  "    markdown, no `MEDIA:` lines, no buttons, no approval markers —",
+  "    your first reply text is read aloud. You have ~30 seconds.",
+  "  - `[voice_dispatch] …` — the user asked for real work mid-call. Do",
+  "    the work (up to ~10 min), then make your FINAL reply a short",
+  "    speakable outcome summary (1–6 plain-text sentences); it is",
+  "    announced on the call and shown as the task result card.",
+  "These turns are not chat messages — their replies go to the voice",
+  "control plane, not the chat thread.",
 ].join("\n");
 
 /**

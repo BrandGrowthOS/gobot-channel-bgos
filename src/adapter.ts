@@ -42,6 +42,11 @@ import {
   loadConfigFromEnv,
   loadConfigFromPluginCfg,
 } from "./config.js";
+import {
+  loadVoiceConfigFromEnv,
+  VoiceRpcHandler,
+  type VoiceConfig,
+} from "./voice-rpc.js";
 import type {
   AssistantBoundPayload,
   AssistantUnboundPayload,
@@ -78,6 +83,14 @@ export interface BgosConfig {
    * after fixing a stuck manifest.
    */
   commandSeedMode?: CommandSeedMode;
+  /**
+   * Optional voice (in-app realtime call) config override. Defaults come
+   * from env: `BGOS_OPENAI_API_KEY` (falls back to `OPENAI_API_KEY`),
+   * `BGOS_VOICE_MODEL`, `BGOS_VOICE_VOICE`, `BGOS_VOICE_PERSONA`. Without
+   * an OpenAI key, voice_rpc mint frames are answered with a descriptive
+   * "voice not configured" error and everything else keeps working.
+   */
+  voice?: Partial<VoiceConfig>;
 }
 
 export class BGOSAdapter {
@@ -105,6 +118,10 @@ export class BGOSAdapter {
   private readonly cfg: PluginConfig;
   private readonly ws: BgosWs;
   private readonly assistantToRoute = new Map<number, string>();
+  private readonly assistantNames = new Map<number, string>();
+  private readonly voiceConfig: VoiceConfig;
+  private voiceRpc: VoiceRpcHandler | null = null;
+  private userId = "";
   private dispatch: DispatchFn | null = null;
   private catalog: CatalogAgent[];
   private getSystemPrompt: (route: string) => string;
@@ -129,6 +146,10 @@ export class BGOSAdapter {
     this.catalog = inputCfg.agents ?? [];
     this.getSystemPrompt = inputCfg.getSystemPrompt ?? (() => "");
     this.commandSeedModeOverride = inputCfg.commandSeedMode ?? null;
+    this.voiceConfig = {
+      ...loadVoiceConfigFromEnv(),
+      ...(inputCfg.voice ?? {}),
+    };
   }
 
   /** Resolve the effective seed mode — explicit override wins over env. */
@@ -174,9 +195,13 @@ export class BGOSAdapter {
     try {
       const me = await this.api.whoami();
       this.pairingId = me.pairing_id;
+      this.userId = me.user_id ?? "";
       for (const a of me.assistants ?? []) {
         if (a.agent_route) {
           this.assistantToRoute.set(a.assistant_id, a.agent_route);
+        }
+        if (a.name) {
+          this.assistantNames.set(a.assistant_id, a.name);
         }
         if (shouldSeedDefaults(a.command_count, seedMode)) {
           emptyManifestAssistantIds.push(a.assistant_id);
@@ -239,6 +264,24 @@ export class BGOSAdapter {
       // No-op — the user changed commands via the BGOS UI; nothing for
       // the adapter to do. Hook is reserved so the fork can subscribe
       // later if it needs to re-render a local picker.
+    });
+    // Native voice control plane (mint / consult / dispatch). The handler
+    // owns dedupe, ACKs, deadlines, and REST replies; consults/dispatches
+    // run REAL turns on the Gobot brain via the fork's dispatch function
+    // with a capture ReplyHandle (see voice-rpc.ts).
+    this.voiceRpc = new VoiceRpcHandler({
+      api: this.api,
+      config: this.voiceConfig,
+      getDispatch: () => this.dispatch,
+      getRouteForAssistant: (id) => this.getRouteForAssistant(id),
+      getAssistantName: (id) => this.assistantNames.get(id) ?? null,
+      getUserId: () => this.userId,
+      getSystemPrompt: (route) => this.getSystemPrompt(route),
+      // eslint-disable-next-line no-console
+      log: (msg) => console.log("[gobot-channel-bgos] " + msg),
+    });
+    this.ws.on("voice_rpc", (frame) => {
+      void this.voiceRpc?.handle(frame);
     });
     this.ws.on("error", (err) => {
       // eslint-disable-next-line no-console

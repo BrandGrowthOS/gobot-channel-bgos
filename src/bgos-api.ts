@@ -11,6 +11,7 @@ import {
   type PairExchangeResponse,
   type PluginConfig,
 } from "./types.js";
+import type { VoiceRpcResultBody } from "./voice-rpc.js";
 
 /**
  * Thin typed wrapper around the BGOS integration endpoints. All methods
@@ -227,6 +228,47 @@ export class BgosApi {
   /** List this pairing's active/paired state. Mostly used in setup wizard. */
   async listPairings(): Promise<IntegrationPairing[]> {
     const r = await this.http.get("integrations/pairings");
+    return r.data;
+  }
+
+  // -------------------------------------------------------------------
+  // Native voice control plane (voice_rpc — see voice-rpc.ts)
+  // -------------------------------------------------------------------
+
+  /** ACK a voice_rpc frame — cancels the backend's 1.5 s retry-emit.
+   *  Best-effort; callers must treat a failure as non-fatal. */
+  async postVoiceRpcAck(rpcId: string): Promise<unknown> {
+    const r = await this.http.post(
+      `integrations/voice-rpc/${encodeURIComponent(rpcId)}/ack`,
+      {},
+    );
+    return r.data;
+  }
+
+  /** Settle a voice_rpc op (mint / consult / dispatch-accept). The backend
+   *  drops results that arrive after its own per-op deadline, so callers
+   *  keep their inner caps strictly under it (see voice-rpc.ts). */
+  async postVoiceRpcResult(
+    rpcId: string,
+    body: VoiceRpcResultBody,
+  ): Promise<unknown> {
+    const r = await this.http.post(
+      `integrations/voice-rpc/${encodeURIComponent(rpcId)}/result`,
+      body,
+    );
+    return r.data;
+  }
+
+  /** Report the outcome of a detached voice dispatch — flips the durable
+   *  voice_tasks row and fans `voice_task_update` to the user's devices. */
+  async postVoiceTaskResult(
+    taskId: string,
+    body: VoiceRpcResultBody,
+  ): Promise<unknown> {
+    const r = await this.http.post(
+      `integrations/voice-tasks/${encodeURIComponent(taskId)}/result`,
+      body,
+    );
     return r.data;
   }
 }

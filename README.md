@@ -39,6 +39,10 @@ The adapter resolves config in order: explicit constructor arg → env var → `
 | `GOBOT_POLL_INTERVAL` | `5` (seconds) | REST backfill interval. Set to `0` to disable polling once the server-side WS push gap is fixed. |
 | `GOBOT_MEDIA_ROOT` | `<cwd>/media` (else `<cwd>`) | **Security allowlist root for outbound files.** Every `sendFile`/`sendImage`/`sendVideo`/`uploadFile` path is realpath-resolved and must live under this root; traversal (`..`), escaping symlinks, and sensitive locations (`/etc`, `~/.ssh`, …) are rejected before any bytes are read. Set it to pin a narrow directory the agent is allowed to send from. |
 | `GOBOT_ALLOW_INLINE_AGENT_NAME` | `false` | **Anti-spoof gate.** When off, the plugin drops any agent-supplied inline `fromAgent` display `name`/`avatarUrl`/`color` and forwards only resolvable handles (`peerId`/`assistantId`/`externalId`/`type`), letting the backend resolve identity. Set truthy (`1`/`true`) only when the matching backend per-user inline-identity toggle is on (e.g. Gobot `/board`). |
+| `BGOS_OPENAI_API_KEY` | _(unset — voice off)_ | OpenAI API key with Realtime access, used ONLY to mint ephemeral client secrets for in-app voice calls (see the Voice section). Falls back to `OPENAI_API_KEY`. Without it, calls fail with a descriptive "voice not configured" error; chat is unaffected. |
+| `BGOS_VOICE_MODEL` | `gpt-realtime-2` | Realtime model for voice calls. |
+| `BGOS_VOICE_VOICE` | `marin` | Realtime voice name. |
+| `BGOS_VOICE_PERSONA` | _(empty)_ | Extra persona text baked into the voice session instructions. |
 
 ## Prerequisites
 
@@ -81,6 +85,16 @@ When another BGOS assistant (a Claude Code, Hermes, OpenClaw, or n8n peer) messa
 
 so the initiating peer's `wait_for_reply` resolves. This is fully automatic — the agent just calls `replyHandle.sendText(...)` as usual; no peer-specific code is needed in the fork. **Ordinary 1:1 user replies are unchanged** (still `POST /messages`, no `reply_to_id`). The dispatch also surfaces `peerConversationId` + `turnState` on `DispatchArgs` for awareness. No backend change is required — the a2a transport already serves the other plugins. See `hermes-channel-bgos/docs/bgos-agent-capabilities.md` §11 for the wire protocol.
 
+## In-app voice calls (realtime, v0.9.0+)
+
+The user can voice-call a Gobot agent from the BGOS app (assistant `voice_provider='realtime'`). The plugin implements the full `voice_rpc` control plane on the pairing WS lane:
+
+- **mint** — the daemon mints an ephemeral client secret DIRECTLY against OpenAI (`POST /v1/realtime/client_secrets`, key from `BGOS_OPENAI_API_KEY`/`OPENAI_API_KEY`), baking the agent's name, `BGOS_VOICE_PERSONA`, the `gobot_agent_consult` tool, and the recent chat context into the session instructions (`contextInjected:true`). The app then talks WebRTC audio straight to OpenAI; the plugin never proxies audio.
+- **consult** — mid-call questions run a REAL turn on the Gobot brain through the fork's normal dispatch pipeline, with a capture `ReplyHandle`: the brain's first `sendText` is returned to the voice model (inner cap 38 s, under the backend's 45 s). The turn text is prefixed `[voice_consult]` and the system prompt tells the brain to answer in short speakable plain text.
+- **dispatch** — "do real work" requests are ACCEPTED within the backend's 10 s window, then run detached (up to 10 min) through the same pipeline; the final reply text is posted to `POST /integrations/voice-tasks/:taskId/result` (retried once) and surfaces in the in-call Agent Work Stream.
+
+No fork changes are required — the adapter wires everything through the already-registered `setDispatch` function. Enable voice by exporting `BGOS_OPENAI_API_KEY` in the Gobot daemon's environment and restarting it, then set the assistant's voice provider to **Native (realtime)** in the BGOS app.
+
 ## Troubleshooting
 
 **No replies in BGOS, but Telegram works:**
@@ -112,6 +126,7 @@ gobot-pair-bgos <NEW-CODE>
 | `agent-hints.ts` | System-prompt addendum injected at dispatch |
 | `default-commands.ts` | 7 seeded slash commands |
 | `last-id-store.ts` | Persistent inbound cursor (CRITICAL — see source) |
+| `voice-rpc.ts` | In-app voice control plane: mint (OpenAI direct) / consult / dispatch |
 | `pair-cli.ts` | `gobot-pair-bgos` CLI |
 | `home-channel.ts` | Resolves `GOBOT_HOME_CHANNEL` for proactive messages |
 

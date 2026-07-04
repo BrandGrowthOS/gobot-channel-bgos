@@ -2,6 +2,7 @@ import { io, type Socket } from "socket.io-client";
 import { EventEmitter } from "node:events";
 
 import type { BgosApi } from "./bgos-api.js";
+import { normalizeVoiceRpc, type VoiceRpcFrame } from "./voice-rpc.js";
 import {
   PairingRevokedError,
   type AssistantBoundPayload,
@@ -22,6 +23,7 @@ type EventMap = {
   assistant_unbound: [AssistantUnboundPayload];
   pairing_revoked: [PairingRevokedPayload];
   callback_result: [CallbackResultPayload];
+  voice_rpc: [VoiceRpcFrame];
   error: [Error];
 };
 
@@ -114,6 +116,15 @@ export class BgosWs {
     socket.on("callback_result", (p: unknown) =>
       this.emitter.emit("callback_result", p as CallbackResultPayload),
     );
+    // Native voice control plane (mint / consult / dispatch). Frames are
+    // normalized + op-whitelisted here (G2 lesson: a malformed frame is
+    // dropped safely — the backend's own timeout surfaces it — but every
+    // well-formed op MUST pass through to the handler, which answers
+    // unserved ops with a descriptive error rather than silence).
+    socket.on("voice_rpc", (p: unknown) => {
+      const frame = normalizeVoiceRpc(p);
+      if (frame) this.emitter.emit("voice_rpc", frame);
+    });
 
     socket.on("connect_error", (err: Error) => {
       this.reconnectAttempts++;

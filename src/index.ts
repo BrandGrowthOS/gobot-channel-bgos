@@ -64,6 +64,24 @@ export { BgosApi } from "./bgos-api.js";
 export { BgosWs } from "./bgos-ws.js";
 export { pairBgos, type PairCliOptions, type PairResult } from "./pair-cli.js";
 export {
+  buildConsultToolDefinition,
+  buildConsultTurnText,
+  buildDispatchTurnText,
+  buildMintInstructions,
+  CONSULT_TOOL_NAME,
+  loadVoiceConfigFromEnv,
+  makeCaptureReplyHandle,
+  normalizeVoiceRpc,
+  VoiceRpcHandler,
+  type VoiceConfig,
+  type VoiceRpcApi,
+  type VoiceRpcDeps,
+  type VoiceRpcFrame,
+  type VoiceRpcOp,
+  type VoiceRpcResultBody,
+  type VoiceRpcTiming,
+} from "./voice-rpc.js";
+export {
   loadConfigFromEnv,
   loadConfigFromPluginCfg,
 } from "./config.js";
