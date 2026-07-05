@@ -139,6 +139,51 @@ export function loadVoiceConfigFromEnv(
   };
 }
 
+/**
+ * Per-assistant voice settings from the app (BGOS assistant voice menu),
+ * riding the mint frame as payload.voiceConfig. Everything optional — the
+ * host env config (BGOS_VOICE_VOICE / BGOS_VOICE_PERSONA) is the fallback
+ * ONLY. Bounds mirror the backend coercion (services/voice-settings.ts) and
+ * OpenAI's GA limits: speed 0.25–1.5 (session.audio.output.speed).
+ */
+export interface MintVoiceConfig {
+  voice?: string;
+  speed?: number;
+  instructions?: string;
+}
+
+export const VOICE_SPEED_MIN = 0.25;
+export const VOICE_SPEED_MAX = 1.5;
+export const VOICE_INSTRUCTIONS_MAX = 2000;
+const VOICE_ID_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/i;
+
+/**
+ * Sanitize payload.voiceConfig from the wire. Defensive twin of the
+ * backend's buildMintVoiceConfig — the backend already coerces, but the
+ * daemon must never trust the wire (junk voice → dropped, out-of-range
+ * speed → clamped, oversized instructions → capped). Returns {} when
+ * nothing usable is present so callers can spread it safely.
+ */
+export function normalizeVoiceConfig(raw: unknown): MintVoiceConfig {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const r = raw as Record<string, unknown>;
+  const out: MintVoiceConfig = {};
+  if (typeof r.voice === "string" && VOICE_ID_RE.test(r.voice.trim())) {
+    out.voice = r.voice.trim().toLowerCase();
+  }
+  const speed = typeof r.speed === "string" ? Number(r.speed) : r.speed;
+  if (typeof speed === "number" && Number.isFinite(speed)) {
+    out.speed =
+      Math.round(
+        Math.min(VOICE_SPEED_MAX, Math.max(VOICE_SPEED_MIN, speed)) * 100,
+      ) / 100;
+  }
+  if (typeof r.instructions === "string" && r.instructions.trim()) {
+    out.instructions = r.instructions.trim().slice(0, VOICE_INSTRUCTIONS_MAX);
+  }
+  return out;
+}
+
 export interface VoiceRpcTiming {
   /** Whole-mint wall clock (the OpenAI call). < backend 10 s. */
   mintTimeoutMs: number;
@@ -492,9 +537,15 @@ export class VoiceRpcHandler {
       typeof frame.payload?.recentContext === "string"
         ? frame.payload.recentContext
         : "";
+    // Per-assistant voice settings from the app (v0.10.0): voice + speed +
+    // persona instructions override the host env config; env vars are the
+    // fallback ONLY when the app sent nothing.
+    const voiceConfig = normalizeVoiceConfig(frame.payload?.voiceConfig);
+    const voice = voiceConfig.voice ?? config.voice;
+    const persona = voiceConfig.instructions ?? config.persona;
     const instructions = buildMintInstructions({
       agentName,
-      persona: config.persona,
+      persona,
       recentContext,
     });
     const body = {
@@ -512,7 +563,12 @@ export class VoiceRpcHandler {
             transcription: { model: "gpt-4o-mini-transcribe" },
             turn_detection: { type: "server_vad" },
           },
-          output: { voice: config.voice },
+          output: {
+            voice,
+            // Only sent when the app configured it — omitting preserves the
+            // exact pre-feature request shape (OpenAI default 1.0).
+            ...(voiceConfig.speed != null ? { speed: voiceConfig.speed } : {}),
+          },
         },
       },
     };
@@ -571,7 +627,10 @@ export class VoiceRpcHandler {
       clientSecret,
       offerUrl: OFFER_URL,
       model: config.model,
-      voice: config.voice,
+      // Echo what was APPLIED (app settings win over env) — the app's
+      // in-call gear shows this as the active voice.
+      voice,
+      ...(voiceConfig.speed != null ? { speed: voiceConfig.speed } : {}),
       expiresAt:
         normalizeExpiresAtSeconds(data?.expires_at) ??
         Math.floor(Date.now() / 1000) + 600,

@@ -21,6 +21,7 @@ import {
   DEFAULT_TIMING,
   loadVoiceConfigFromEnv,
   normalizeExpiresAtSeconds,
+  normalizeVoiceConfig,
   normalizeVoiceRpc,
   OFFER_URL,
   VOICE_TURN_SYSTEM_NOTE,
@@ -241,6 +242,94 @@ describe("mint", () => {
     expect(sent.session.instructions).toContain("KC: hi");
     expect(sent.session.audio.input.transcription).toBeTruthy();
     expect(sent.session.audio.input.turn_detection).toBeTruthy();
+  });
+
+  it("normalizeVoiceConfig sanitizes the wire (junk dropped, speed clamped, cap applied)", () => {
+    expect(normalizeVoiceConfig(undefined)).toEqual({});
+    expect(normalizeVoiceConfig("cedar")).toEqual({});
+    expect(normalizeVoiceConfig([])).toEqual({});
+    expect(
+      normalizeVoiceConfig({ voice: " Cedar ", speed: 1.2, instructions: " hi " }),
+    ).toEqual({ voice: "cedar", speed: 1.2, instructions: "hi" });
+    expect(normalizeVoiceConfig({ voice: "x; DROP", speed: 99 })).toEqual({
+      speed: 1.5,
+    });
+    expect(normalizeVoiceConfig({ speed: "0.01" })).toEqual({ speed: 0.25 });
+    expect(
+      normalizeVoiceConfig({ instructions: "x".repeat(5000) }).instructions,
+    ).toHaveLength(2000);
+  });
+
+  it("applies payload.voiceConfig — voice/speed/persona override env, echoed back", async () => {
+    const capture: { body?: unknown } = {};
+    const { handler, calls } = makeHarness({
+      fetchImpl: okFetch(undefined, capture),
+      config: { persona: "Speak like a calm pilot." },
+    });
+    await handler.handle(
+      frame({
+        op: "mint",
+        payload: {
+          recentContext: "KC: hi",
+          voiceConfig: {
+            voice: "cedar",
+            speed: 1.25,
+            instructions: "Dry humor, two sentences max.",
+          },
+        },
+      }),
+    );
+    const sent = JSON.parse(String(capture.body)) as {
+      session: {
+        instructions: string;
+        audio: { output: { voice: string; speed?: number } };
+      };
+    };
+    // Applied to the OpenAI session…
+    expect(sent.session.audio.output.voice).toBe("cedar");
+    expect(sent.session.audio.output.speed).toBe(1.25);
+    // App persona REPLACES the env persona (env is the fallback only).
+    expect(sent.session.instructions).toContain("Dry humor");
+    expect(sent.session.instructions).not.toContain("calm pilot");
+    // …and echoed in the result so the in-call gear shows the real voice.
+    expect(calls.results[0]!.body.payload).toMatchObject({
+      voice: "cedar",
+      speed: 1.25,
+    });
+  });
+
+  it("keeps the exact pre-feature request shape without voiceConfig (env fallback)", async () => {
+    const capture: { body?: unknown } = {};
+    const { handler, calls } = makeHarness({
+      fetchImpl: okFetch(undefined, capture),
+    });
+    await handler.handle(
+      frame({ op: "mint", payload: { recentContext: "" } }),
+    );
+    const sent = JSON.parse(String(capture.body)) as {
+      session: { audio: { output: Record<string, unknown> } };
+    };
+    expect(sent.session.audio.output).toEqual({ voice: "marin" });
+    expect(calls.results[0]!.body.payload!.voice).toBe("marin");
+    expect("speed" in calls.results[0]!.body.payload!).toBe(false);
+  });
+
+  it("degrades junk voiceConfig to env config, never failing the call", async () => {
+    const capture: { body?: unknown } = {};
+    const { handler, calls } = makeHarness({
+      fetchImpl: okFetch(undefined, capture),
+    });
+    await handler.handle(
+      frame({
+        op: "mint",
+        payload: { recentContext: "", voiceConfig: { voice: "!!", speed: "junk" } },
+      }),
+    );
+    const sent = JSON.parse(String(capture.body)) as {
+      session: { audio: { output: Record<string, unknown> } };
+    };
+    expect(sent.session.audio.output).toEqual({ voice: "marin" });
+    expect(calls.results[0]!.body.ok).toBe(true);
   });
 
   it("normalizes a milliseconds expires_at to epoch seconds", async () => {
