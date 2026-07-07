@@ -228,6 +228,23 @@ export class BGOSAdapter {
     );
   }
 
+  /**
+   * Set (or clear) an assistant's status line (contract C4). Public surface the
+   * fork's loader feature-detects (`typeof adapter.setStatus === "function"`)
+   * and drives to show the "working…" line while an agent turn is in flight.
+   * Delegates straight to `BgosApi.setStatus`
+   * (PATCH `/integrations/assistants/:id/status`). Pass an empty string or null
+   * `statusText` to clear. Fail-open is the CALLER's job: the fork wraps this
+   * in try/catch + throttle so a status write never suppresses a reply; this
+   * method only delegates.
+   */
+  async setStatus(
+    assistantId: number,
+    body: { statusText: string | null; statusEmoji?: string | null },
+  ): Promise<void> {
+    await this.api.setStatus(assistantId, body);
+  }
+
   // -------------------------------------------------------------------
   // Lifecycle
   // -------------------------------------------------------------------

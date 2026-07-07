@@ -43,6 +43,32 @@ The adapter resolves config in order: explicit constructor arg → env var → `
 | `BGOS_VOICE_MODEL` | `gpt-realtime-2` | Realtime model for voice calls. |
 | `BGOS_VOICE_VOICE` | `marin` | Realtime voice name. |
 | `BGOS_VOICE_PERSONA` | _(empty)_ | Extra persona text baked into the voice session instructions. |
+| `GOBOT_BGOS_HEARTBEAT_INTERVAL` | `60` (seconds) | Cadence for the daemon heartbeat that reports `daemon_version` + last error to the backend (surfaced in the BGOS Integrations card). `0` disables the network heartbeat; a local `$GOBOT_HOME/bgos_heartbeat.json` is always written for the watchdog. |
+| `GOBOT_BGOS_BACKFILL_STORM_LIMIT` | `25` | If a single REST backfill returns more than this many messages, the cursor fast-forwards and dispatch is skipped (prevents a history-replay storm after a long outage). `0` disables the guard. |
+| `GOBOT_BGOS_CHAT_ID` / `GOBOT_BGOS_CHAT_ID_<assistantId>` | _(auto)_ | **Rarely needed.** Proactive messages (check-ins, briefings) self-resolve their delivery chat via the backend, so you do not normally set this. Set it only to pin a specific chat. |
+
+## Proactive delivery (check-ins, briefings): zero-config
+
+Self-initiated messages (smart check-ins, morning briefings, watchdog alerts, async task pushes) reach BGOS with no extra setup as of **v0.11.1**:
+
+- The proactive sender reads the pairing token from `~/.gobot/secrets/bgos.json` (written by `gobot-pair-bgos`) when it is not in the process env, so the separate check-in/briefing launchd jobs authenticate without a hand-set `GOBOT_PAIRING_TOKEN`.
+- It self-resolves each assistant's delivery chat via `POST /api/v1/integrations/assistants/:id/primary-chat` (falling back to `GOBOT_BGOS_CHAT_ID` only if you set it), so you do not have to look up a numeric chat id.
+
+The only knob you normally touch is `GOBOT_HOME_CHANNEL` (`telegram` | `bgos` | `both`, default `both`). Force a delivery test with `bun run briefing`.
+
+## Re-pair (rotate the token without losing history)
+
+If the pairing is revoked or you rotate the token from the BGOS Integrations card, apply the new token without exposing it on the command line:
+
+```bash
+bunx gobot-pair-bgos --token -   # reads the pairing token from stdin (paste it, then Ctrl-D)
+```
+
+The running daemon watches the secrets directory and re-authenticates the moment the new token lands, no restart required.
+
+## Reliability
+
+Inbound is deduplicated (a message is dispatched exactly once across the live WS push and the REST backfill), the cursor is durable, revocation surfaces as a visible error plus a recover-on-new-token state, and outbound sends retry the network-error class with a bounded on-disk spool. A `daemon_version` heartbeat keeps the Integrations card honest about what the host is running.
 
 ## Prerequisites
 
