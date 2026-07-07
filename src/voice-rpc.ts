@@ -523,12 +523,25 @@ export class VoiceRpcHandler {
   private async mint(frame: VoiceRpcFrame): Promise<Record<string, unknown>> {
     const deadline = Date.now() + this.timing.mintTimeoutMs;
     const { config } = this.deps;
-    if (!config.openaiApiKey) {
+    // Per-user key (BGOS billing/security): the BGOS backend rides the CALLER's
+    // own OpenAI key on the mint frame (payload.openaiApiKey) so the call
+    // spends THEIR credits, never this host's owner key. Prefer it; the host
+    // env key (config.openaiApiKey) is a fallback ONLY for a standalone Gobot
+    // host not driven by the BGOS backend. The BGOS backend refuses a mint for
+    // a user with no key of their own, so a BGOS-driven mint always arrives
+    // with a user key here. The raw key stays server-side (it arrived over the
+    // authed pairing WS room) and never reaches the app.
+    const userOpenaiApiKey =
+      typeof frame.payload?.openaiApiKey === "string"
+        ? frame.payload.openaiApiKey.trim()
+        : "";
+    const openaiApiKey = userOpenaiApiKey || config.openaiApiKey;
+    if (!openaiApiKey) {
       throw new VoiceRpcError(
         "VOICE_NOT_CONFIGURED",
-        "voice is not configured on this Gobot host: set BGOS_OPENAI_API_KEY " +
-          "(an OpenAI API key with Realtime access) in the Gobot daemon env " +
-          "and restart it",
+        "voice is not configured: the caller has not set an OpenAI API key in " +
+          "their Home of Agents settings, and this Gobot host has no " +
+          "BGOS_OPENAI_API_KEY fallback",
       );
     }
     const assistantId = Number(frame.assistantId) || 0;
@@ -583,7 +596,7 @@ export class VoiceRpcHandler {
       res = await fetchImpl(CLIENT_SECRETS_URL, {
         method: "POST",
         headers: {
-          Authorization: `Bearer ${config.openaiApiKey}`,
+          Authorization: `Bearer ${openaiApiKey}`,
           "Content-Type": "application/json",
         },
         body: JSON.stringify(body),
