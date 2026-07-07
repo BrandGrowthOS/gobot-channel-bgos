@@ -47,6 +47,15 @@ const KIND_VENDOR_TO_FORK: Record<string, ForkAttachmentKind> = {
 export interface CreatedAdapter {
   start: () => Promise<void>;
   stop: () => Promise<void>;
+  /**
+   * Set (or clear) an assistant's status line (contract C4). Mirrors
+   * `BGOSAdapter.setStatus` so the fork's loader can feature-detect + drive it
+   * on the object createAdapter returns. Delegates to the underlying adapter.
+   */
+  setStatus: (
+    assistantId: number,
+    body: { statusText: string | null; statusEmoji?: string | null },
+  ) => Promise<void>;
   /** Underlying adapter — for the fork to access outbound primitives if needed. */
   raw: BGOSAdapter;
 }
@@ -98,5 +107,6 @@ export function createAdapter(
     raw: adapter,
     start: () => adapter.start(),
     stop: () => adapter.stop(),
+    setStatus: (assistantId, body) => adapter.setStatus(assistantId, body),
   };
 }
