@@ -1,6 +1,16 @@
 import type { BgosApi } from "./bgos-api.js";
 import { publishMediaPath } from "./attachment-bridge.js";
 import { sanitizeFromAgent } from "./agent-identity.js";
+import {
+  classifyOutboundError,
+  OUTBOUND_BACKOFFS_MS,
+} from "./outbound-retry.js";
+import {
+  appendOutbox,
+  loadOutbox,
+  rewriteOutbox,
+  type OutboxEntry,
+} from "./outbox.js";
 import type {
   ApprovalMeta,
   FromAgentInput,
@@ -42,26 +52,138 @@ export class BgosOutbound {
    *  publishMediaPath). */
   readonly api: BgosApi;
 
+  private typingEmitter:
+    | ((p: { chatId: number; assistantId: number }) => void)
+    | null = null;
+  private onLastError: ((code: string, message: string) => void) | null = null;
+  private onOutbound: (() => void) | null = null;
+  /** Single-flight guard for replaySpool: concurrent callers (the 60s spool
+   *  timer, onReconnect, recover) await the same in-flight run instead of each
+   *  loading + re-sending the same spooled entries (double-send). */
+  private spoolInFlight: Promise<void> | null = null;
+  private sleepFn: (ms: number) => Promise<void> = (ms) =>
+    new Promise((r) => setTimeout(r, ms));
+
   constructor(api: BgosApi) {
     this.api = api;
   }
 
-  /**
-   * Pick the reply endpoint. Default `messages` (POST /api/v1/messages) is
-   * the historical path used for every normal reply, proactive send, and
-   * `/board` fan-out — UNCHANGED. `send-message` (POST /api/v1/send-message)
-   * is used ONLY for a2a peer replies, where the backend's peer-reply
-   * bridge must fire to resolve the initiator's `wait_for_reply`. Keeping
-   * this opt-in means non-a2a behavior (and its push-notification profile)
-   * is untouched.
-   */
-  private deliver(
+  /** Wire the WS typing emitter (contract C4). Without it, sendTyping no-ops. */
+  setTypingEmitter(
+    fn: (p: { chatId: number; assistantId: number }) => void,
+  ): void {
+    this.typingEmitter = fn;
+  }
+
+  /** Report an outbound failure to the heartbeat lastError channel. */
+  setLastErrorReporter(fn: (code: string, message: string) => void): void {
+    this.onLastError = fn;
+  }
+
+  /** Called on every successful send (drives heartbeat lastOutboundAt). */
+  setOutboundReporter(fn: () => void): void {
+    this.onOutbound = fn;
+  }
+
+  /** Test seam: override the retry sleep so specs don't wait real seconds. */
+  setSleepFn(fn: (ms: number) => Promise<void>): void {
+    this.sleepFn = fn;
+  }
+
+  private rawSend(
     payload: OutboundMessagePayload,
     replyVia?: "messages" | "send-message",
   ): Promise<{ id: number }> {
     return replyVia === "send-message"
       ? this.api.sendMessage(payload)
       : this.api.postMessage(payload);
+  }
+
+  /**
+   * Pick the reply endpoint + apply the outbound retry policy (contract C3).
+   *
+   * Default `messages` (POST /api/v1/messages) is the historical path used for
+   * every normal reply, proactive send, and `/board` fan-out. `send-message`
+   * (POST /api/v1/send-message) is used ONLY for a2a peer replies.
+   *
+   * Retry (backoff 1s/5s/25s) applies ONLY to the provably-undelivered
+   * network-error class + 429 (see classifyOutboundError), because the backend
+   * insert is not idempotent. Ambiguous failures (timeouts, 5xx) are NOT
+   * retried and reject to the caller. After 3 failed retries of the safe class
+   * the payload is spooled to the outbox for later replay.
+   */
+  private async deliver(
+    payload: OutboundMessagePayload,
+    replyVia?: "messages" | "send-message",
+  ): Promise<{ id: number }> {
+    let attempt = 0;
+    for (;;) {
+      try {
+        const r = await this.rawSend(payload, replyVia);
+        this.onOutbound?.();
+        return r;
+      } catch (err) {
+        const cls = classifyOutboundError(err);
+        if (cls.retriable && attempt < OUTBOUND_BACKOFFS_MS.length) {
+          const wait = cls.retryAfterMs ?? OUTBOUND_BACKOFFS_MS[attempt];
+          attempt += 1;
+          await this.sleepFn(wait);
+          continue;
+        }
+        const message = err instanceof Error ? err.message : String(err);
+        if (cls.retriable) {
+          // Exhausted the safe class: spool for later replay.
+          appendOutbox({
+            ts: Date.now(),
+            payload,
+            ...(replyVia ? { replyVia } : {}),
+          });
+        }
+        this.onLastError?.("outbound_failed", message);
+        throw err;
+      }
+    }
+  }
+
+  /**
+   * Replay any spooled outbound payloads (contract C3). Called by the adapter
+   * on WS reconnect and every 60s while non-empty. Entries older than 24h are
+   * dropped on load; safe-class failures are re-kept, ambiguous failures on
+   * replay are dropped to avoid a non-idempotent duplicate.
+   *
+   * Single-flight: concurrent callers (the 60s spool timer racing an
+   * onReconnect racing a recover, or WS flapping spawning overlapping
+   * onReconnects) coalesce onto one in-flight run. Two overlapping runs would
+   * otherwise both load the SAME entries and each re-send them, and the backend
+   * insert is NOT idempotent, so that produces duplicate agent messages.
+   */
+  replaySpool(): Promise<void> {
+    if (this.spoolInFlight) return this.spoolInFlight;
+    this.spoolInFlight = this.runReplaySpool().finally(() => {
+      this.spoolInFlight = null;
+    });
+    return this.spoolInFlight;
+  }
+
+  private async runReplaySpool(): Promise<void> {
+    const entries = loadOutbox();
+    if (entries.length === 0) return;
+    // Claim the entries by clearing the spool up-front (atomic tmp + rename).
+    // At-most-once for the non-idempotent insert: a crash mid-replay cannot
+    // double-send on restart, and a concurrent send failure re-spools below.
+    // Failed safe-class entries are re-APPENDED (not rewritten) so a
+    // concurrent deliver() spool during replay is preserved.
+    rewriteOutbox([]);
+    for (const entry of entries) {
+      try {
+        await this.rawSend(entry.payload, entry.replyVia);
+        this.onOutbound?.();
+      } catch (err) {
+        const cls = classifyOutboundError(err);
+        if (cls.retriable) appendOutbox(entry);
+        // Ambiguous replay failures are dropped: the write may have applied.
+      }
+    }
   }
 
   // -------------------------------------------------------------------
@@ -373,19 +495,20 @@ export class BgosOutbound {
   }
 
   /**
-   * Send a "typing..." indicator. Best-effort — the backend doesn't yet
-   * expose a typing endpoint for the integrations channel, so this
-   * resolves immediately. Method is here so the adapter's interface
-   * doesn't change later when the endpoint lands; callers should not
-   * await it for correctness.
+   * Send a "typing..." indicator (contract C4). Emits the client-side WS
+   * `typing` event via the wired emitter (throttled 1/3s per chat inside
+   * BgosWs). Best-effort: no emitter wired (or an emit failure) resolves
+   * silently so a reply path is never broken over a typing indicator.
    */
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  async sendTyping(_params: {
+  async sendTyping(params: {
     assistantId: number;
     chatId: number;
   }): Promise<void> {
-    // No-op; swallow any future errors so we never break a reply path
-    // over a typing indicator.
+    try {
+      this.typingEmitter?.(params);
+    } catch {
+      /* best-effort */
+    }
     return;
   }
 }

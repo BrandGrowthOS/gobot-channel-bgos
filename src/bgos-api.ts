@@ -12,6 +12,7 @@ import {
   type PluginConfig,
 } from "./types.js";
 import type { VoiceRpcResultBody } from "./voice-rpc.js";
+import type { HeartbeatDto } from "./heartbeat.js";
 
 /**
  * Thin typed wrapper around the BGOS integration endpoints. All methods
@@ -84,6 +85,8 @@ export class BgosApi {
        * created as code='openclaw' (wrong UI gates, wrong slash picker).
        */
       integration?: string;
+      /** Daemon version stamped on the pairing row (contract C1). */
+      daemonVersion?: string;
     },
   ): Promise<PairExchangeResponse> {
     const base = baseUrl.replace(/\/+$/, "") + "/api/v1";
@@ -229,6 +232,49 @@ export class BgosApi {
   async listPairings(): Promise<IntegrationPairing[]> {
     const r = await this.http.get("integrations/pairings");
     return r.data;
+  }
+
+  /**
+   * POST a liveness heartbeat (contract C1). Pairing-token auth only. The
+   * backend touches last_seen_at + records daemon_version / last_error_*.
+   * Additive: older backends 404 this route; callers must treat any failure
+   * as non-fatal (the HeartbeatController swallows it).
+   */
+  async postHeartbeat(body: HeartbeatDto): Promise<void> {
+    await this.http.post("integrations/heartbeat", body);
+  }
+
+  /**
+   * Set (or clear) an assistant's status line (contract C4). PATCHes the
+   * pairing-scoped `/integrations/assistants/:assistantId/status`. Pass an
+   * empty string to clear. Fail-open at the call site (fork throttles + never
+   * lets a status write suppress a reply).
+   */
+  async setStatus(
+    assistantId: number,
+    body: { statusText: string | null; statusEmoji?: string | null },
+  ): Promise<void> {
+    await this.http.patch(
+      `integrations/assistants/${assistantId}/status`,
+      body,
+    );
+  }
+
+  /**
+   * Swap the pairing token (and optionally base URL) in place after a token
+   * rotation, so existing references (outbound, tool-progress) keep working
+   * without a rebuild. Used by the adapter's re-pair recovery path.
+   */
+  updateToken(token: string, baseUrl?: string): void {
+    const headers = this.http.defaults.headers as unknown as {
+      common: Record<string, unknown>;
+      [k: string]: unknown;
+    };
+    headers.common["X-BGOS-Pairing"] = token;
+    headers["X-BGOS-Pairing"] = token;
+    if (baseUrl) {
+      this.http.defaults.baseURL = baseUrl.replace(/\/+$/, "") + "/api/v1";
+    }
   }
 
   // -------------------------------------------------------------------

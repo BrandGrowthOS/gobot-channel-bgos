@@ -30,7 +30,13 @@ import {
 } from "./attachment-bridge.js";
 import { buildSystemPromptWithHints } from "./agent-hints.js";
 import { saveLastId } from "./last-id-store.js";
+import {
+  clearPendingUnknown,
+  recordPendingUnknown,
+} from "./pending-unknown-store.js";
+import { ProcessedIdsCache } from "./processed-ids.js";
 import type { BgosOutbound } from "./outbound.js";
+import type { ToolProgressOrchestrator } from "./tool-progress.js";
 import type {
   ApprovalMeta,
   InboundMessagePayload,
@@ -169,7 +175,103 @@ export interface InboundHandlerDeps {
    *  wires `replyHandle.sendToolStart` + `replyHandle.finalizeTurn`
    *  through this. Optional for back-compat; older host code that
    *  doesn't call these methods continues to work, just without cards. */
-  toolProgress?: import("./tool-progress.js").ToolProgressOrchestrator;
+  toolProgress?: ToolProgressOrchestrator;
+  /** Called (best-effort) when a message is about to dispatch, driving the
+   *  heartbeat `lastInboundAt` timestamp. Optional. */
+  onInbound?(): void;
+  /** Rate-limited, single-flight scope refresh invoked when an inbound
+   *  arrives for an assistant_id NOT in the route map. The adapter refreshes
+   *  identity (whoami) so a newly-exposed agent heals without a restart. The
+   *  handler retries the route lookup ONCE after this resolves. Optional. */
+  onUnknownAssistant?(assistantId: number): Promise<void>;
+}
+
+/**
+ * Build a BGOS-scoped ReplyHandle. Extracted so both the inbound dispatch
+ * path AND the adapter's `makeReplyHandle` factory (contract C6, for the
+ * fork's HITL button-click resume) produce an identical surface.
+ *
+ * `replyVia` / `replyToId` are set by the inbound path for a2a peer replies;
+ * `makeReplyHandle` leaves them undefined (a plain reply into a chat).
+ */
+export function buildReplyHandle(
+  deps: { outbound: BgosOutbound; toolProgress?: ToolProgressOrchestrator },
+  target: {
+    assistantId: number;
+    chatId: number;
+    replyVia?: "send-message";
+    replyToId?: number;
+  },
+): ReplyHandle {
+  const { assistantId, chatId, replyVia, replyToId } = target;
+  return {
+    origin: "bgos",
+    sendText: (text) =>
+      deps.outbound.sendText({ assistantId, chatId, text, replyVia, replyToId }),
+    sendButtons: (text, options) =>
+      deps.outbound.sendButtons({
+        assistantId,
+        chatId,
+        text,
+        options,
+        replyVia,
+        replyToId,
+      }),
+    sendApprovalRequest: (text, meta) =>
+      deps.outbound.sendApprovalRequest({
+        assistantId,
+        chatId,
+        text,
+        // SECURITY: ignore any agent-supplied request_id and mint a
+        // fork-generated UUID. The request_id keys the approval-callback
+        // correlation map (ea:<decision>:<reqId>); an agent that picks its
+        // own value could collide with another in-flight approval and steal
+        // or clobber its decision. A v4 UUID is collision-free.
+        meta: { ...meta, request_id: randomUUID() },
+        replyVia,
+        replyToId,
+      }),
+    sendAskUserInput: (prompt, options, modal) =>
+      deps.outbound.sendAskUserInput({ assistantId, chatId, prompt, options, modal }),
+    sendFile: (filePath, caption) =>
+      deps.outbound.sendFile({
+        assistantId,
+        chatId,
+        filePath,
+        caption,
+        replyVia,
+        replyToId,
+      }),
+    sendImage: (filePath, caption) =>
+      deps.outbound.sendImage({
+        assistantId,
+        chatId,
+        filePath,
+        caption,
+        replyVia,
+        replyToId,
+      }),
+    sendVideo: (filePath, caption) =>
+      deps.outbound.sendVideo({
+        assistantId,
+        chatId,
+        filePath,
+        caption,
+        replyVia,
+        replyToId,
+      }),
+    sendTyping: () => deps.outbound.sendTyping({ assistantId, chatId }),
+    uploadFile: (filePath, opts) =>
+      publishMediaPath(deps.outbound.api, filePath, opts),
+    sendToolStart: async (toolName, args) => {
+      if (!deps.toolProgress) return;
+      await deps.toolProgress.sendToolStart({ assistantId, chatId, toolName, args });
+    },
+    finalizeTurn: async () => {
+      if (!deps.toolProgress) return;
+      await deps.toolProgress.finalizeTurn(chatId);
+    },
+  };
 }
 
 /**
@@ -185,23 +287,63 @@ export function createInboundHandler(
   // arrives WITHOUT markers — e.g. a REST `integrations/inbound` poll
   // backfill, which strips them — still gets its reply routed correctly.
   const a2aChats = new Set<number>();
+  // Dedupe cache shared by the live WS path AND the backfill/poll path (both
+  // flow through this handler). Gated AFTER the route resolves so an unknown-
+  // assistant message stays UNCONSUMED and the poll re-fetches it until
+  // identity heals (contract C3). 500-entry FIFO, ported from openclaw.
+  const processedIds = new ProcessedIdsCache(500);
+  // Rate-limit the unknown-assistant warning to 1/min per assistant id.
+  const unknownWarnedAt = new Map<number, number>();
 
   return async function handleInbound(event): Promise<void> {
-    const route = deps.getRouteForAssistant(event.assistantId);
+    let route = deps.getRouteForAssistant(event.assistantId);
     if (!route) {
-      // eslint-disable-next-line no-console
-      console.warn(
-        "[gobot-channel-bgos] inbound for unknown assistant_id=" +
-          event.assistantId +
-          " — dropping",
-      );
-      return;
+      // Unknown assistant: the user likely just exposed a new agent. Ask the
+      // adapter to refresh identity (rate-limited + single-flight), then retry
+      // the lookup ONCE.
+      if (deps.onUnknownAssistant) {
+        try {
+          await deps.onUnknownAssistant(event.assistantId);
+        } catch {
+          /* swallow: the retry below decides the outcome */
+        }
+        route = deps.getRouteForAssistant(event.assistantId);
+      }
+      if (!route) {
+        // Leave the message UNCONSUMED: do NOT mark dedupe, do NOT saveLastId.
+        // Record it as pending-unknown so a sibling KNOWN message's saveLastId
+        // cannot advance the disk cursor past this hole (durable clamp). The 5s
+        // poll re-fetches it until refreshIdentity fills the map. Warn at most
+        // 1/min per assistant so we don't spam the logs.
+        recordPendingUnknown(event.messageId);
+        const now = Date.now();
+        const last = unknownWarnedAt.get(event.assistantId) ?? 0;
+        if (now - last >= 60_000) {
+          unknownWarnedAt.set(event.assistantId, now);
+          // eslint-disable-next-line no-console
+          console.warn(
+            "[gobot-channel-bgos] inbound for unknown assistant_id=" +
+              event.assistantId +
+              " (leaving unconsumed; poll will retry after identity heals)",
+          );
+        }
+        return;
+      }
     }
 
-    // Persist the cursor BEFORE dispatch. A crash inside the agent
-    // handler should not cause an infinite replay on restart (matches
-    // Hermes behavior — see hermes_integration_shipped.md).
+    // Route resolved. Dedupe SYNCHRONOUSLY before the first await: a message
+    // that already dispatched (via the other delivery path) is skipped here,
+    // and only a first-seen message advances the disk cursor.
+    if (!processedIds.markIfFirstTime(event.messageId)) return;
+    // This id is now consumed: clear any pending-unknown record for it BEFORE
+    // saving the cursor so the clamp releases and the cursor can advance to it.
+    // (A message that heals after being stranded flows through here once its
+    // route resolves.) No-op when the id was never pending.
+    clearPendingUnknown(event.messageId);
+    // Persist the cursor BEFORE dispatch. A crash inside the agent handler
+    // should not cause an infinite replay on restart (matches Hermes).
     saveLastId(event.messageId);
+    deps.onInbound?.();
 
     // Translate BGOS attachments to local file paths. Failures are
     // surfaced as a single agent_error and the message is still
@@ -248,101 +390,17 @@ export function createInboundHandler(
       ? event.messageId
       : undefined;
 
-    // Build the BGOS-scoped ReplyHandle. Closure-captures the outbound
-    // adapter + identifiers so the agent code never needs to know the
-    // chat/assistant ids — it just calls `replyHandle.sendText("...")`.
-    const replyHandle: ReplyHandle = {
-      origin: "bgos",
-      sendText: (text) =>
-        deps.outbound.sendText({
-          assistantId: event.assistantId,
-          chatId: event.chatId,
-          text,
-          replyVia,
-          replyToId,
-        }),
-      sendButtons: (text, options) =>
-        deps.outbound.sendButtons({
-          assistantId: event.assistantId,
-          chatId: event.chatId,
-          text,
-          options,
-          replyVia,
-          replyToId,
-        }),
-      sendApprovalRequest: (text, meta) =>
-        deps.outbound.sendApprovalRequest({
-          assistantId: event.assistantId,
-          chatId: event.chatId,
-          text,
-          // SECURITY: ignore any agent-supplied request_id and mint a
-          // fork-generated UUID. The request_id keys the approval-callback
-          // correlation map (ea:<decision>:<reqId>); an agent that picks
-          // its own value could collide with another in-flight approval
-          // and steal/clobber its decision. A v4 UUID is collision-free.
-          meta: { ...meta, request_id: randomUUID() },
-          replyVia,
-          replyToId,
-        }),
-      sendAskUserInput: (prompt, options, modal) =>
-        deps.outbound.sendAskUserInput({
-          assistantId: event.assistantId,
-          chatId: event.chatId,
-          prompt,
-          options,
-          modal,
-        }),
-      sendFile: (filePath, caption) =>
-        deps.outbound.sendFile({
-          assistantId: event.assistantId,
-          chatId: event.chatId,
-          filePath,
-          caption,
-          replyVia,
-          replyToId,
-        }),
-      sendImage: (filePath, caption) =>
-        deps.outbound.sendImage({
-          assistantId: event.assistantId,
-          chatId: event.chatId,
-          filePath,
-          caption,
-          replyVia,
-          replyToId,
-        }),
-      sendVideo: (filePath, caption) =>
-        deps.outbound.sendVideo({
-          assistantId: event.assistantId,
-          chatId: event.chatId,
-          filePath,
-          caption,
-          replyVia,
-          replyToId,
-        }),
-      sendTyping: () =>
-        deps.outbound.sendTyping({
-          assistantId: event.assistantId,
-          chatId: event.chatId,
-        }),
-      uploadFile: (filePath, opts) =>
-        publishMediaPath(deps.outbound.api, filePath, opts),
-      // tool_progress wiring — gracefully no-ops when older host code
-      // constructed the adapter without an orchestrator. New host code
-      // (fork v2026-05-16+) passes the orchestrator via adapter.toolProgress.
-      sendToolStart: async (toolName, args) => {
-        if (!deps.toolProgress) return;
-        await deps.toolProgress.sendToolStart({
-          assistantId: event.assistantId,
-          chatId: event.chatId,
-          toolName,
-          args,
-        });
+    // Build the BGOS-scoped ReplyHandle via the shared factory (identical to
+    // the surface the adapter's makeReplyHandle exposes for HITL resume).
+    const replyHandle: ReplyHandle = buildReplyHandle(
+      { outbound: deps.outbound, toolProgress: deps.toolProgress },
+      {
+        assistantId: event.assistantId,
+        chatId: event.chatId,
+        replyVia,
+        replyToId,
       },
-      finalizeTurn: async () => {
-        if (!deps.toolProgress) return;
-        await deps.toolProgress.finalizeTurn(event.chatId);
-      },
-    };
+    );
 
     const dispatch = deps.getDispatch();
     if (!dispatch) {

@@ -94,7 +94,10 @@ export interface AssistantUnboundPayload {
 
 export interface PairingRevokedPayload {
   pairingId: number;
-  reason?: string;
+  /** Why the pairing became unusable. `'revoked'` (user deleted the pairing)
+   *  or `'rotated'` (token rotated: re-pair with the new token). Absent on
+   *  older backends; the adapter treats an absent reason as `'revoked'`. */
+  reason?: "revoked" | "rotated" | string;
 }
 
 export interface CallbackResultPayload {
@@ -103,6 +106,23 @@ export interface CallbackResultPayload {
   success: boolean;
   error?: string;
   assistantId?: number;
+}
+
+/**
+ * Inbound button-click event (`inbound_click`). Emitted to `assistant:<id>`
+ * when the user taps an inline button. Unlike `callback_result` (the n8n
+ * success/error lane, which has NO callbackData), this carries the raw
+ * `callbackData` so the adapter can route approval clicks (`ea:*`) through the
+ * ApprovalHandler and forward everything else to the fork's onButtonClick hook.
+ */
+export interface InboundClickPayload {
+  assistantId: number;
+  userId: string;
+  chatId: number;
+  messageId: number;
+  optionId: number;
+  callbackData: string;
+  buttonText?: string;
 }
 
 /** Option = button on a message (Telegram inline-keyboard equivalent). */

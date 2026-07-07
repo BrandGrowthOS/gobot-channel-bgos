@@ -23,6 +23,8 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
+import { lowestPendingUnknown } from "./pending-unknown-store.js";
+
 /** Resolve the target file path; respects `GOBOT_HOME` env override. */
 function lastIdPath(): string {
   const root = process.env.GOBOT_HOME ?? join(homedir(), ".gobot");
@@ -62,19 +64,33 @@ export function loadLastId(): number {
  *     advance monotonically). This guards against a backfill replay
  *     accidentally rewinding the cursor.
  *
+ * Clamp: the cursor never advances past the LOWEST still-pending unknown
+ * assistant id (see pending-unknown-store). Without this a sibling KNOWN
+ * message with a higher id would push the cursor past an unconsumed unknown
+ * message, stranding it forever (silent loss). The clamp holds the cursor just
+ * below the hole so the inbound window stays re-fetchable until the route heals
+ * and the pending id is consumed + cleared.
+ *
  * Errors are caught + ignored — see module docstring.
  */
 export function saveLastId(id: number): void {
   if (!Number.isFinite(id) || !Number.isInteger(id) || id <= 0) return;
   try {
     const current = loadLastId();
-    if (id <= current) return;
+    // Clamp against the lowest pending-unknown id so the cursor never strands
+    // an unconsumed message above the hole.
+    let advanceTo = id;
+    const lowest = lowestPendingUnknown();
+    if (lowest !== null && advanceTo >= lowest) {
+      advanceTo = lowest - 1;
+    }
+    if (advanceTo <= current) return;
     const target = lastIdPath();
     mkdirSync(dirname(target), { recursive: true });
     // Write to a sibling tempfile then rename so a partial write never
     // leaves us with a corrupt cursor.
     const tmp = `${target}.${process.pid}.tmp`;
-    writeFileSync(tmp, String(id), { mode: 0o600 });
+    writeFileSync(tmp, String(advanceTo), { mode: 0o600 });
     renameSync(tmp, target);
   } catch {
     /* swallow — see module docstring */

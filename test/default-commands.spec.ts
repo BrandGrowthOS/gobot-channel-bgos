@@ -10,8 +10,8 @@ const NAME_PATTERN = /^[a-z0-9_]{1,32}$/;
 const DESCRIPTION_MAX = 100;
 
 describe("default-commands", () => {
-  it("ships exactly seven commands", () => {
-    expect(DEFAULT_COMMANDS).toHaveLength(7);
+  it("ships the full command-router surface (twelve commands)", () => {
+    expect(DEFAULT_COMMANDS).toHaveLength(12);
   });
 
   it("every command name matches ^[a-z0-9_]{1,32}$", () => {
@@ -27,7 +27,7 @@ describe("default-commands", () => {
     }
   });
 
-  it("includes the canonical seven Gobot commands in the documented order", () => {
+  it("includes the canonical Gobot commands in the documented order", () => {
     const names = DEFAULT_COMMANDS.map((c) => c.command);
     expect(names).toEqual([
       "remember",
@@ -37,6 +37,11 @@ describe("default-commands", () => {
       "cancel",
       "critic",
       "board",
+      "goals",
+      "memory",
+      "tasks",
+      "credit",
+      "plan",
     ]);
   });
 

@@ -1,22 +1,23 @@
 import type { CommandManifestEntry } from "./types.js";
 
 /**
- * Gobot's seven built-in user-invocable slash commands.
+ * Gobot's built-in user-invocable slash commands (the full command-router
+ * surface).
  *
  * These pre-populate BGOS's slash picker for a freshly bound assistant so
  * the user gets Gobot's full vocabulary without hand-typing each row.
  *
  * Names match `^[a-z0-9_]{1,32}$`. Descriptions ≤100 characters so they
- * fit BGOS's slash-picker chip.
+ * fit BGOS's slash-picker chip. No em dashes in copy.
  *
- * Source: extracted from Gobot's `src/bot.ts` text-prefix command parser
- * (see plan §2.3). When upstream Gobot adds or removes commands, update
- * this list — but only fresh manifests (`command_count === 0`) are seeded
- * automatically by default, so a stale default never stomps a user's
+ * Source: extracted from Gobot's `src/bot.ts` text-prefix command parser plus
+ * the fork's command-router (contract C6). When upstream Gobot adds or removes
+ * commands, update this list. Only fresh manifests (`command_count === 0`) are
+ * seeded automatically by default, so a stale default never stomps a user's
  * edits. Set `GOBOT_BGOS_RESEED_COMMANDS=always` to force a reseed.
  *
- * Order is the picker order — ordering by frequency-of-use rather than
- * alphabetical so the typical "remember/track" pair sits at the top.
+ * Order is the picker order: frequency-of-use first (the "remember/track"
+ * pair on top), then the read-only lookups.
  */
 const _DEFAULT_COMMANDS: ReadonlyArray<{
   name: string;
@@ -32,6 +33,11 @@ const _DEFAULT_COMMANDS: ReadonlyArray<{
     description: "Ask the critic agent for a devil's advocate take",
   },
   { name: "board", description: "Run a multi-agent board meeting on a topic" },
+  { name: "goals", description: "List your tracked goals" },
+  { name: "memory", description: "Show what the agent remembers" },
+  { name: "tasks", description: "List your open tasks" },
+  { name: "credit", description: "Check your remaining credit balance" },
+  { name: "plan", description: "Draft a plan for a goal or project" },
 ] as const;
 
 /**
