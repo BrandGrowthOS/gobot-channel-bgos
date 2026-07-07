@@ -12,9 +12,10 @@ import type {
  * returns a promise that resolves when the user clicks Approve/Deny via
  * the corresponding callback_result WS event.
  *
- * Correlation happens via ApprovalMeta.request_id, which we embed into
- * each option's callback_data as `__approval__:<decision>:<req_id>`.
- * handleCallbackResult(...) is the wiring hook for the WS listener.
+ * Correlation happens via ApprovalMeta.request_id, embedded into each
+ * option's callback_data as `ea:<decision>:<req_id>` (Telegram parity). The
+ * legacy `__approval__:<decision>:<req_id>` form is still accepted for compat.
+ * handleCallbackResult(...) is the wiring hook for the WS inbound_click lane.
  */
 
 export type ApprovalDecision = "approve" | "deny";
@@ -73,27 +74,40 @@ export class ApprovalHandler {
   }
 
   /**
-   * Wire this into BgosWs.on("callback_result", ...). Decodes
-   * __approval__:<decision>:<req_id> from the option's callback_data and
-   * resolves the matching pending approval, if any.
+   * Wire this into the WS inbound_click lane. Decodes
+   * `ea:<decision>:<req_id>` (or legacy `__approval__:<decision>:<req_id>`)
+   * from the option's callback_data and resolves the matching pending
+   * approval, if any.
+   *
+   * The 4-button bubble uses decisions once|session|always|deny; once/session/
+   * always all resolve to `approve` (the scope choice is applied by the fork's
+   * approval store, not here), and deny resolves to `deny`.
    *
    * Returns true if the payload matched a pending approval, false otherwise
-   * (regular button click — caller should route it to the agent's
-   * interaction handler).
+   * (regular button click: caller should route it to the fork's onButtonClick
+   * handler; an approval-consumed click is NOT also forwarded).
    */
   handleCallbackResult(
     payload: CallbackResultPayload & { callbackData?: string },
   ): boolean {
     const cb = payload.callbackData;
-    if (!cb?.startsWith("__approval__:")) return false;
+    if (!cb) return false;
+    if (!cb.startsWith("ea:") && !cb.startsWith("__approval__:")) return false;
     const [, decision, reqId] = cb.split(":");
     if (!decision || !reqId) return false;
     const entry = this.pending.get(reqId);
     if (!entry) return false;
     clearTimeout(entry.timeout);
     this.pending.delete(reqId);
-    if (decision === "approve" || decision === "deny") {
-      entry.resolve(decision);
+    if (decision === "deny") {
+      entry.resolve("deny");
+    } else if (
+      decision === "approve" ||
+      decision === "once" ||
+      decision === "session" ||
+      decision === "always"
+    ) {
+      entry.resolve("approve");
     } else {
       entry.reject(new Error(`unknown approval decision: ${decision}`));
     }

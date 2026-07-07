@@ -13,7 +13,20 @@
  * Public surface kept narrow — the fork only needs adapter lifecycle +
  * outbound primitives + the agent-hints + default-commands constants.
  */
-export { BGOSAdapter, type BgosConfig } from "./adapter.js";
+export {
+  BGOSAdapter,
+  type BgosConfig,
+  type ButtonClickInfo,
+  type FatalInfo,
+} from "./adapter.js";
+export { getPackageVersion } from "./version.js";
+export {
+  HeartbeatController,
+  type HeartbeatDto,
+  type HeartbeatFileState,
+  type HeartbeatLastError,
+} from "./heartbeat.js";
+export { ProcessedIdsCache } from "./processed-ids.js";
 export { BgosOutbound, BGOSOutbound } from "./outbound.js";
 export { BGOS_AGENT_HINTS, buildSystemPromptWithHints } from "./agent-hints.js";
 export {
@@ -51,6 +64,7 @@ export {
 } from "./agent-identity.js";
 export { syncCatalog, type CatalogAgent } from "./catalog-sync.js";
 export {
+  buildReplyHandle,
   createInboundHandler,
   type DispatchArgs,
   type DispatchFn,
@@ -62,7 +76,13 @@ export { ApprovalHandler, type ApprovalDecision } from "./approval-handler.js";
 export { CommandsSync } from "./commands-sync.js";
 export { BgosApi } from "./bgos-api.js";
 export { BgosWs } from "./bgos-ws.js";
-export { pairBgos, type PairCliOptions, type PairResult } from "./pair-cli.js";
+export {
+  pairBgos,
+  pairBgosWithToken,
+  type PairCliOptions,
+  type PairResult,
+  type PairWithTokenOptions,
+} from "./pair-cli.js";
 export {
   buildConsultToolDefinition,
   buildConsultTurnText,
@@ -104,6 +124,7 @@ export type {
   FromAgentInput,
   InboundFile,
   InboundMessagePayload,
+  InboundClickPayload,
   IntegrationDirection,
   IntegrationPairing,
   MessageOption,

@@ -1,25 +1,33 @@
 #!/usr/bin/env node
 import { hostname } from "node:os";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, rename, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { BgosApi } from "./bgos-api.js";
-import type { AgentCatalogEntry, PairExchangeResponse } from "./types.js";
+import { getPackageVersion } from "./version.js";
+import {
+  PairingRevokedError,
+  type AgentCatalogEntry,
+  type PairExchangeResponse,
+} from "./types.js";
 
 /**
- * CLI entry point for `gobot-pair-bgos <CODE>`.
+ * CLI entry point for `gobot-pair-bgos`.
  *
- * Steps:
- *   1. POST /api/v1/integrations/pair-exchange with the user-supplied
- *      code, a derived device label (os.hostname()), and the local
- *      agent-route catalog (passed in by caller).
- *   2. Persist the raw pairing_token at ~/.gobot/secrets/bgos.json
- *      (0600 perms). Caller can hand it off to the proper secret store.
+ * Two modes:
+ *   - Pair-code mode: `gobot-pair-bgos <CODE>`, POST /integrations/pair-exchange
+ *     with the code, a device label, the daemon version, and the local agent
+ *     catalog, then persist the returned token.
+ *   - Token mode: `gobot-pair-bgos --token -` (reads the token from stdin) or
+ *     `--token <value>` (scripting; shell-history caveat documented). Validates
+ *     via GET /integrations/me (learns pairing_id/user_id), then persists.
  *
- * Exit-code convention (set by the CLI wrapper):
+ * The secrets file is written ATOMICALLY (tmp + rename, 0600) in both modes.
+ *
+ * Exit codes:
  *   0 success
  *   1 network error
- *   2 invalid/consumed/expired code
+ *   2 invalid/consumed/expired code, or invalid token (401)
  */
 
 export interface PairResult {
@@ -35,34 +43,87 @@ export interface PairCliOptions {
   secretsDir?: string;
 }
 
+function defaultSecretsDir(): string {
+  return join(
+    process.env.HOME ?? process.env.USERPROFILE ?? ".",
+    ".gobot",
+    "secrets",
+  );
+}
+
+/** Atomically persist the secrets file (tmp + rename, 0600). */
+async function writeSecretsAtomic(
+  secretsDir: string,
+  payload: Record<string, unknown>,
+): Promise<string> {
+  await mkdir(secretsDir, { recursive: true });
+  const tokenFile = join(secretsDir, "bgos.json");
+  const tmp = `${tokenFile}.${process.pid}.tmp`;
+  await writeFile(tmp, JSON.stringify(payload, null, 2), { mode: 0o600 });
+  await rename(tmp, tokenFile);
+  return tokenFile;
+}
+
 export async function pairBgos(opts: PairCliOptions): Promise<PairResult> {
   const label = opts.deviceLabel ?? `${hostname()} (Gobot)`;
   const res = await BgosApi.pairExchange(opts.baseUrl, {
     code: opts.code,
     deviceLabel: label,
     agentCatalog: opts.agentCatalog,
-    // Tag the pairing so it lands under the Gobot card (and assistants
-    // get created with code='gobot'). Without this, the backend defaults
-    // to 'openclaw' and the pairing surfaces in the wrong card.
+    // Tag the pairing so it lands under the Gobot card (assistants get
+    // created with code='gobot'). Without this the backend defaults to
+    // 'openclaw' and the pairing surfaces in the wrong card.
     integration: "gobot",
+    daemonVersion: getPackageVersion(),
   });
 
-  const secretsDir =
-    opts.secretsDir ??
-    join(process.env.HOME ?? process.env.USERPROFILE ?? ".", ".gobot", "secrets");
-  await mkdir(secretsDir, { recursive: true });
-  const tokenFile = join(secretsDir, "bgos.json");
-  const payload = {
+  const secretsDir = opts.secretsDir ?? defaultSecretsDir();
+  const tokenFile = await writeSecretsAtomic(secretsDir, {
     baseUrl: opts.baseUrl.replace(/\/+$/, ""),
     pairingToken: res.pairing_token,
     pairingId: res.pairing_id,
     userId: res.user_id,
     pairedAt: new Date().toISOString(),
-  };
-  await writeFile(tokenFile, JSON.stringify(payload, null, 2), {
-    mode: 0o600,
   });
   return { pairing: res, tokenFile };
+}
+
+export interface PairWithTokenOptions {
+  baseUrl: string;
+  token: string;
+  secretsDir?: string;
+}
+
+/**
+ * Token mode: validate an existing pairing token via GET /integrations/me
+ * (learns pairing_id/user_id), then persist the secrets file atomically.
+ * Throws PairingRevokedError (mapped from 401) for an invalid token.
+ */
+export async function pairBgosWithToken(
+  opts: PairWithTokenOptions,
+): Promise<PairResult> {
+  const api = new BgosApi({
+    baseUrl: opts.baseUrl.replace(/\/+$/, ""),
+    pairingToken: opts.token,
+    reconnect: { initialDelayMs: 1000, maxDelayMs: 30000 },
+  });
+  const me = await api.whoami();
+  const secretsDir = opts.secretsDir ?? defaultSecretsDir();
+  const tokenFile = await writeSecretsAtomic(secretsDir, {
+    baseUrl: opts.baseUrl.replace(/\/+$/, ""),
+    pairingToken: opts.token,
+    pairingId: me.pairing_id,
+    userId: me.user_id,
+    pairedAt: new Date().toISOString(),
+  });
+  return {
+    pairing: {
+      pairing_token: opts.token,
+      pairing_id: me.pairing_id,
+      user_id: me.user_id,
+    },
+    tokenFile,
+  };
 }
 
 const DEFAULT_BASE_URL = "https://api.brandgrowthos.ai";
@@ -90,6 +151,13 @@ function takeFlag(argv: string[], flag: string): string | undefined {
   return val;
 }
 
+/** Read a single line/blob from stdin (used for `--token -`). */
+async function readStdin(): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const c of process.stdin) chunks.push(c as Buffer);
+  return Buffer.concat(chunks).toString("utf8").trim();
+}
+
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
   const deviceLabel = takeFlag(argv, "--device-label");
@@ -97,11 +165,42 @@ async function main(): Promise<void> {
     takeFlag(argv, "--base-url") ??
     process.env.BGOS_BASE_URL ??
     DEFAULT_BASE_URL;
-  const code = argv.find((a) => !a.startsWith("--"));
+  const tokenFlag = takeFlag(argv, "--token");
 
+  // ---- Token mode ---------------------------------------------------
+  if (tokenFlag !== undefined) {
+    try {
+      let token = tokenFlag;
+      if (token === "-") {
+        token = await readStdin();
+      }
+      if (!token) {
+        process.stderr.write("No token provided on stdin.\n");
+        process.exit(2);
+      }
+      const { pairing, tokenFile } = await pairBgosWithToken({ baseUrl, token });
+      process.stdout.write(`Token accepted. Secret written to ${tokenFile}\n`);
+      process.stdout.write(
+        `pairing_id=${pairing.pairing_id} user_id=${pairing.user_id}\n`,
+      );
+      process.exit(0);
+    } catch (err: unknown) {
+      const e = err as { response?: { status?: number }; message?: string };
+      if (err instanceof PairingRevokedError || e?.response?.status === 401) {
+        process.stderr.write("Token rejected (401): invalid or revoked.\n");
+        process.exit(2);
+      }
+      process.stderr.write(`Token validation failed: ${e?.message ?? String(err)}\n`);
+      process.exit(1);
+    }
+  }
+
+  // ---- Pair-code mode -----------------------------------------------
+  const code = argv.find((a) => !a.startsWith("--"));
   if (!code) {
     process.stderr.write(
-      "usage: gobot-pair-bgos <CODE> [--device-label NAME] [--base-url URL]\n",
+      "usage: gobot-pair-bgos <CODE> [--device-label NAME] [--base-url URL]\n" +
+        "       gobot-pair-bgos --token -   (reads a pairing token from stdin)\n",
     );
     process.exit(2);
   }

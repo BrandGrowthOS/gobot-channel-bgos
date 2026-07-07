@@ -1,4 +1,9 @@
-import { BGOSAdapter, type BgosConfig } from "./adapter.js";
+import {
+  BGOSAdapter,
+  type BgosConfig,
+  type ButtonClickInfo,
+  type FatalInfo,
+} from "./adapter.js";
 import type { DispatchFn } from "./inbound-handler.js";
 
 /**
@@ -9,6 +14,10 @@ import type { DispatchFn } from "./inbound-handler.js";
 export interface ForkLoaderOpts {
   getAgentSystemPrompt?: (route: string) => string;
   dispatch: (args: ForkDispatchArgs) => Promise<void>;
+  /** Called ONCE when the pairing is revoked/rotated (contract C2). */
+  onFatal?: (info: FatalInfo) => void;
+  /** Called for a non-approval inline-button tap (contract C6). */
+  onButtonClick?: (info: ButtonClickInfo) => void | Promise<void>;
 }
 
 export interface ForkDispatchArgs {
@@ -55,6 +64,8 @@ export function createAdapter(
     ...config,
     getSystemPrompt:
       config.getSystemPrompt ?? opts.getAgentSystemPrompt ?? (() => ""),
+    ...(opts.onFatal ? { onFatal: opts.onFatal } : {}),
+    ...(opts.onButtonClick ? { onButtonClick: opts.onButtonClick } : {}),
   };
 
   const adapter = new BGOSAdapter(merged);
