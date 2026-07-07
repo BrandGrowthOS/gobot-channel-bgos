@@ -244,6 +244,54 @@ describe("mint", () => {
     expect(sent.session.audio.input.turn_detection).toBeTruthy();
   });
 
+  it("mints with the CALLER's OpenAI key from the frame, never the host env owner key", async () => {
+    let authHeader = "";
+    const fetchImpl = (async (
+      _url: unknown,
+      init?: { headers?: Record<string, string> },
+    ) => {
+      authHeader = init?.headers?.Authorization ?? "";
+      return new Response(
+        JSON.stringify({ value: "ek_test_secret", expires_at: 1_780_000_000 }),
+        { status: 200 },
+      );
+    }) as unknown as typeof fetch;
+    const { handler, calls } = makeHarness({
+      fetchImpl,
+      config: { openaiApiKey: "sk-host-owner-key" },
+    });
+    await handler.handle(
+      frame({
+        op: "mint",
+        payload: { recentContext: "", openaiApiKey: "sk-caller-own-key" },
+      }),
+    );
+    // The caller's own key is spent, not the host env owner key.
+    expect(authHeader).toBe("Bearer sk-caller-own-key");
+    expect(authHeader).not.toContain("sk-host-owner-key");
+    expect(calls.results[0]!.body.ok).toBe(true);
+  });
+
+  it("falls back to the host env OpenAI key only when the frame carries no caller key (standalone host)", async () => {
+    let authHeader = "";
+    const fetchImpl = (async (
+      _url: unknown,
+      init?: { headers?: Record<string, string> },
+    ) => {
+      authHeader = init?.headers?.Authorization ?? "";
+      return new Response(
+        JSON.stringify({ value: "ek_test_secret", expires_at: 1_780_000_000 }),
+        { status: 200 },
+      );
+    }) as unknown as typeof fetch;
+    const { handler } = makeHarness({
+      fetchImpl,
+      config: { openaiApiKey: "sk-host-owner-key" },
+    });
+    await handler.handle(frame({ op: "mint", payload: { recentContext: "" } }));
+    expect(authHeader).toBe("Bearer sk-host-owner-key");
+  });
+
   it("normalizeVoiceConfig sanitizes the wire (junk dropped, speed clamped, cap applied)", () => {
     expect(normalizeVoiceConfig(undefined)).toEqual({});
     expect(normalizeVoiceConfig("cedar")).toEqual({});
