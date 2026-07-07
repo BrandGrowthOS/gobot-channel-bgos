@@ -40,6 +40,28 @@ function readSecrets(): SecretsFile | null {
   return null;
 }
 
+/**
+ * Synchronous, never-throwing read of the pairing secrets written by
+ * `gobot-pair-bgos` (`~/.gobot/secrets/bgos.json`). Returns `null` when the
+ * file is missing, unreadable, malformed, or the token is too short.
+ *
+ * Intended for constructors that cannot `await` (e.g. `BgosProactiveClient`),
+ * so the SEPARATE proactive check-in/briefing processes — which do not inherit
+ * the adapter's `GOBOT_PAIRING_TOKEN` env — can still authenticate off the same
+ * secrets file the long-running adapter uses. Safe to call unconditionally; a
+ * missing file simply yields `null`.
+ */
+export function readSecretsSafe(): {
+  pairingToken?: string;
+  baseUrl?: string;
+} | null {
+  try {
+    return readSecrets();
+  } catch {
+    return null;
+  }
+}
+
 function parseAgents(raw: string | undefined): CatalogAgent[] {
   if (!raw) return [];
   return raw

@@ -141,6 +141,34 @@ export class BgosApi {
     return Array.isArray(rows) ? (rows as BgosMessageEnvelope[]) : [];
   }
 
+  /**
+   * Self-resolve (or create) this assistant's primary BGOS delivery chat —
+   * the target for proactive / check-in sends when no `GOBOT_BGOS_CHAT_ID`
+   * env override is set (parity root cause D). Pairing-token auth only (the
+   * pairing must own the assistant; the backend enforces this).
+   *
+   * `POST /integrations/assistants/:assistantId/primary-chat` (no body). The
+   * backend resolves the assistant's `primaryChatId`, else the newest
+   * `kind='main'` chat, else creates a fresh main chat (pinning only on a
+   * fresh create). Response is `{ chat_id: number }`.
+   *
+   * Throws on any non-2xx or a malformed response — the caller (proactive
+   * `loadTargets`) treats a throw as "skip this assistant".
+   */
+  async getOrCreatePrimaryChat(assistantId: number): Promise<number> {
+    const r = await this.http.post(
+      `integrations/assistants/${assistantId}/primary-chat`,
+      {},
+    );
+    const chatId = (r.data as { chat_id?: number } | null)?.chat_id;
+    if (typeof chatId !== "number" || !Number.isFinite(chatId) || chatId <= 0) {
+      throw new Error(
+        `primary-chat endpoint returned no chat_id for assistant ${assistantId}`,
+      );
+    }
+    return chatId;
+  }
+
   /** Agent reply — assistant message with optional inline buttons/approval. */
   async postMessage(
     payload: OutboundMessagePayload,

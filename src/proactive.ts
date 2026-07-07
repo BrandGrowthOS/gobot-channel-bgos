@@ -24,6 +24,7 @@
 import { BgosApi } from "./bgos-api.js";
 import { sanitizeFromAgent } from "./agent-identity.js";
 import { resolveHomeChannel, type HomeChannel } from "./home-channel.js";
+import { readSecretsSafe } from "./load-config.js";
 import type {
   FromAgentInput,
   MessageOption,
@@ -95,18 +96,40 @@ export class BgosProactiveClient {
   private readonly api: BgosApi;
   private readonly cfg: PluginConfig;
   private targets: AssistantTarget[] | null = null;
+  /**
+   * Self-resolved delivery chats, keyed by assistantId. Populated the first
+   * time an assistant is resolved via the primary-chat endpoint and kept for
+   * the lifetime of this process so a multi-send cron only POSTs once per
+   * assistant (even if `targets` were ever rebuilt).
+   */
+  private readonly resolvedChats = new Map<number, number>();
+  /** Last primary-chat resolve failure per assistant (for a clear skip msg). */
+  private readonly resolveErrors = new Map<number, string>();
 
   constructor(init: ProactiveClientInit = {}) {
-    const baseUrl =
+    const envBaseUrl =
       init.baseUrl ??
       process.env.GOBOT_BASE_URL ??
-      process.env.BGOS_BASE_URL ??
-      DEFAULT_BASE_URL;
-    const pairingToken =
+      process.env.BGOS_BASE_URL;
+    const envToken =
       init.pairingToken ??
       process.env.GOBOT_PAIRING_TOKEN ??
-      process.env.BGOS_PAIRING_TOKEN ??
-      "";
+      process.env.BGOS_PAIRING_TOKEN;
+    // Fall back to the pairing secrets file (`~/.gobot/secrets/bgos.json`) only
+    // when init/env leaves the token or base URL unset. The SEPARATE proactive
+    // check-in/briefing processes (launchd `com.go.smart-checkin`, `bun run
+    // checkin`) do not inherit the adapter's GOBOT_PAIRING_TOKEN env, so without
+    // this every proactive send would be skipped as "unconfigured". Reading is
+    // synchronous + never throws, so a missing/corrupt file simply leaves the
+    // token undefined and isConfigured() stays false (graceful no-op). Composes
+    // with the primary-chat self-resolve so a freshly-paired host gets
+    // zero-config proactive delivery.
+    const secrets =
+      !envToken || !envBaseUrl ? readSecretsSafe() : null;
+    const baseUrl =
+      envBaseUrl ?? secrets?.baseUrl ?? DEFAULT_BASE_URL;
+    const pairingToken =
+      envToken ?? secrets?.pairingToken ?? "";
     this.cfg = {
       baseUrl: baseUrl.replace(/\/+$/, ""),
       pairingToken,
@@ -121,11 +144,19 @@ export class BgosProactiveClient {
   }
 
   /**
-   * Resolve assistant + chat targets. The chat is the assistant's
-   * most-recent chat (last message in `getMessages` ordered ASC); when
-   * the assistant has no messages yet, the proactive send is skipped
-   * (we don't auto-create a chat from a cron — that's the user's
-   * decision and would surface as a noisy empty thread).
+   * Resolve assistant + chat targets for proactive delivery.
+   *
+   * Chat resolution precedence per assistant:
+   *   1. `GOBOT_BGOS_CHAT_ID_<assistantId>` env override (most specific),
+   *   2. `GOBOT_BGOS_CHAT_ID` env override (shared fallback),
+   *   3. the backend `primary-chat` endpoint — the daemon self-resolves (or
+   *      creates) the assistant's delivery chat so the operator never has to
+   *      set an env var (parity root cause D).
+   *
+   * We only touch the network (step 3) when neither env override is present,
+   * and the result is cached for the process lifetime (see `resolvePrimaryChat`).
+   * When step 3 fails, `chatId` stays null and the assistant is skipped with a
+   * clear error (never thrown — proactive must not abort the Telegram leg).
    */
   private async loadTargets(): Promise<AssistantTarget[]> {
     if (this.targets) return this.targets;
@@ -133,18 +164,9 @@ export class BgosProactiveClient {
     const userId = me.user_id;
     const targets: AssistantTarget[] = [];
     for (const a of me.assistants ?? []) {
-      let chatId: number | null = null;
-      try {
-        // We don't have a direct "list chats for assistant" on the
-        // integrations surface, so we cheat: getMessages requires a
-        // chatId we don't have. For V1 we pin proactive deliveries to
-        // the assistant's most-recent chat by listing pairings → no,
-        // pairings doesn't give us that either. Fall through and let
-        // the fork pass `assistantIds` + a known `chatId` via the
-        // env var below when it has one.
-        chatId = readChatIdEnv(a.assistant_id);
-      } catch {
-        chatId = null;
+      let chatId: number | null = readChatIdEnv(a.assistant_id);
+      if (chatId === null) {
+        chatId = await this.resolvePrimaryChat(a.assistant_id);
       }
       targets.push({
         assistantId: a.assistant_id,
@@ -155,6 +177,30 @@ export class BgosProactiveClient {
     this.targets = targets;
     void userId;
     return targets;
+  }
+
+  /**
+   * Self-resolve the assistant's BGOS delivery chat via the backend, memoized
+   * per assistant for the lifetime of this process so repeated proactive sends
+   * do not re-POST. Returns null (never throws) when the endpoint is
+   * unavailable; the underlying reason is stashed in `resolveErrors` so the
+   * caller can surface a clear, skippable message.
+   */
+  private async resolvePrimaryChat(assistantId: number): Promise<number | null> {
+    const cached = this.resolvedChats.get(assistantId);
+    if (cached !== undefined) return cached;
+    try {
+      const chatId = await this.api.getOrCreatePrimaryChat(assistantId);
+      this.resolvedChats.set(assistantId, chatId);
+      this.resolveErrors.delete(assistantId);
+      return chatId;
+    } catch (err) {
+      this.resolveErrors.set(
+        assistantId,
+        err instanceof Error ? err.message : String(err),
+      );
+      return null;
+    }
   }
 
   /**
@@ -217,11 +263,15 @@ export class BgosProactiveClient {
     const errors: Array<{ assistantId: number; error: string }> = [];
     for (const t of filtered) {
       if (t.chatId === null) {
+        // Neither an env override nor the primary-chat endpoint yielded a
+        // chat. Skip this assistant (never throw — the Telegram leg must
+        // still fire) with a message that reflects the self-resolve path.
+        const reason = this.resolveErrors.get(t.assistantId);
         errors.push({
           assistantId: t.assistantId,
           error:
-            "no chat target — set GOBOT_BGOS_CHAT_ID or " +
-            `GOBOT_BGOS_CHAT_ID_${t.assistantId} env var to enable proactive routing`,
+            "the daemon could not resolve a BGOS delivery chat for this assistant" +
+            (reason ? ` (primary-chat endpoint failed: ${reason})` : ""),
         });
         continue;
       }
