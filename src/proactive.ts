@@ -24,6 +24,7 @@
 import { BgosApi } from "./bgos-api.js";
 import { sanitizeFromAgent } from "./agent-identity.js";
 import { resolveHomeChannel, type HomeChannel } from "./home-channel.js";
+import { readSecretsSafe } from "./load-config.js";
 import type {
   FromAgentInput,
   MessageOption,
@@ -106,16 +107,29 @@ export class BgosProactiveClient {
   private readonly resolveErrors = new Map<number, string>();
 
   constructor(init: ProactiveClientInit = {}) {
-    const baseUrl =
+    const envBaseUrl =
       init.baseUrl ??
       process.env.GOBOT_BASE_URL ??
-      process.env.BGOS_BASE_URL ??
-      DEFAULT_BASE_URL;
-    const pairingToken =
+      process.env.BGOS_BASE_URL;
+    const envToken =
       init.pairingToken ??
       process.env.GOBOT_PAIRING_TOKEN ??
-      process.env.BGOS_PAIRING_TOKEN ??
-      "";
+      process.env.BGOS_PAIRING_TOKEN;
+    // Fall back to the pairing secrets file (`~/.gobot/secrets/bgos.json`) only
+    // when init/env leaves the token or base URL unset. The SEPARATE proactive
+    // check-in/briefing processes (launchd `com.go.smart-checkin`, `bun run
+    // checkin`) do not inherit the adapter's GOBOT_PAIRING_TOKEN env, so without
+    // this every proactive send would be skipped as "unconfigured". Reading is
+    // synchronous + never throws, so a missing/corrupt file simply leaves the
+    // token undefined and isConfigured() stays false (graceful no-op). Composes
+    // with the primary-chat self-resolve so a freshly-paired host gets
+    // zero-config proactive delivery.
+    const secrets =
+      !envToken || !envBaseUrl ? readSecretsSafe() : null;
+    const baseUrl =
+      envBaseUrl ?? secrets?.baseUrl ?? DEFAULT_BASE_URL;
+    const pairingToken =
+      envToken ?? secrets?.pairingToken ?? "";
     this.cfg = {
       baseUrl: baseUrl.replace(/\/+$/, ""),
       pairingToken,

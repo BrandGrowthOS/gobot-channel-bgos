@@ -1,3 +1,7 @@
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { BgosProactiveClient } from "../src/proactive.js";
@@ -6,15 +10,35 @@ import { MockBgosServer } from "./mocks/mock-bgos-server.js";
 const ENV_KEYS = [
   "GOBOT_HOME_CHANNEL",
   "GOBOT_PAIRING_TOKEN",
+  "BGOS_PAIRING_TOKEN",
   "GOBOT_BGOS_CHAT_ID",
   "GOBOT_BGOS_CHAT_ID_42",
   "GOBOT_BGOS_CHAT_ID_43",
   "GOBOT_BASE_URL",
+  "BGOS_BASE_URL",
+  // Managed so the secrets-file fallback is hermetic: every test points
+  // GOBOT_HOME at a fresh empty temp dir, so a real ~/.gobot/secrets/bgos.json
+  // on the dev machine can never leak into (or break) the suite.
+  "GOBOT_HOME",
 ] as const;
+
+/** Write a `<home>/secrets/bgos.json` the readSecrets() loader will pick up. */
+function writeSecretsFile(
+  homeDir: string,
+  secrets: { pairingToken?: string; baseUrl?: string },
+): void {
+  mkdirSync(join(homeDir, "secrets"), { recursive: true });
+  writeFileSync(
+    join(homeDir, "secrets", "bgos.json"),
+    JSON.stringify(secrets),
+    "utf8",
+  );
+}
 
 describe("BgosProactiveClient", () => {
   let server: MockBgosServer;
   let baseUrl: string;
+  let homeDir: string;
   const saved: Partial<Record<(typeof ENV_KEYS)[number], string | undefined>> =
     {};
 
@@ -23,12 +47,17 @@ describe("BgosProactiveClient", () => {
       saved[k] = process.env[k];
       delete process.env[k];
     }
+    // Point GOBOT_HOME at a fresh empty temp dir so the secrets-file fallback
+    // is fully controlled per test (no real ~/.gobot leakage).
+    homeDir = mkdtempSync(join(tmpdir(), "gobot-home-"));
+    process.env.GOBOT_HOME = homeDir;
     server = new MockBgosServer();
     baseUrl = await server.start();
   });
 
   afterEach(async () => {
     await server.stop();
+    rmSync(homeDir, { recursive: true, force: true });
     for (const k of ENV_KEYS) {
       const v = saved[k];
       if (v === undefined) {
@@ -262,5 +291,93 @@ describe("BgosProactiveClient", () => {
     expect(r.attempted).toBe(true);
     expect(r.delivered).toBe(0);
     expect(r.errors[0].error).toMatch(/GOBOT_PAIRING_TOKEN/);
+  });
+
+  it("uses the env token (secrets file is NOT consulted) when GOBOT_PAIRING_TOKEN is present", async () => {
+    process.env.GOBOT_HOME_CHANNEL = "both";
+    const envToken = "pair_env_" + "e".repeat(30);
+    process.env.GOBOT_PAIRING_TOKEN = envToken;
+    process.env.GOBOT_BGOS_CHAT_ID_42 = "777";
+    // A valid but DIFFERENT secrets file exists on disk. The env token must
+    // win, and the bogus secrets baseUrl must never be dialed.
+    writeSecretsFile(homeDir, {
+      pairingToken: "secret_" + "s".repeat(30),
+      baseUrl: "https://should-not-be-used.example",
+    });
+
+    server.stage("GET", "/api/v1/integrations/me", 200, {
+      pairing_id: 1,
+      user_id: "user_x",
+      device_label: "Test",
+      integration: "gobot",
+      assistants: [{ assistant_id: 42, agent_route: "general", name: "Ava" }],
+    });
+    server.stage("POST", "/api/v1/messages", 201, { id: 1001 });
+
+    const client = new BgosProactiveClient({ baseUrl });
+    expect(client.isConfigured()).toBe(true);
+    const r = await client.sendProactive({ text: "env wins" });
+
+    expect(r.delivered).toBe(1);
+    expect(r.errors).toEqual([]);
+    // The request rode the ENV token, not the secrets-file token, and hit the
+    // mock server (init baseUrl), not the bogus secrets baseUrl.
+    const posted = server.requests.filter(
+      (req) => req.url === "/api/v1/messages",
+    );
+    expect(posted).toHaveLength(1);
+    expect(posted[0].headers["x-bgos-pairing"]).toBe(envToken);
+  });
+
+  it("falls back to the secrets file for BOTH token and baseUrl when env is absent", async () => {
+    process.env.GOBOT_HOME_CHANNEL = "both";
+    // No env token, no init: everything must come from ~/.gobot/secrets/bgos.json.
+    // The secrets baseUrl points at the mock server so a successful delivery
+    // proves the baseUrl fallback fired too.
+    const secretsToken = "secret_" + "s".repeat(30);
+    writeSecretsFile(homeDir, { pairingToken: secretsToken, baseUrl });
+
+    server.stage("GET", "/api/v1/integrations/me", 200, {
+      pairing_id: 1,
+      user_id: "user_x",
+      device_label: "Test",
+      integration: "gobot",
+      assistants: [{ assistant_id: 42, agent_route: "general", name: "Ava" }],
+    });
+    server.stage(
+      "POST",
+      "/api/v1/integrations/assistants/42/primary-chat",
+      200,
+      { chat_id: 777 },
+    );
+    server.stage("POST", "/api/v1/messages", 201, { id: 1001 });
+
+    const client = new BgosProactiveClient();
+    expect(client.isConfigured()).toBe(true);
+    const r = await client.sendProactive({ text: "from secrets" });
+
+    expect(r.attempted).toBe(true);
+    expect(r.delivered).toBe(1);
+    expect(r.errors).toEqual([]);
+
+    const posted = server.requests.filter(
+      (req) => req.url === "/api/v1/messages",
+    );
+    expect(posted).toHaveLength(1);
+    expect(posted[0].body).toMatchObject({ assistantId: 42, chatId: 777 });
+    expect(posted[0].headers["x-bgos-pairing"]).toBe(secretsToken);
+  });
+
+  it("stays unconfigured (delivered:0, never throws) with no env token and no secrets file", async () => {
+    process.env.GOBOT_HOME_CHANNEL = "both";
+    // homeDir is a fresh empty temp dir → no secrets/bgos.json present.
+    const client = new BgosProactiveClient();
+    expect(client.isConfigured()).toBe(false);
+    const r = await client.sendProactive({ text: "nothing configured" });
+    expect(r.attempted).toBe(true);
+    expect(r.delivered).toBe(0);
+    expect(r.errors[0].error).toMatch(/GOBOT_PAIRING_TOKEN/);
+    // No secrets file means we never even reach the network.
+    expect(server.requests).toHaveLength(0);
   });
 });
