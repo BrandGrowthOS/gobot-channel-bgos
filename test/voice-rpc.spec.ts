@@ -791,6 +791,9 @@ describe("quick-wins prompt pack (Iris 514)", () => {
     });
     expect(text).toContain("Reuse those results");
     expect(text).toContain("re-check only what changed");
+    expect(text.indexOf("Reuse those results")).toBeLessThan(
+      text.indexOf("You have ~"),
+    );
   });
 
   it("dispatch turn text carries the continuation brief", () => {
@@ -801,5 +804,8 @@ describe("quick-wins prompt pack (Iris 514)", () => {
     });
     expect(text).toContain("Reuse those results");
     expect(text).toContain("re-check only what changed");
+    expect(text.indexOf("Reuse those results")).toBeLessThan(
+      text.indexOf("Do the work now"),
+    );
   });
 });
