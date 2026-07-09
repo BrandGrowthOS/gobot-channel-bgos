@@ -756,3 +756,50 @@ describe("builders and config", () => {
     expect(normalizeExpiresAtSeconds(undefined)).toBeNull();
   });
 });
+
+// ---------------------------------------------------------------------
+// quick-wins prompt pack (Iris 514)
+// ---------------------------------------------------------------------
+
+describe("quick-wins prompt pack (Iris 514)", () => {
+  it("mint instructions carry the truthfulness contract", () => {
+    const text = buildMintInstructions({
+      agentName: "Jeff",
+      persona: "",
+      recentContext: "",
+    });
+    expect(text).toContain("Truthfulness contract: NEVER invent");
+    expect(text).toContain("still in progress");
+  });
+
+  it("mint instructions carry the intent-only brief rule", () => {
+    const text = buildMintInstructions({
+      agentName: "Jeff",
+      persona: "",
+      recentContext: "",
+    });
+    expect(text).toContain("intent and desired outcome");
+    expect(text).toContain("stale mechanics mislead it");
+  });
+
+  it("consult turn text carries the continuation brief", () => {
+    const text = buildConsultTurnText({
+      question: "q",
+      context: "",
+      responseStyle: "",
+      budgetSeconds: 30,
+    });
+    expect(text).toContain("Reuse those results");
+    expect(text).toContain("re-check only what changed");
+  });
+
+  it("dispatch turn text carries the continuation brief", () => {
+    const text = buildDispatchTurnText({
+      taskId: "t1",
+      question: "q",
+      context: "",
+    });
+    expect(text).toContain("Reuse those results");
+    expect(text).toContain("re-check only what changed");
+  });
+});

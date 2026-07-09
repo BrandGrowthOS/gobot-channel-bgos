@@ -263,6 +263,14 @@ export function normalizeExpiresAtSeconds(value: unknown): number | null {
   return n > 10_000_000_000 ? Math.floor(n / 1000) : Math.floor(n);
 }
 
+/** Continuation brief (Iris 514): consult/dispatch turns land in the agent's
+ *  OWN session, which may already hold earlier voice-run results. Telling the
+ *  brain so makes repeat asks dramatically faster (reuse, don't redo). */
+const CONTINUATION_BRIEF =
+  "This session may contain your earlier runs of similar work from this " +
+  "call. Reuse those results where they still apply and re-check only " +
+  "what changed instead of starting over.";
+
 /** Realtime session instructions: persona + the dumb-mouth contract. The
  *  realtime model is only the VOICE; the Gobot brain (memory, tools, chat
  *  context) is reachable via the baked consult tool and the app-registered
@@ -297,6 +305,19 @@ export function buildMintInstructions(args: {
       "agent_dispatch: verbally acknowledge what you are kicking off, " +
       "dispatch it, and the result is announced when ready.\n" +
       "- Speak results naturally; keep technical detail light unless asked.",
+  );
+  parts.push(
+    "Truthfulness contract: NEVER invent, guess, or embellish the results " +
+      "of the agent's work. Only report an outcome you actually received " +
+      "from a tool result or an announcement on this call. If you do not " +
+      "have the result yet, say the work is still in progress and check " +
+      "its status before speaking about it.",
+  );
+  parts.push(
+    "When you consult or dispatch, phrase the brief as the user's intent " +
+      "and desired outcome, in their own words. Never include mechanics " +
+      "from earlier runs (tool names, file paths, step-by-step how-to); " +
+      "the agent owns its tools and stale mechanics mislead it.",
   );
   const ctx = args.recentContext.trim();
   if (ctx) {
@@ -353,6 +374,7 @@ export function buildConsultTurnText(args: {
     args.question +
     (args.context ? `\n\nCall context: ${args.context}` : "") +
     (args.responseStyle ? `\n\nAnswer style: ${args.responseStyle}` : "") +
+    `\n\n${CONTINUATION_BRIEF}` +
     `\n\nYou have ~${args.budgetSeconds} seconds. Reply IMMEDIATELY with a ` +
     `short, SPEAKABLE answer (1-3 sentences of plain text — no markdown, ` +
     `no MEDIA: lines, no buttons). Do NOT run tools unless the question ` +
@@ -373,6 +395,7 @@ export function buildDispatchTurnText(args: {
     `do this task (task ${args.taskId}):\n\n` +
     args.question +
     (args.context ? `\n\nContext: ${args.context}` : "") +
+    `\n\n${CONTINUATION_BRIEF}` +
     `\n\nDo the work now. Your FINAL reply must be a short, speakable ` +
     `summary of the outcome (1-6 sentences of plain text — no markdown, ` +
     `no MEDIA: lines); it is announced aloud on the call and shown as the ` +
