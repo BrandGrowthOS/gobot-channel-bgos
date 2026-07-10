@@ -45,6 +45,10 @@
  * is answered with a descriptive error, never silence.
  */
 
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { isAbsolute, join } from "node:path";
+
 import type {
   DispatchArgs,
   DispatchFn,
@@ -165,6 +169,68 @@ export const VOICE_SPEED_MIN = 0.25;
 export const VOICE_SPEED_MAX = 1.5;
 export const VOICE_INSTRUCTIONS_MAX = 2000;
 const VOICE_ID_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/i;
+
+/** ONE shared total-instructions budget (Iris G4): persona + recent context +
+ *  the owner memory head fit in ~14k chars. When over, memory is trimmed
+ *  FIRST (then recent context); the fixed voice contract is never trimmed. */
+export const AGGREGATE_INSTRUCTIONS_BUDGET = 14_000;
+/** Per-source cap on the owner memory head before the aggregate trim. */
+export const VOICE_MEMORY_MAX = 8_000;
+
+/** Gobot home memory files read into the voice memory head (USER.md +
+ *  MEMORY.md), resolved from GOBOT_HOME or ~/.gobot. */
+const VOICE_MEMORY_CANDIDATES = ["USER.md", "MEMORY.md"];
+
+/** Resolve the Gobot home dir (mirrors the adapter's resolution). */
+function gobotHome(env: Record<string, string | undefined>): string {
+  const fromEnv = (env.GOBOT_HOME || "").trim();
+  if (fromEnv) {
+    return fromEnv.startsWith("~")
+      ? join(homedir(), fromEnv.slice(1))
+      : fromEnv;
+  }
+  return join(homedir(), ".gobot");
+}
+
+/**
+ * Owner memory head (Iris G4): read the Gobot home USER.md + MEMORY.md (or an
+ * explicit BGOS_VOICE_MEMORY_FILE) into a single capped string. Owner-only by
+ * construction (the backend refuses non-owner mints). Best-effort: a missing
+ * file contributes nothing, so a home with no memory is byte-identical to the
+ * pre-feature mint. Set BGOS_VOICE_MEMORY=off to disable. Reader injectable
+ * for tests.
+ */
+export function loadVoiceMemory(
+  opts: {
+    env?: Record<string, string | undefined>;
+    readFile?: (path: string) => string | null;
+  } = {},
+): string {
+  const env = opts.env ?? process.env;
+  if ((env.BGOS_VOICE_MEMORY ?? "").trim().toLowerCase() === "off") return "";
+  const read =
+    opts.readFile ??
+    ((p: string) => {
+      try {
+        return readFileSync(p, "utf8");
+      } catch {
+        return null;
+      }
+    });
+  const explicit = (env.BGOS_VOICE_MEMORY_FILE ?? "").trim();
+  const home = gobotHome(env);
+  const candidates = explicit
+    ? [explicit]
+    : VOICE_MEMORY_CANDIDATES.map((f) => join(home, f));
+  const chunks: string[] = [];
+  for (const rel of candidates) {
+    const path = isAbsolute(rel) ? rel : join(home, rel);
+    const body = read(path);
+    if (body && body.trim()) chunks.push(body.trim());
+    if (chunks.join("\n\n").length >= VOICE_MEMORY_MAX) break;
+  }
+  return chunks.join("\n\n").slice(0, VOICE_MEMORY_MAX);
+}
 
 /**
  * Sanitize payload.voiceConfig from the wire. Defensive twin of the
@@ -297,6 +363,9 @@ export function buildMintInstructions(args: {
   recentContext: string;
   /** Confirm gate (Iris G5): bake the propose-first contract. */
   requireDispatchConfirm?: boolean;
+  /** Owner memory head (Iris G4): the owner's profile / active projects /
+   *  shorthand. Owner-only by construction. */
+  memory?: string;
 }): string {
   const name = args.agentName?.trim() || "the agent";
   const parts: string[] = [];
@@ -356,14 +425,38 @@ export function buildMintInstructions(args: {
         "confirmation the user did not give.",
     );
   }
-  const ctx = args.recentContext.trim();
-  if (ctx) {
-    parts.push(
-      "Recent conversation with your user (for continuity):\n" +
-        ctx.slice(0, 20_000),
-    );
+  // Owner memory head + recent conversation share the remaining aggregate
+  // budget (G4), memory trimmed first so the live conversation wins.
+  const core = parts.join("\n\n");
+  const memLabel = "Owner memory (profile, active projects, shorthand):\n";
+  const ctxLabel = "Recent conversation with your user (for continuity):\n";
+  let memory = (args.memory ?? "").trim().slice(0, VOICE_MEMORY_MAX);
+  let context = args.recentContext.trim().slice(0, 20_000);
+  const SEP = "\n\n";
+  const coreCost = core.length;
+  const ctxBlockCost = context
+    ? SEP.length + ctxLabel.length + context.length
+    : 0;
+  if (coreCost + ctxBlockCost > AGGREGATE_INSTRUCTIONS_BUDGET) {
+    memory = "";
+    if (context) {
+      const room =
+        AGGREGATE_INSTRUCTIONS_BUDGET - coreCost - SEP.length - ctxLabel.length;
+      context = room > 0 ? context.slice(0, room) : "";
+    }
+  } else if (memory) {
+    const memRoom =
+      AGGREGATE_INSTRUCTIONS_BUDGET -
+      coreCost -
+      ctxBlockCost -
+      SEP.length -
+      memLabel.length;
+    memory = memRoom > 0 ? memory.slice(0, memRoom) : "";
   }
-  return parts.join("\n\n");
+  const out = [core];
+  if (memory) out.push(memLabel + memory);
+  if (context) out.push(ctxLabel + context);
+  return out.join(SEP);
 }
 
 /** The consult tool definition baked into the realtime session at mint.
@@ -636,6 +729,9 @@ export class VoiceRpcHandler {
       persona,
       recentContext,
       requireDispatchConfirm: voiceConfig.requireDispatchConfirm === true,
+      // Owner memory head (G4): read the Gobot home memory files. Owner-only
+      // by construction (backend refuses non-owner mints).
+      memory: loadVoiceMemory(),
     });
     const body = {
       expires_after: { anchor: "created_at", seconds: 600 },

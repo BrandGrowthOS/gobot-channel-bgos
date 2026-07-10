@@ -16,7 +16,9 @@ import {
   buildConsultToolDefinition,
   buildConsultTurnText,
   buildDispatchTurnText,
+  AGGREGATE_INSTRUCTIONS_BUDGET,
   buildMintInstructions,
+  loadVoiceMemory,
   CONSULT_TOOL_NAME,
   DEFAULT_TIMING,
   loadVoiceConfigFromEnv,
@@ -913,5 +915,84 @@ describe("welcome-back ceremony (Iris G2)", () => {
     expect(text).toContain("skip the greeting ceremony");
     expect(text).toContain("by name");
     expect(text).toContain("never a robotic");
+  });
+});
+
+// ---------------------------------------------------------------------
+// owner memory head + aggregate budget (Iris G4, wave 2)
+// ---------------------------------------------------------------------
+
+describe("owner memory head + aggregate budget (Iris G4)", () => {
+  it("includes the owner memory head when memory is present", () => {
+    const text = buildMintInstructions({
+      agentName: "Echo",
+      persona: "",
+      recentContext: "",
+      memory: 'Owner tz Asia/Dubai. Project: the launch. "the usual" = Thu 9am.',
+    });
+    expect(text).toContain("Owner memory");
+    expect(text).toContain("Asia/Dubai");
+  });
+
+  it("no memory head + byte-identical output when memory is empty", () => {
+    const withEmpty = buildMintInstructions({
+      agentName: "Echo",
+      persona: "",
+      recentContext: "",
+      memory: "",
+    });
+    const without = buildMintInstructions({
+      agentName: "Echo",
+      persona: "",
+      recentContext: "",
+    });
+    expect(withEmpty).not.toContain("Owner memory");
+    expect(withEmpty).toBe(without);
+  });
+
+  it("caps total instructions and trims memory FIRST under budget pressure", () => {
+    const text = buildMintInstructions({
+      agentName: "Echo",
+      persona: "",
+      recentContext: "C".repeat(13000),
+      memory: "M".repeat(8000),
+    });
+    expect(text.length).toBeLessThanOrEqual(AGGREGATE_INSTRUCTIONS_BUDGET);
+    const memoryChars = (text.match(/M/g) || []).length;
+    const contextChars = (text.match(/C/g) || []).length;
+    expect(contextChars).toBeGreaterThan(memoryChars);
+  });
+
+  it("drops memory entirely when the context alone fills the budget", () => {
+    const text = buildMintInstructions({
+      agentName: "Echo",
+      persona: "",
+      recentContext: "C".repeat(20000),
+      memory: "M".repeat(4000),
+    });
+    expect(text.length).toBeLessThanOrEqual(AGGREGATE_INSTRUCTIONS_BUDGET);
+    expect(text).not.toContain("Owner memory");
+  });
+
+  it("loadVoiceMemory reads home USER.md + MEMORY.md, empty when absent, off kill switch", () => {
+    const files: Record<string, string> = {
+      "/home/.gobot/USER.md": "Owner is Kc, tz Asia/Dubai.",
+      "/home/.gobot/MEMORY.md": "Active project: the launch.",
+    };
+    const mem = loadVoiceMemory({
+      env: { GOBOT_HOME: "/home/.gobot" },
+      readFile: (p) => files[p] ?? null,
+    });
+    expect(mem).toContain("Asia/Dubai");
+    expect(mem).toContain("the launch");
+    expect(
+      loadVoiceMemory({ env: { GOBOT_HOME: "/empty" }, readFile: () => null }),
+    ).toBe("");
+    expect(
+      loadVoiceMemory({
+        env: { GOBOT_HOME: "/home/.gobot", BGOS_VOICE_MEMORY: "off" },
+        readFile: () => "secret",
+      }),
+    ).toBe("");
   });
 });
