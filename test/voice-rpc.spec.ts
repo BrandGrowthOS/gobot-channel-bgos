@@ -897,3 +897,21 @@ describe("confirm-before-dispatch gate (Iris G5)", () => {
     ).toBe(false);
   });
 });
+
+// ---------------------------------------------------------------------
+// welcome-back ceremony (Iris G2, wave 2)
+// ---------------------------------------------------------------------
+
+describe("welcome-back ceremony (Iris G2)", () => {
+  it("mint instructions carry the welcome-back ceremony", () => {
+    const text = buildMintInstructions({
+      agentName: "Echo",
+      persona: "",
+      recentContext: "",
+    });
+    expect(text).toContain("Welcome-back ceremony");
+    expect(text).toContain("skip the greeting ceremony");
+    expect(text).toContain("by name");
+    expect(text).toContain("never a robotic");
+  });
+});
