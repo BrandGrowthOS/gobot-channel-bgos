@@ -123,6 +123,10 @@ export interface VoiceConfig {
   voice: string;
   /** Optional extra persona text baked into the mint instructions. */
   persona: string;
+  /** Confirm gate belt (Iris G5): reject dispatch frames lacking
+   *  confirmed:true. Default off; the backend-side gate is the primary
+   *  enforcement and now sends confirmed:true on every forwarded dispatch. */
+  requireConfirmedDispatch?: boolean;
 }
 
 /** Same env names as the Claude Code plugin (cross-plugin parity):
@@ -136,6 +140,7 @@ export function loadVoiceConfigFromEnv(
     model: env.BGOS_VOICE_MODEL || "gpt-realtime-2",
     voice: env.BGOS_VOICE_VOICE || "marin",
     persona: env.BGOS_VOICE_PERSONA || "",
+    requireConfirmedDispatch: env.BGOS_REQUIRE_CONFIRMED_DISPATCH === "true",
   };
 }
 
@@ -150,6 +155,10 @@ export interface MintVoiceConfig {
   voice?: string;
   speed?: number;
   instructions?: string;
+  /** Confirm gate (Iris G5): the backend sets this when the assistant's
+   *  owner enabled ask-before-dispatch; the mint instructions then carry
+   *  the propose-first contract. */
+  requireDispatchConfirm?: true;
 }
 
 export const VOICE_SPEED_MIN = 0.25;
@@ -180,6 +189,13 @@ export function normalizeVoiceConfig(raw: unknown): MintVoiceConfig {
   }
   if (typeof r.instructions === "string" && r.instructions.trim()) {
     out.instructions = r.instructions.trim().slice(0, VOICE_INSTRUCTIONS_MAX);
+  }
+  // Coerce defensively (never trust the wire): boolean true or string 'true'.
+  if (
+    r.requireDispatchConfirm === true ||
+    r.requireDispatchConfirm === "true"
+  ) {
+    out.requireDispatchConfirm = true;
   }
   return out;
 }
@@ -279,6 +295,8 @@ export function buildMintInstructions(args: {
   agentName: string | null;
   persona: string;
   recentContext: string;
+  /** Confirm gate (Iris G5): bake the propose-first contract. */
+  requireDispatchConfirm?: boolean;
 }): string {
   const name = args.agentName?.trim() || "the agent";
   const parts: string[] = [];
@@ -319,6 +337,17 @@ export function buildMintInstructions(args: {
       "from earlier runs (tool names, file paths, step-by-step how-to); " +
       "the agent owns its tools and stale mechanics mislead it.",
   );
+  if (args.requireDispatchConfirm) {
+    parts.push(
+      "Dispatch confirmation is ON for this agent: agent_dispatch STAGES a " +
+        "proposal instead of starting work. Read the staged brief back to " +
+        "the user in one short sentence and ask for their go-ahead. Only " +
+        "after the user clearly confirms on their next turn, call " +
+        "confirm_dispatch with the task id from the ack. If they decline, " +
+        "call confirm_dispatch with approve:false. Never invent a " +
+        "confirmation the user did not give.",
+    );
+  }
   const ctx = args.recentContext.trim();
   if (ctx) {
     parts.push(
@@ -512,6 +541,21 @@ export class VoiceRpcHandler {
             "dispatch payload missing taskId",
           );
         }
+        // Confirm gate belt (Iris G5): pre-accept, so the backend gets an
+        // explicit descriptive rejection on the rpc result route. Coerce
+        // defensively (boolean true or string 'true').
+        if (this.deps.config.requireConfirmedDispatch) {
+          const confirmed = (frame.payload as Record<string, unknown>)
+            .confirmed;
+          if (confirmed !== true && confirmed !== "true") {
+            throw new VoiceRpcError(
+              "DISPATCH_UNCONFIRMED",
+              `unconfirmed dispatch rejected (task=${String(taskId)}): ` +
+                "BGOS_REQUIRE_CONFIRMED_DISPATCH is on and the payload " +
+                "lacks confirmed:true",
+            );
+          }
+        }
         await this.deps.api.postVoiceRpcResult(frame.rpcId, {
           ok: true,
           payload: { accepted: true, taskId: String(taskId) },
@@ -583,6 +627,7 @@ export class VoiceRpcHandler {
       agentName,
       persona,
       recentContext,
+      requireDispatchConfirm: voiceConfig.requireDispatchConfirm === true,
     });
     const body = {
       expires_after: { anchor: "created_at", seconds: 600 },

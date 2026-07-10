@@ -741,6 +741,7 @@ describe("builders and config", () => {
       model: "gpt-realtime-2",
       voice: "marin",
       persona: "",
+      requireConfirmedDispatch: false,
     });
     expect(loadVoiceConfigFromEnv({ OPENAI_API_KEY: "sk-b" }).openaiApiKey).toBe(
       "sk-b",
@@ -807,5 +808,92 @@ describe("quick-wins prompt pack (Iris 514)", () => {
     expect(text.indexOf("Reuse those results")).toBeLessThan(
       text.indexOf("Do the work now"),
     );
+  });
+});
+
+// ---------------------------------------------------------------------
+// confirm-before-dispatch gate (Iris G5, wave 2)
+// ---------------------------------------------------------------------
+
+describe("confirm-before-dispatch gate (Iris G5)", () => {
+  it("loadVoiceConfigFromEnv reads the BGOS_REQUIRE_CONFIRMED_DISPATCH belt (default off)", () => {
+    expect(loadVoiceConfigFromEnv({}).requireConfirmedDispatch).toBe(false);
+    expect(
+      loadVoiceConfigFromEnv({ BGOS_REQUIRE_CONFIRMED_DISPATCH: "true" })
+        .requireConfirmedDispatch,
+    ).toBe(true);
+    expect(
+      loadVoiceConfigFromEnv({ BGOS_REQUIRE_CONFIRMED_DISPATCH: "1" })
+        .requireConfirmedDispatch,
+    ).toBe(false);
+  });
+
+  it("gate off: an unconfirmed dispatch is accepted (back-compat)", async () => {
+    const { handler, calls } = makeHarness();
+    await handler.handle(dispatchFrame());
+    expect(calls.results[0]!.body.ok).toBe(true);
+  });
+
+  it("gate on: an unconfirmed dispatch is rejected pre-accept with DISPATCH_UNCONFIRMED", async () => {
+    const { handler, calls } = makeHarness({
+      config: { requireConfirmedDispatch: true },
+    });
+    await handler.handle(dispatchFrame());
+    expect(calls.results[0]!.body.ok).toBe(false);
+    expect(calls.results[0]!.body.error!.code).toBe("DISPATCH_UNCONFIRMED");
+    expect(calls.taskResults).toHaveLength(0);
+    expect(calls.dispatches).toHaveLength(0);
+  });
+
+  it("gate on: confirmed:true and 'true' both pass", async () => {
+    for (const confirmed of [true, "true"]) {
+      const { handler, calls } = makeHarness({
+        config: { requireConfirmedDispatch: true },
+      });
+      await handler.handle(
+        dispatchFrame({
+          payload: {
+            taskId: "task-9",
+            callId: "call-1",
+            name: "agent_dispatch",
+            args: { question: "Summarize the overnight logs." },
+            confirmed,
+          },
+        }),
+      );
+      expect(calls.results[0]!.body.ok).toBe(true);
+    }
+  });
+
+  it("mint instructions carry the propose-first contract only when voiceConfig requires it", () => {
+    const on = buildMintInstructions({
+      agentName: "Echo",
+      persona: "",
+      recentContext: "",
+      requireDispatchConfirm: true,
+    });
+    expect(on).toContain("Dispatch confirmation is ON");
+    expect(on).toContain("STAGES a proposal");
+    expect(on).toContain("confirm_dispatch");
+    const off = buildMintInstructions({
+      agentName: "Echo",
+      persona: "",
+      recentContext: "",
+    });
+    expect(off).not.toContain("Dispatch confirmation is ON");
+  });
+
+  it("normalizeVoiceConfig picks up requireDispatchConfirm (boolean and string)", () => {
+    expect(
+      normalizeVoiceConfig({ requireDispatchConfirm: true })
+        .requireDispatchConfirm,
+    ).toBe(true);
+    expect(
+      normalizeVoiceConfig({ requireDispatchConfirm: "true" })
+        .requireDispatchConfirm,
+    ).toBe(true);
+    expect(
+      "requireDispatchConfirm" in normalizeVoiceConfig({ voice: "marin" }),
+    ).toBe(false);
   });
 });
