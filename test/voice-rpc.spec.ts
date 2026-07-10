@@ -996,3 +996,42 @@ describe("owner memory head + aggregate budget (Iris G4)", () => {
     ).toBe("");
   });
 });
+
+describe("G4 budget safe-default + tail-keep (review fixes)", () => {
+  it("a memory-less agent keeps its full pre-feature context (no aggregate trim)", () => {
+    const text = buildMintInstructions({
+      agentName: "Echo",
+      persona: "",
+      recentContext: "C".repeat(18000),
+      memory: "",
+    });
+    expect((text.match(/C/g) || []).length).toBeGreaterThanOrEqual(18000);
+  });
+
+  it("context trim keeps the MOST RECENT turns (tail), not the oldest", () => {
+    const context = "OLDEST" + "x".repeat(14000) + "NEWEST";
+    const text = buildMintInstructions({
+      agentName: "Echo",
+      persona: "",
+      recentContext: context,
+      memory: "M".repeat(2000),
+    });
+    expect(text).toContain("NEWEST");
+    expect(text).not.toContain("OLDEST");
+  });
+
+  it("loadVoiceMemory does not double-prefix a relative GOBOT_HOME", () => {
+    const seen: string[] = [];
+    loadVoiceMemory({
+      env: { GOBOT_HOME: "relgobot" },
+      readFile: (p) => {
+        seen.push(p);
+        return null;
+      },
+    });
+    // No path contains the home segment twice.
+    for (const p of seen) {
+      expect(p.split("relgobot").length - 1).toBe(1);
+    }
+  });
+});

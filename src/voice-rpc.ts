@@ -172,7 +172,9 @@ const VOICE_ID_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/i;
 
 /** ONE shared total-instructions budget (Iris G4): persona + recent context +
  *  the owner memory head fit in ~14k chars. When over, memory is trimmed
- *  FIRST (then recent context); the fixed voice contract is never trimmed. */
+ *  FIRST (then recent context); the fixed voice contract is never trimmed. The
+ *  aggregate trim only applies when a memory head is present, so a memory-less
+ *  agent mints byte-identically to the pre-feature path. */
 export const AGGREGATE_INSTRUCTIONS_BUDGET = 14_000;
 /** Per-source cap on the owner memory head before the aggregate trim. */
 export const VOICE_MEMORY_MAX = 8_000;
@@ -181,15 +183,36 @@ export const VOICE_MEMORY_MAX = 8_000;
  *  MEMORY.md), resolved from GOBOT_HOME or ~/.gobot. */
 const VOICE_MEMORY_CANDIDATES = ["USER.md", "MEMORY.md"];
 
-/** Resolve the Gobot home dir (mirrors the adapter's resolution). */
+/** Resolve the Gobot home dir (mirrors the adapter's resolution) to an
+ *  ABSOLUTE path so candidate joins never double-prefix a relative home. */
 function gobotHome(env: Record<string, string | undefined>): string {
   const fromEnv = (env.GOBOT_HOME || "").trim();
   if (fromEnv) {
-    return fromEnv.startsWith("~")
+    const expanded = fromEnv.startsWith("~")
       ? join(homedir(), fromEnv.slice(1))
       : fromEnv;
+    return isAbsolute(expanded) ? expanded : join(process.cwd(), expanded);
   }
   return join(homedir(), ".gobot");
+}
+
+/** Keep the first `n` UTF-16 units, dropping a trailing lone high surrogate. */
+function sliceHead(s: string, n: number): string {
+  if (s.length <= n) return s;
+  let out = s.slice(0, n);
+  const last = out.charCodeAt(out.length - 1);
+  if (last >= 0xd800 && last <= 0xdbff) out = out.slice(0, -1);
+  return out;
+}
+
+/** Keep the LAST `n` UTF-16 units (most recent text), dropping a leading lone
+ *  low surrogate. */
+function sliceTail(s: string, n: number): string {
+  if (s.length <= n) return s;
+  let out = s.slice(s.length - n);
+  const first = out.charCodeAt(0);
+  if (first >= 0xdc00 && first <= 0xdfff) out = out.slice(1);
+  return out;
 }
 
 /**
@@ -219,12 +242,13 @@ export function loadVoiceMemory(
     });
   const explicit = (env.BGOS_VOICE_MEMORY_FILE ?? "").trim();
   const home = gobotHome(env);
-  const candidates = explicit
-    ? [explicit]
+  // Explicit path is used verbatim; otherwise resolve each bare candidate
+  // against the absolute home exactly once (no double-prefix).
+  const paths = explicit
+    ? [isAbsolute(explicit) ? explicit : join(home, explicit)]
     : VOICE_MEMORY_CANDIDATES.map((f) => join(home, f));
   const chunks: string[] = [];
-  for (const rel of candidates) {
-    const path = isAbsolute(rel) ? rel : join(home, rel);
+  for (const path of paths) {
     const body = read(path);
     if (body && body.trim()) chunks.push(body.trim());
     if (chunks.join("\n\n").length >= VOICE_MEMORY_MAX) break;
@@ -425,33 +449,38 @@ export function buildMintInstructions(args: {
         "confirmation the user did not give.",
     );
   }
-  // Owner memory head + recent conversation share the remaining aggregate
-  // budget (G4), memory trimmed first so the live conversation wins.
   const core = parts.join("\n\n");
   const memLabel = "Owner memory (profile, active projects, shorthand):\n";
   const ctxLabel = "Recent conversation with your user (for continuity):\n";
-  let memory = (args.memory ?? "").trim().slice(0, VOICE_MEMORY_MAX);
-  let context = args.recentContext.trim().slice(0, 20_000);
   const SEP = "\n\n";
-  const coreCost = core.length;
-  const ctxBlockCost = context
-    ? SEP.length + ctxLabel.length + context.length
-    : 0;
-  if (coreCost + ctxBlockCost > AGGREGATE_INSTRUCTIONS_BUDGET) {
-    memory = "";
-    if (context) {
-      const room =
-        AGGREGATE_INSTRUCTIONS_BUDGET - coreCost - SEP.length - ctxLabel.length;
-      context = room > 0 ? context.slice(0, room) : "";
+  let memory = sliceHead((args.memory ?? "").trim(), VOICE_MEMORY_MAX);
+  // recentContext is built most-recent-LAST, so keep its TAIL when trimming.
+  let context = sliceTail(args.recentContext.trim(), 20_000);
+
+  // Safe default: with NO memory head, leave recent context at its pre-feature
+  // 20k slice and skip the aggregate trim, so a memory-less agent mints
+  // byte-identically to before this feature.
+  if (memory) {
+    const coreCost = core.length;
+    const ctxBlockCost = context
+      ? SEP.length + ctxLabel.length + context.length
+      : 0;
+    if (coreCost + ctxBlockCost > AGGREGATE_INSTRUCTIONS_BUDGET) {
+      memory = "";
+      if (context) {
+        const room =
+          AGGREGATE_INSTRUCTIONS_BUDGET - coreCost - SEP.length - ctxLabel.length;
+        context = room > 0 ? sliceTail(context, room) : "";
+      }
+    } else {
+      const memRoom =
+        AGGREGATE_INSTRUCTIONS_BUDGET -
+        coreCost -
+        ctxBlockCost -
+        SEP.length -
+        memLabel.length;
+      memory = memRoom > 0 ? sliceHead(memory, memRoom) : "";
     }
-  } else if (memory) {
-    const memRoom =
-      AGGREGATE_INSTRUCTIONS_BUDGET -
-      coreCost -
-      ctxBlockCost -
-      SEP.length -
-      memLabel.length;
-    memory = memRoom > 0 ? memory.slice(0, memRoom) : "";
   }
   const out = [core];
   if (memory) out.push(memLabel + memory);
