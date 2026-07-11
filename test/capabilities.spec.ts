@@ -7,6 +7,7 @@ import { BgosApi } from "../src/bgos-api.js";
 import { BGOS_AGENT_HINTS } from "../src/agent-hints.js";
 import {
   BUNDLED_AGENT_HINTS,
+  MAX_CANON_BYTES,
   appendAgentHints,
   hasCanonMarkers,
   pickAgentHints,
@@ -57,6 +58,17 @@ describe("pickAgentHints", () => {
     expect(pickAgentHints(undefined).source).toBe("bundled");
     expect(pickAgentHints(served("")).source).toBe("bundled");
     expect(pickAgentHints(served("no markers here")).source).toBe("bundled");
+  });
+
+  it("falls back to bundled when the served canon exceeds the size cap (DoS/injection guard)", () => {
+    const marker = "# BGOS Channel Agent Capabilities\n";
+    const oversized = marker + "x".repeat(MAX_CANON_BYTES + 1);
+    const picked = pickAgentHints(served(oversized));
+    expect(picked.source).toBe("bundled");
+    expect(picked.hints).toBe(BUNDLED_AGENT_HINTS);
+    // A canon right at the cap with valid markers is still accepted.
+    const atCap = marker + "y".repeat(MAX_CANON_BYTES - marker.length);
+    expect(pickAgentHints(served(atCap)).source).toBe("backend");
   });
 });
 

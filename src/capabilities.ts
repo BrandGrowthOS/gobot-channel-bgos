@@ -23,6 +23,15 @@ import { BGOS_AGENT_HINTS } from "./agent-hints.js";
  */
 export const BUNDLED_AGENT_HINTS = BGOS_AGENT_HINTS;
 
+/**
+ * Upper bound on an accepted served canon. The real canon is a few KB; this is
+ * ~50x headroom. SECURITY: the served text is injected verbatim into a
+ * shell-capable agent's system prompt, so a compromised or MITM'd backend
+ * returning a multi-MB body would be both a memory-DoS and an unbounded
+ * prompt-injection surface. Over the cap we fall back to the bundled copy.
+ */
+export const MAX_CANON_BYTES = 256 * 1024;
+
 /** Shape of GET /integrations/capabilities?channel=gobot. */
 export interface ServedCapabilities {
   channel: string;
@@ -71,6 +80,7 @@ export function pickAgentHints(
   if (
     typeof served === "string" &&
     served.trim().length > 0 &&
+    served.length <= MAX_CANON_BYTES &&
     hasCanonMarkers(served)
   ) {
     return { hints: toInjectableHints(served), source: "backend" };
