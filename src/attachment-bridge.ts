@@ -21,10 +21,17 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { extname, join } from "node:path";
-import { Readable } from "node:stream";
+import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 
 import type { BgosApi } from "./bgos-api.js";
+import {
+  MAX_ATTACHMENT_BYTES,
+  AttachmentSizeError,
+  assertDeclaredSizeOk,
+  decodeBase64Capped,
+  fetchAttachmentGuarded,
+} from "./attachment-guard.js";
 import {
   classifyMedia,
   sniffImageDimensions,
@@ -102,10 +109,11 @@ function decodeDataUri(dataUri: string): Buffer {
   const payload = dataUri.slice(comma + 1);
   if (!meta.toLowerCase().includes("base64")) {
     // Unsupported (URL-encoded payloads are rare and we don't promise
-    // to support them — agents would have to re-encode anyway).
+    // to support them; agents would have to re-encode anyway).
     throw new Error("invalid data URI: only base64 encoding supported");
   }
-  return Buffer.from(payload, "base64");
+  // Capped decode so a hostile backend cannot force a giant allocation.
+  return decodeBase64Capped(payload);
 }
 
 /**
@@ -132,8 +140,8 @@ export async function ingestBgosAttachment(
   const localPath = join(tmpdir(), baseName);
 
   if (att.fileData) {
-    // Inline base64 — write directly.
-    await fsp.writeFile(localPath, Buffer.from(att.fileData, "base64"));
+    // Inline base64; write directly under a size cap.
+    await fsp.writeFile(localPath, decodeBase64Capped(att.fileData));
     return { localPath, kind, mimeType };
   }
   if (att.dataUri) {
@@ -141,22 +149,50 @@ export async function ingestBgosAttachment(
     return { localPath, kind, mimeType };
   }
   if (att.url) {
-    // Presigned S3 URL — stream to disk so we don't buffer giant files
-    // in memory.
-    const res = await fetch(att.url);
+    // Presigned S3 URL. SECURITY: att.url is server-controlled, so validate it
+    // against SSRF (no loopback / link-local / RFC1918 / cloud-metadata; every
+    // redirect hop re-checked) BEFORE fetching, and stream to disk under a hard
+    // byte cap so a hostile backend cannot fill the disk.
+    const res = await fetchAttachmentGuarded(att.url);
     if (!res.ok) {
       throw new Error(
         `download failed: HTTP ${res.status} for ${fileName}`,
       );
     }
     if (!res.body) throw new Error(`download produced no body for ${fileName}`);
+    // Reject an oversized declared length up front (cheap when the server is
+    // honest); the counting stream below is the real cap for a lying/absent
+    // Content-Length.
+    assertDeclaredSizeOk(res.headers.get("content-length"));
+    let received = 0;
+    const capStream = new Transform({
+      transform(chunk, _enc, cb) {
+        received += chunk.length;
+        if (received > MAX_ATTACHMENT_BYTES) {
+          cb(
+            new AttachmentSizeError(
+              `attachment ${fileName} exceeded the ${MAX_ATTACHMENT_BYTES} byte cap`,
+            ),
+          );
+          return;
+        }
+        cb(null, chunk);
+      },
+    });
     // Node 18+ supports converting a fetch ReadableStream to a Node
     // Readable via Readable.fromWeb. The any-cast keeps the typecheck
     // narrow (lib.dom.d.ts inclusion varies by tsconfig).
-    await pipeline(
-      Readable.fromWeb(res.body as never),
-      createWriteStream(localPath),
-    );
+    try {
+      await pipeline(
+        Readable.fromWeb(res.body as never),
+        capStream,
+        createWriteStream(localPath),
+      );
+    } catch (err) {
+      // Remove any partial file so a capped/failed download leaves no litter.
+      await fsp.unlink(localPath).catch(() => {});
+      throw err;
+    }
     return { localPath, kind, mimeType };
   }
   if (att.s3Key) {
