@@ -33,6 +33,7 @@ import { pairBgos } from "./pair-cli.js";
 import { getPackageVersion } from "./version.js";
 import type { AgentCatalogEntry } from "./types.js";
 import { parseSetupArgs, type SetupOptions } from "./setup/args.js";
+import { invokedAsCliEntry } from "./setup/entry.js";
 import { composeEnvBlock, mergeEnvFile } from "./setup/env-block.js";
 import {
   LAUNCHD_LABEL,
@@ -583,11 +584,13 @@ async function main(): Promise<void> {
   if (opts.dryRun) log("\n(dry run complete: nothing was changed)");
 }
 
-// Run when invoked as a CLI (not when imported).
-const invokedAsCli =
-  typeof process !== "undefined" &&
-  Array.isArray(process.argv) &&
-  /setup-cli(?:\.[mc]?[jt]s)?$/.test(process.argv[1] ?? "");
+// Run when invoked as a CLI (not when imported). Uses import.meta.main when the
+// runtime provides it (Bun, Node >= 24) and a realpath fallback otherwise, so a
+// `bunx gobot-channel-bgos ...` bin-name shim still triggers main().
+const invokedAsCli = invokedAsCliEntry(
+  import.meta as unknown as { url: string; main?: boolean },
+  process.argv[1],
+);
 if (invokedAsCli) {
   main().catch((err: unknown) => {
     const e = err as { message?: string };
