@@ -28,7 +28,8 @@ import {
   publishMediaPath,
   type BgosInboundAttachment,
 } from "./attachment-bridge.js";
-import { buildSystemPromptWithHints } from "./agent-hints.js";
+import { BGOS_AGENT_HINTS } from "./agent-hints.js";
+import { appendAgentHints } from "./capabilities.js";
 import { saveLastId } from "./last-id-store.js";
 import {
   clearPendingUnknown,
@@ -169,8 +170,13 @@ export interface InboundHandlerDeps {
    *  calls `setDispatch(fn)` — early WS messages then no-op safely. */
   getDispatch(): DispatchFn | null;
   /** Optional system-prompt prefix (e.g. agent persona). The handler
-   *  appends `BGOS_AGENT_HINTS` to whatever this returns. */
+   *  appends the agent-capability hints to whatever this returns. */
   getSystemPrompt?(agentRoute: string): string;
+  /** The agent-capability hints addendum to append per dispatch. Returns the
+   *  served capability canon fetched at connect, or the bundled
+   *  `BGOS_AGENT_HINTS` fallback. Optional: defaults to the bundled copy so
+   *  older callers keep their exact behavior. */
+  getAgentHints?(): string;
   /** Tool-progress card orchestrator — adapter-provided. The factory
    *  wires `replyHandle.sendToolStart` + `replyHandle.finalizeTurn`
    *  through this. Optional for back-compat; older host code that
@@ -417,7 +423,8 @@ export function createInboundHandler(
     }
 
     const baseSystemPrompt = deps.getSystemPrompt?.(route) ?? "";
-    const systemPrompt = buildSystemPromptWithHints(baseSystemPrompt);
+    const hints = deps.getAgentHints?.() ?? BGOS_AGENT_HINTS;
+    const systemPrompt = appendAgentHints(baseSystemPrompt, hints);
 
     const command =
       event.messageType === "slash_command"

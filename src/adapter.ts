@@ -45,6 +45,8 @@ import {
 } from "./inbound-handler.js";
 import { loadConfigFromEnv, loadConfigFromPluginCfg } from "./config.js";
 import { pendingUnknownStats } from "./pending-unknown-store.js";
+import { BGOS_AGENT_HINTS } from "./agent-hints.js";
+import { pickAgentHints } from "./capabilities.js";
 import {
   loadVoiceConfigFromEnv,
   VoiceRpcHandler,
@@ -139,6 +141,11 @@ export class BGOSAdapter {
 
   // Identity retry state.
   private identityReady = false;
+  private capabilitiesLoaded = false;
+  /** Agent-capability hints injected per dispatch. Starts as the bundled
+   *  BGOS_AGENT_HINTS fallback; replaced with the served capability canon once
+   *  it is fetched at connect (best-effort). */
+  private cachedAgentHints: string = BGOS_AGENT_HINTS;
   private identityRetryTimer: NodeJS.Timeout | null = null;
   private pollStarted = false;
 
@@ -259,6 +266,7 @@ export class BGOSAdapter {
       getRouteForAssistant: (id) => this.getRouteForAssistant(id),
       getDispatch: () => this.dispatch,
       getSystemPrompt: (route) => this.getSystemPrompt(route),
+      getAgentHints: () => this.cachedAgentHints,
       toolProgress: this.toolProgress,
       onInbound: () => this.heartbeat.recordInbound(),
       onUnknownAssistant: () => this.refreshScopeRateLimited(),
@@ -343,6 +351,10 @@ export class BGOSAdapter {
     await this.ws.connect();
     this.heartbeat.start();
 
+    // Fetch the served capability canon once at connect and cache it for the
+    // per-dispatch injection (best-effort; falls back to the bundled copy).
+    void this.loadServedCapabilities();
+
     // 3. Resolve identity. On success run the initial backfill + start the
     // poll loop; on failure keep the adapter up and retry forever.
     const ok = await this.refreshIdentity();
@@ -382,6 +394,44 @@ export class BGOSAdapter {
       await this.commandsSync.flushAll();
     } catch {
       /* swallow on shutdown, best effort */
+    }
+  }
+
+  // -------------------------------------------------------------------
+  // Capability bootstrap (fetch-on-connect)
+  // -------------------------------------------------------------------
+
+  /**
+   * Fetch the served capability canon once and cache it for the per-dispatch
+   * system-prompt injection, replacing the bundled fallback. Never throws: any
+   * failure (network, 401, 404 on an old backend, malformed body) leaves the
+   * bundled BGOS_AGENT_HINTS in place so the daemon is never blocked on this.
+   * Runs once per process (start() is guarded), i.e. once at connect.
+   */
+  private async loadServedCapabilities(): Promise<void> {
+    if (this.capabilitiesLoaded) return;
+    this.capabilitiesLoaded = true;
+    try {
+      const served = await this.api.getCapabilities("gobot");
+      const picked = pickAgentHints(served);
+      if (picked.source === "backend") {
+        this.cachedAgentHints = picked.hints;
+        // eslint-disable-next-line no-console
+        console.log(
+          `[gobot-channel-bgos] capability canon applied version=${served.version} chars=${served.text.length} source=backend`,
+        );
+      } else {
+        // eslint-disable-next-line no-console
+        console.warn(
+          "[gobot-channel-bgos] served capability canon malformed; keeping bundled fallback",
+        );
+      }
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        "[gobot-channel-bgos] capability canon fetch failed; keeping bundled fallback: " +
+          (err instanceof Error ? err.message : String(err)),
+      );
     }
   }
 

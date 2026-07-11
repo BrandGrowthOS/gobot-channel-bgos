@@ -30,6 +30,16 @@ export { ProcessedIdsCache } from "./processed-ids.js";
 export { BgosOutbound, BGOSOutbound } from "./outbound.js";
 export { BGOS_AGENT_HINTS, buildSystemPromptWithHints } from "./agent-hints.js";
 export {
+  BUNDLED_AGENT_HINTS,
+  appendAgentHints,
+  hasCanonMarkers,
+  pickAgentHints,
+} from "./capabilities.js";
+export type {
+  ServedCapabilities,
+  PickedAgentHints,
+} from "./capabilities.js";
+export {
   DEFAULT_COMMANDS,
   resolveCommandSeedMode,
   shouldSeedDefaults,
