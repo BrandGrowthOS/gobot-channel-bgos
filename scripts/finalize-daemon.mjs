@@ -8,7 +8,11 @@
 import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 
-const BIN_FILES = ["dist/pair-cli.js", "dist/reseed-cli.js"];
+const BIN_FILES = [
+  "dist/setup-cli.js",
+  "dist/pair-cli.js",
+  "dist/reseed-cli.js",
+];
 
 let exitCode = 0;
 for (const rel of BIN_FILES) {
