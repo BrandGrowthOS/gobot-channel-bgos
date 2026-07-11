@@ -234,7 +234,14 @@ function stageAcquireSource(opts: SetupOptions, facts: EnvFacts): void {
   if (!facts.installDirExists) {
     mkdirSync(dirname(opts.installDir), { recursive: true });
     const c = run("git", ["clone", opts.upstreamRepo, opts.installDir]);
-    if (!c.ok) throw new Error("git clone failed");
+    if (!c.ok) {
+      throw new Error(
+        `git clone of ${opts.upstreamRepo} failed. Gobot is a private repo, so ` +
+          `this needs a git that can read it (you must already be a Gobot user). ` +
+          `If you have an existing Gobot checkout, re-run with --install-dir ` +
+          `pointing at it; setup applies the BGOS hook in place without cloning.`,
+      );
+    }
   }
 
   // Download the public hook patch.
