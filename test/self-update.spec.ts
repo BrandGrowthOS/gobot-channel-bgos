@@ -50,22 +50,23 @@ afterEach(async () => {
 });
 
 describe("auto-update flag gate", () => {
-  it("accepts only the exact on and off values", () => {
+  it("defaults to on when unset; off and exact values respected (KC 2026-07-18)", () => {
     expect(parseAutoUpdateFlag("on")).toBe("on");
+    expect(parseAutoUpdateFlag(undefined)).toBe("on");
+    expect(parseAutoUpdateFlag("")).toBe("on");
     expect(parseAutoUpdateFlag("off")).toBe("off");
-    expect(parseAutoUpdateFlag(undefined)).toBe("invalid");
     expect(parseAutoUpdateFlag("ON")).toBe("invalid");
     expect(parseAutoUpdateFlag("true")).toBe("invalid");
     expect(parseAutoUpdateFlag(" on ")).toBe("invalid");
   });
 
-  it("does no IO, command, check, or timer work when unset", async () => {
+  it("does no IO, command, check, or timer work with an invalid flag value", async () => {
     const dir = tempDir();
     const statePath = join(dir, "bgos_auto_update.json");
     const runner = vi.fn<CommandRunner>();
     const setTimer = vi.fn();
     const controller = new AutoUpdateController({
-      env: {},
+      env: { BGOS_AUTO_UPDATE: "not-a-flag" },
       statePath,
       runner,
       setTimer,
