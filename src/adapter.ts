@@ -48,6 +48,10 @@ import { pendingUnknownStats } from "./pending-unknown-store.js";
 import { BGOS_AGENT_HINTS } from "./agent-hints.js";
 import { pickAgentHints } from "./capabilities.js";
 import {
+  AutoUpdateController,
+  decideDrainBeforeUpdate,
+} from "./self-update.js";
+import {
   loadVoiceConfigFromEnv,
   VoiceRpcHandler,
   type VoiceConfig,
@@ -135,6 +139,10 @@ export class BGOSAdapter {
   private pollTimer: NodeJS.Timeout | null = null;
   private spoolTimer: NodeJS.Timeout | null = null;
   private started = false;
+  private networkStarted = false;
+  private updateDraining = false;
+  private activeMessageCount = 0;
+  private readonly autoUpdate: AutoUpdateController;
 
   private readonly onFatal?: (info: FatalInfo) => void;
   private readonly onButtonClick?: (info: ButtonClickInfo) => void | Promise<void>;
@@ -177,6 +185,12 @@ export class BGOSAdapter {
     this.heartbeat = new HeartbeatController({
       version: getPackageVersion(),
       postHeartbeat: (body) => this.api.postHeartbeat(body),
+    });
+    this.autoUpdate = new AutoUpdateController({
+      drain: () => this.drainForUpdate(),
+      resume: () => this.resumeAfterUpdateFailure(),
+      shutdown: () => this.stop(),
+      ...(process.execPath.endsWith("bun") ? { bunPath: process.execPath } : {}),
     });
 
     const inputCfg = (input as BgosConfig | undefined) ?? {};
@@ -260,6 +274,9 @@ export class BGOSAdapter {
     if (this.started) return;
     this.started = true;
 
+    const updateStart = await this.autoUpdate.start();
+    if (updateStart === "exit-requested") return;
+
     // 1. Wire WS handlers BEFORE connecting.
     const inboundHandler = createInboundHandler({
       outbound: this.outbound,
@@ -272,9 +289,13 @@ export class BGOSAdapter {
       onUnknownAssistant: () => this.refreshScopeRateLimited(),
     });
     this.ws.on("inbound_message", (msg) => {
-      void inboundHandler(msg);
+      if (this.updateDraining) return;
+      this.trackMessageProcessing(() => inboundHandler(msg));
     });
-    this.ws.on("inbound_click", (click) => this.routeInboundClick(click));
+    this.ws.on("inbound_click", (click) => {
+      if (this.updateDraining) return;
+      this.trackMessageProcessing(() => this.routeInboundClick(click));
+    });
     this.ws.on("callback_result", (p) => {
       // n8n success/error lane. `callback_result` carries NO callbackData, so
       // this never matches an approval, approvals resolve via inbound_click.
@@ -344,12 +365,16 @@ export class BGOSAdapter {
       log: (msg) => console.log("[gobot-channel-bgos] " + msg),
     });
     this.ws.on("voice_rpc", (frame) => {
-      void this.voiceRpc?.handle(frame);
+      if (this.updateDraining) return;
+      this.trackMessageProcessing(
+        () => this.voiceRpc?.handle(frame) ?? Promise.resolve(),
+      );
     });
 
     // 2. Connect WS + start heartbeat.
     await this.ws.connect();
     this.heartbeat.start();
+    this.networkStarted = true;
 
     // Fetch the served capability canon once at connect and cache it for the
     // per-dispatch injection (best-effort; falls back to the bundled copy).
@@ -376,6 +401,9 @@ export class BGOSAdapter {
   async stop(): Promise<void> {
     if (!this.started) return;
     this.started = false;
+    this.autoUpdate.stop();
+    this.networkStarted = false;
+    this.updateDraining = false;
     this.stopPollLoop();
     if (this.spoolTimer !== null) {
       clearInterval(this.spoolTimer);
@@ -394,6 +422,58 @@ export class BGOSAdapter {
       await this.commandsSync.flushAll();
     } catch {
       /* swallow on shutdown, best effort */
+    }
+  }
+
+  private trackMessageProcessing(task: () => Promise<unknown>): void {
+    this.activeMessageCount += 1;
+    void Promise.resolve()
+      .then(task)
+      .finally(() => {
+        this.activeMessageCount = Math.max(0, this.activeMessageCount - 1);
+      });
+  }
+
+  private async drainForUpdate(): Promise<void> {
+    let decision = decideDrainBeforeUpdate({
+      updateReady: true,
+      draining: this.updateDraining,
+      activeMessages: this.activeMessageCount,
+    });
+    if (decision === "begin") {
+      this.updateDraining = true;
+      if (this.networkStarted) {
+        this.stopPollLoop();
+        this.ws.disconnect();
+        this.heartbeat.setWsConnected(false, null);
+      }
+    }
+    decision = decideDrainBeforeUpdate({
+      updateReady: true,
+      draining: this.updateDraining,
+      activeMessages: this.activeMessageCount,
+    });
+    while (decision === "wait") {
+      await new Promise<void>((resolve) => setTimeout(resolve, 25));
+      decision = decideDrainBeforeUpdate({
+        updateReady: true,
+        draining: this.updateDraining,
+        activeMessages: this.activeMessageCount,
+      });
+    }
+  }
+
+  private async resumeAfterUpdateFailure(): Promise<void> {
+    this.updateDraining = false;
+    if (!this.started || !this.networkStarted) return;
+    await this.ws.connect();
+    const ok = await this.refreshIdentity();
+    if (ok) {
+      this.identityReady = true;
+      await this.ws.triggerBackfill();
+      this.startPollLoop();
+    } else if (!this.fatalLatched) {
+      this.scheduleIdentityRetry(1000);
     }
   }
 
@@ -585,7 +665,7 @@ export class BGOSAdapter {
   // inbound_click routing (HITL, contract C6)
   // -------------------------------------------------------------------
 
-  private routeInboundClick(click: InboundClickPayload): void {
+  private async routeInboundClick(click: InboundClickPayload): Promise<void> {
     // Approval precedence: an approval-consumed click is NOT also forwarded.
     const consumed = this.approvals.handleCallbackResult({
       messageId: click.messageId,
@@ -596,7 +676,7 @@ export class BGOSAdapter {
     });
     if (consumed) return;
     try {
-      void this.onButtonClick?.({
+      await this.onButtonClick?.({
         assistantId: click.assistantId,
         chatId: click.chatId,
         callbackData: click.callbackData,

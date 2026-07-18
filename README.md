@@ -62,6 +62,7 @@ The adapter resolves config in order: explicit constructor arg → env var → `
 | `BGOS_VOICE_VOICE` | `marin` | Realtime voice name. |
 | `BGOS_VOICE_PERSONA` | _(empty)_ | Extra persona text baked into the voice session instructions. |
 | `GOBOT_BGOS_HEARTBEAT_INTERVAL` | `60` (seconds) | Cadence for the daemon heartbeat that reports `daemon_version` + last error to the backend (surfaced in the BGOS Integrations card). `0` disables the network heartbeat; a local `$GOBOT_HOME/bgos_heartbeat.json` is always written for the watchdog. |
+| `BGOS_AUTO_UPDATE` | `off` | Exact value `on` opts the supervised Gobot checkout into same-major automatic updates. Exact value `off` is the hard kill switch. |
 | `GOBOT_BGOS_BACKFILL_STORM_LIMIT` | `25` | If a single REST backfill returns more than this many messages, the cursor fast-forwards and dispatch is skipped (prevents a history-replay storm after a long outage). `0` disables the guard. |
 | `GOBOT_BGOS_CHAT_ID` / `GOBOT_BGOS_CHAT_ID_<assistantId>` | _(auto)_ | **Rarely needed.** Proactive messages (check-ins, briefings) self-resolve their delivery chat via the backend, so you do not normally set this. Set it only to pin a specific chat. |
 
@@ -87,6 +88,18 @@ The running daemon watches the secrets directory and re-authenticates the moment
 ## Reliability
 
 Inbound is deduplicated (a message is dispatched exactly once across the live WS push and the REST backfill), the cursor is durable, revocation surfaces as a visible error plus a recover-on-new-token state, and outbound sends retry the network-error class with a bounded on-disk spool. A `daemon_version` heartbeat keeps the Integrations card honest about what the host is running.
+
+## Opt-in checkout updates
+
+The one-paste setup clones or reuses the Gobot host checkout, installs this npm package into that checkout, and supervises the host `src/bot.ts`. The adapter lifecycle is therefore the update integration point. Automatic update never assumes that the npm package directory itself is the host. It first proves that the working directory, or `GOBOT_INSTALL_DIR` when set, is a git checkout whose package name is `gobot`. Other install layouts are logged and skipped.
+
+Set `BGOS_AUTO_UPDATE=on` to opt in. The default and every unrecognized value are off. An exact `BGOS_AUTO_UPDATE=off` prevents every update check, timer, and git command. A boot with `off` may write only the durable reset marker needed after an automatic rollback.
+
+An opted-in daemon checks at boot, then every 24 hours plus a fresh random delay from zero through six hours. It fetches the configured upstream, compares the checkout package version with the upstream package version, and proceeds only for a newer version in the same major. The apply step is `git merge --ff-only <validated-target-sha>`. It never resets, forces, or rewrites local history. A merge that cannot fast-forward is logged and skipped. Bun installs dependencies only when a recognized lockfile changed.
+
+Before changing the checkout, the adapter stops accepting new BGOS work, disconnects its intake, and waits for active message processing to finish. After a successful update it exits with status 0 so launchd or systemd restarts it. Update check failures are logged and the daemon continues.
+
+Rollback state is stored at `$GOBOT_HOME/bgos_auto_update.json`, next to the heartbeat state. The previous commit is monitored for the first 60 seconds of each boot. Two consecutive short boots restore that recorded commit with a detached checkout, then disable further automatic updates. To re-enable after a rollback, run one supervised boot with `BGOS_AUTO_UPDATE=off`, then set it back to `on` and restart again.
 
 ## Prerequisites
 

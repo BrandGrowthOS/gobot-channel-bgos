@@ -1,5 +1,5 @@
 /**
- * gobot-channel-bgos — public exports.
+ * gobot-channel-bgos public exports.
  *
  * The fork (`BrandGrowthOS/gobot-bgos-fork`) loads this package via
  * `optionalDependencies`. If the package is installed, the fork:
@@ -10,7 +10,7 @@
  *   4. Starts: `await adapter.start()`
  *   5. On shutdown: `await adapter.stop()`
  *
- * Public surface kept narrow — the fork only needs adapter lifecycle +
+ * Public surface kept narrow because the fork only needs adapter lifecycle +
  * outbound primitives + the agent-hints + default-commands constants.
  */
 export {
@@ -20,6 +20,37 @@ export {
   type FatalInfo,
 } from "./adapter.js";
 export { getPackageVersion } from "./version.js";
+export {
+  AutoUpdateController,
+  autoUpdateStatePath,
+  checkGitUpdate,
+  compareVersions,
+  decideDrainBeforeUpdate,
+  decideVersionUpdate,
+  formatGitUpdateDecision,
+  parseAutoUpdateFlag,
+  readAutoUpdateState,
+  transitionRollbackState,
+  updateJitterMs,
+  writeAutoUpdateState,
+  HEALTHY_BOOT_MS,
+  MAX_UPDATE_JITTER_MS,
+  UPDATE_INTERVAL_MS,
+  type AutoUpdateControllerDeps,
+  type AutoUpdateFlag,
+  type AutoUpdateStartResult,
+  type AutoUpdateState,
+  type CommandResult,
+  type CommandRunner,
+  type DrainDecision,
+  type GitCheckDecision,
+  type GitUpdateCheck,
+  type GitUpdateOptions,
+  type PendingUpdateState,
+  type RollbackAction,
+  type RollbackEvent,
+  type VersionDecision,
+} from "./self-update.js";
 export {
   HeartbeatController,
   type HeartbeatDto,

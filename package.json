@@ -14,7 +14,8 @@
     "build": "tsc -p tsconfig.json && node scripts/finalize-daemon.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
-    "lint": "tsc --noEmit -p tsconfig.json"
+    "lint": "tsc --noEmit -p tsconfig.json",
+    "self-update:dry-run": "npm run build && node scripts/self-update-dry-run.mjs"
   },
   "keywords": [
     "gobot",
