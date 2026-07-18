@@ -13,6 +13,8 @@ import { dirname, join, resolve } from "node:path";
 export const UPDATE_INTERVAL_MS = 24 * 60 * 60 * 1000;
 export const MAX_UPDATE_JITTER_MS = 6 * 60 * 60 * 1000;
 export const HEALTHY_BOOT_MS = 60_000;
+export const ACTIVE_WORK_RETRY_MS = 60_000;
+export const COMMAND_TIMEOUT_MS = 5 * 60 * 1000;
 
 const LOCKFILES = [
   "bun.lock",
@@ -127,6 +129,7 @@ export interface PendingUpdateState {
   crashCount: number;
   bootStartedAtMs: number | null;
   lockfileChanged: boolean;
+  rollbackRequired: boolean;
 }
 
 export interface AutoUpdateState {
@@ -197,6 +200,7 @@ export function transitionRollbackState(
       crashCount: 0,
       bootStartedAtMs: null,
       lockfileChanged: event.lockfileChanged,
+      rollbackRequired: false,
     };
     current.upstreamRef = event.upstreamRef;
     return { state: current, action: "continue" };
@@ -229,6 +233,9 @@ export function transitionRollbackState(
 
   const pending = current.pending;
   if (!pending) return { state: current, action: "continue" };
+  if (pending.rollbackRequired) {
+    return { state: current, action: "rollback" };
+  }
   if (pending.targetCommit !== event.currentCommit) {
     current.pending = null;
     return { state: current, action: "continue" };
@@ -244,6 +251,7 @@ export function transitionRollbackState(
   }
 
   if (pending.crashCount >= 2) {
+    pending.rollbackRequired = true;
     return { state: current, action: "rollback" };
   }
   pending.bootStartedAtMs = event.nowMs;
@@ -255,13 +263,18 @@ function isPendingState(value: unknown): value is PendingUpdateState {
   const pending = value as Partial<PendingUpdateState>;
   return (
     typeof pending.previousCommit === "string" &&
+    /^[0-9a-f]{40,64}$/i.test(pending.previousCommit) &&
     typeof pending.previousVersion === "string" &&
     typeof pending.targetCommit === "string" &&
+    /^[0-9a-f]{40,64}$/i.test(pending.targetCommit) &&
     typeof pending.targetVersion === "string" &&
-    typeof pending.crashCount === "number" &&
+    Number.isInteger(pending.crashCount) &&
+    (pending.crashCount ?? -1) >= 0 &&
     (pending.bootStartedAtMs === null ||
-      typeof pending.bootStartedAtMs === "number") &&
-    typeof pending.lockfileChanged === "boolean"
+      (typeof pending.bootStartedAtMs === "number" &&
+        Number.isFinite(pending.bootStartedAtMs))) &&
+    typeof pending.lockfileChanged === "boolean" &&
+    typeof pending.rollbackRequired === "boolean"
   );
 }
 
@@ -272,18 +285,37 @@ function isState(value: unknown): value is AutoUpdateState {
     state.schemaVersion === 1 &&
     typeof state.disabled === "boolean" &&
     typeof state.resetSeen === "boolean" &&
-    (state.upstreamRef === null || typeof state.upstreamRef === "string") &&
+    (state.upstreamRef === null ||
+      (typeof state.upstreamRef === "string" &&
+        isSafeUpstreamRef(state.upstreamRef))) &&
     (state.pending === null || isPendingState(state.pending))
   );
 }
 
-export function readAutoUpdateState(path: string): AutoUpdateState {
-  try {
-    const parsed = JSON.parse(readFileSync(path, "utf8")) as unknown;
-    return isState(parsed) ? parsed : structuredClone(EMPTY_AUTO_UPDATE_STATE);
-  } catch {
-    return structuredClone(EMPTY_AUTO_UPDATE_STATE);
+export class MalformedAutoUpdateStateError extends Error {
+  constructor(path: string) {
+    super(`auto-update state is malformed: ${path}`);
+    this.name = "MalformedAutoUpdateStateError";
   }
+}
+
+export function readAutoUpdateState(path: string): AutoUpdateState {
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return structuredClone(EMPTY_AUTO_UPDATE_STATE);
+    }
+    throw error;
+  }
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (isState(parsed)) return parsed;
+  } catch {
+    throw new MalformedAutoUpdateStateError(path);
+  }
+  throw new MalformedAutoUpdateStateError(path);
 }
 
 export function writeAutoUpdateState(
@@ -331,6 +363,9 @@ export const runCommand: CommandRunner = (command, args, cwd) => {
       stdio: "pipe",
       maxBuffer: 16 * 1024 * 1024,
       shell: false,
+      timeout: COMMAND_TIMEOUT_MS,
+      killSignal: "SIGTERM",
+      env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
     });
     return {
       status: result.status,
@@ -632,6 +667,7 @@ export interface AutoUpdateControllerDeps extends GitUpdateOptions {
   setTimer?: (callback: () => void, delayMs: number) => NodeJS.Timeout;
   clearTimer?: (timer: NodeJS.Timeout) => void;
   bunPath?: string;
+  hasActiveWork?: () => boolean;
 }
 
 export type AutoUpdateStartResult = "inactive" | "running" | "exit-requested";
@@ -652,6 +688,7 @@ export class AutoUpdateController {
     delayMs: number,
   ) => NodeJS.Timeout;
   private readonly clearTimer: (timer: NodeJS.Timeout) => void;
+  private readonly hasActiveWork: () => boolean;
   private timer: NodeJS.Timeout | null = null;
   private healthyTimer: NodeJS.Timeout | null = null;
   private stopped = false;
@@ -671,6 +708,7 @@ export class AutoUpdateController {
     this.random = deps.random ?? (() => Math.random());
     this.setTimer = deps.setTimer ?? ((callback, delay) => setTimeout(callback, delay));
     this.clearTimer = deps.clearTimer ?? ((timer) => clearTimeout(timer));
+    this.hasActiveWork = deps.hasActiveWork ?? (() => false);
   }
 
   async start(): Promise<AutoUpdateStartResult> {
@@ -683,7 +721,18 @@ export class AutoUpdateController {
     if (flag !== "on") return "inactive";
 
     try {
-      let state = readAutoUpdateState(this.statePath);
+      let state: AutoUpdateState;
+      try {
+        state = readAutoUpdateState(this.statePath);
+      } catch (error) {
+        if (error instanceof MalformedAutoUpdateStateError) {
+          this.log(
+            "[gobot-channel-bgos] auto-update state is malformed; updates are disabled until one off boot resets the state",
+          );
+          return "inactive";
+        }
+        throw error;
+      }
       if (state.disabled && !state.resetSeen) {
         this.log(
           "[gobot-channel-bgos] auto-update is disabled after rollback; run one supervised boot with BGOS_AUTO_UPDATE=off before enabling it again",
@@ -764,7 +813,20 @@ export class AutoUpdateController {
 
   private recordFlagReset(): void {
     try {
-      const state = readAutoUpdateState(this.statePath);
+      let state: AutoUpdateState;
+      try {
+        state = readAutoUpdateState(this.statePath);
+      } catch (error) {
+        if (!(error instanceof MalformedAutoUpdateStateError)) throw error;
+        writeAutoUpdateState(this.statePath, {
+          schemaVersion: 1,
+          disabled: true,
+          resetSeen: true,
+          upstreamRef: null,
+          pending: null,
+        });
+        return;
+      }
       if (!state.disabled || state.resetSeen) return;
       const next = transitionRollbackState(state, { type: "flag-off" });
       writeAutoUpdateState(this.statePath, next.state);
@@ -794,11 +856,17 @@ export class AutoUpdateController {
     this.healthyTimer.unref?.();
   }
 
-  private armNextCheck(): void {
+  private armNextCheck(delayOverrideMs?: number): void {
     if (this.stopped || this.timer) return;
-    const delay = UPDATE_INTERVAL_MS + updateJitterMs(this.random());
+    const delay =
+      delayOverrideMs ?? UPDATE_INTERVAL_MS + updateJitterMs(this.random());
     this.timer = this.setTimer(() => {
       this.timer = null;
+      if (this.stopped) return;
+      if (this.hasActiveWork()) {
+        this.armNextCheck(ACTIVE_WORK_RETRY_MS);
+        return;
+      }
       void this.checkAndApply().finally(() => this.armNextCheck());
     }, delay);
     this.timer.unref?.();
@@ -933,10 +1001,23 @@ export class AutoUpdateController {
       pending.previousCommit,
       pending.lockfileChanged,
     );
-    if (!restored.checkoutRestored) {
-      this.log(
-        "[gobot-channel-bgos] rollback could not restore the previous commit; daemon will continue without running another update check",
-      );
+    if (!restored.checkoutRestored || !restored.dependenciesReady) {
+      this.stopped = true;
+      if (restored.checkoutRestored) {
+        const returned = this.checkoutDetached(
+          checkoutRoot,
+          pending.targetCommit,
+        );
+        this.log(
+          returned
+            ? "[gobot-channel-bgos] rollback dependency restoration failed; the target checkout was restored and rollback will retry on the next boot"
+            : "[gobot-channel-bgos] rollback dependency restoration failed; rollback remains pending and requires operator attention",
+        );
+      } else {
+        this.log(
+          "[gobot-channel-bgos] rollback could not restore the previous commit; rollback remains pending and will retry on the next boot",
+        );
+      }
       await this.resume();
       return "running";
     }
@@ -980,6 +1061,22 @@ export class AutoUpdateController {
       }
     }
     return { checkoutRestored: true, dependenciesReady: true };
+  }
+
+  private checkoutDetached(checkoutRoot: string, commit: string): boolean {
+    if (!/^[0-9a-f]{40,64}$/i.test(commit)) return false;
+    const checkedOut = this.runner(
+      "git",
+      ["checkout", "--detach", commit],
+      checkoutRoot,
+    );
+    if (checkedOut.status !== 0) {
+      this.log(
+        `[gobot-channel-bgos] checkout restore failed: ${commandFailure(checkedOut)}`,
+      );
+      return false;
+    }
+    return true;
   }
 
   private async shutdownForRestart(): Promise<void> {

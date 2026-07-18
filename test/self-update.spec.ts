@@ -10,9 +10,12 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   AutoUpdateController,
+  ACTIVE_WORK_RETRY_MS,
+  COMMAND_TIMEOUT_MS,
   EMPTY_AUTO_UPDATE_STATE,
   HEALTHY_BOOT_MS,
   MAX_UPDATE_JITTER_MS,
+  MalformedAutoUpdateStateError,
   UPDATE_INTERVAL_MS,
   checkGitUpdate,
   compareVersions,
@@ -20,6 +23,7 @@ import {
   decideVersionUpdate,
   parseAutoUpdateFlag,
   readAutoUpdateState,
+  runCommand,
   transitionRollbackState,
   updateJitterMs,
   writeAutoUpdateState,
@@ -95,6 +99,71 @@ describe("auto-update flag gate", () => {
     expect(readAutoUpdateState(statePath).resetSeen).toBe(true);
     expect(runner).not.toHaveBeenCalled();
     expect(setTimer).not.toHaveBeenCalled();
+  });
+
+  it("requires explicit off then on to recover malformed state", async () => {
+    const root = tempDir();
+    const statePath = join(root, "bgos_auto_update.json");
+    writeFileSync(statePath, "malformed");
+    const blockedRunner = vi.fn<CommandRunner>();
+    const blocked = new AutoUpdateController({
+      env: { BGOS_AUTO_UPDATE: "on" },
+      checkoutDir: root,
+      statePath,
+      runner: blockedRunner,
+    });
+    await expect(blocked.start()).resolves.toBe("inactive");
+    expect(blockedRunner).not.toHaveBeenCalled();
+
+    const offRunner = vi.fn<CommandRunner>();
+    const off = new AutoUpdateController({
+      env: { BGOS_AUTO_UPDATE: "off" },
+      checkoutDir: root,
+      statePath,
+      runner: offRunner,
+    });
+    await expect(off.start()).resolves.toBe("inactive");
+    expect(offRunner).not.toHaveBeenCalled();
+    expect(readAutoUpdateState(statePath)).toMatchObject({
+      disabled: true,
+      resetSeen: true,
+    });
+
+    const commit = "a".repeat(40);
+    writeFileSync(
+      join(root, "package.json"),
+      JSON.stringify({ name: "gobot", version: "2.1.0" }),
+    );
+    const runner: CommandRunner = (_command, args) => {
+      const key = args.join(" ");
+      if (key === "rev-parse --show-toplevel") {
+        return { status: 0, stdout: root + "\n", stderr: "" };
+      }
+      if (
+        key === "rev-parse HEAD" ||
+        key === "rev-parse refs/remotes/origin/main"
+      ) {
+        return { status: 0, stdout: commit + "\n", stderr: "" };
+      }
+      if (key === "rev-parse --symbolic-full-name @{upstream}") {
+        return { status: 0, stdout: "refs/remotes/origin/main\n", stderr: "" };
+      }
+      if (key === "fetch --quiet") {
+        return { status: 0, stdout: "", stderr: "" };
+      }
+      return { status: 1, stdout: "", stderr: "unexpected command" };
+    };
+    const timer = { unref: vi.fn() } as unknown as NodeJS.Timeout;
+    const reenabled = new AutoUpdateController({
+      env: { BGOS_AUTO_UPDATE: "on" },
+      checkoutDir: root,
+      statePath,
+      runner,
+      setTimer: () => timer,
+    });
+    await expect(reenabled.start()).resolves.toBe("running");
+    expect(readAutoUpdateState(statePath).disabled).toBe(false);
+    reenabled.stop();
   });
 });
 
@@ -254,11 +323,36 @@ describe("state persistence", () => {
     expect(statSync(path).mode & 0o777).toBe(0o600);
   });
 
-  it("fails open to an empty state for malformed data", () => {
+  it("fails closed for malformed existing data", () => {
     const dir = tempDir();
     const path = join(dir, "bgos_auto_update.json");
     writeFileSync(path, "not json");
-    expect(readAutoUpdateState(path)).toEqual(EMPTY_AUTO_UPDATE_STATE);
+    expect(() => readAutoUpdateState(path)).toThrow(
+      MalformedAutoUpdateStateError,
+    );
+  });
+
+  it("treats a missing state file as first run", () => {
+    const dir = tempDir();
+    expect(readAutoUpdateState(join(dir, "missing.json"))).toEqual(
+      EMPTY_AUTO_UPDATE_STATE,
+    );
+  });
+
+  it("sets a finite command timeout and disables git prompts", () => {
+    const dir = tempDir();
+    expect(Number.isFinite(COMMAND_TIMEOUT_MS)).toBe(true);
+    expect(COMMAND_TIMEOUT_MS).toBeGreaterThan(0);
+    const result = runCommand(
+      process.execPath,
+      [
+        "-e",
+        "process.stdout.write(process.env.GIT_TERMINAL_PROMPT || '')",
+      ],
+      dir,
+    );
+    expect(result.status).toBe(0);
+    expect(result.stdout).toBe("0");
   });
 });
 
@@ -421,6 +515,64 @@ describe("git update inspection", () => {
     controller.stop();
   });
 
+  it("defers a scheduled check while message work is active", async () => {
+    const root = tempDir();
+    const statePath = join(root, "state.json");
+    writeFileSync(
+      join(root, "package.json"),
+      JSON.stringify({ name: "gobot", version: "2.1.0" }),
+    );
+    let fetchCount = 0;
+    const runner: CommandRunner = (_command, args) => {
+      const key = args.join(" ");
+      if (key === "rev-parse --show-toplevel") {
+        return { status: 0, stdout: root + "\n", stderr: "" };
+      }
+      if (
+        key === "rev-parse HEAD" ||
+        key === "rev-parse refs/remotes/origin/main"
+      ) {
+        return { status: 0, stdout: currentCommit + "\n", stderr: "" };
+      }
+      if (key === "rev-parse --symbolic-full-name @{upstream}") {
+        return { status: 0, stdout: "refs/remotes/origin/main\n", stderr: "" };
+      }
+      if (key === "fetch --quiet") {
+        fetchCount += 1;
+        return { status: 0, stdout: "", stderr: "" };
+      }
+      return { status: 1, stdout: "", stderr: "unexpected command" };
+    };
+    const timers: Array<{ callback: () => void; delay: number }> = [];
+    const setTimer = vi.fn((callback: () => void, delay: number) => {
+      timers.push({ callback, delay });
+      return { unref: vi.fn() } as unknown as NodeJS.Timeout;
+    });
+    let active = false;
+    const controller = new AutoUpdateController({
+      env: { BGOS_AUTO_UPDATE: "on" },
+      checkoutDir: root,
+      statePath,
+      runner,
+      setTimer,
+      hasActiveWork: () => active,
+    });
+
+    await controller.start();
+    expect(fetchCount).toBe(1);
+    active = true;
+    timers.shift()?.callback();
+    expect(fetchCount).toBe(1);
+    expect(timers[0]?.delay).toBe(ACTIVE_WORK_RETRY_MS);
+
+    active = false;
+    timers.shift()?.callback();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(fetchCount).toBe(2);
+    controller.stop();
+  });
+
   it("dry-run logs the real decision without merge, install, drain, or exit", async () => {
     const root = tempDir();
     const statePath = join(root, "state.json");
@@ -550,6 +702,83 @@ describe("git update inspection", () => {
     expect(setTimer).not.toHaveBeenCalled();
   });
 
+  it("keeps rollback retryable when rollback dependencies cannot be restored", async () => {
+    const root = tempDir();
+    const statePath = join(root, "state", "bgos_auto_update.json");
+    writeFileSync(
+      join(root, "package.json"),
+      JSON.stringify({ name: "gobot", version: "2.2.0" }),
+    );
+    writeFileSync(join(root, "bun.lock"), "lock");
+    writeAutoUpdateState(statePath, {
+      schemaVersion: 1,
+      disabled: false,
+      resetSeen: false,
+      upstreamRef: "refs/remotes/origin/main",
+      pending: {
+        previousCommit: currentCommit,
+        previousVersion: "2.1.0",
+        targetCommit,
+        targetVersion: "2.2.0",
+        crashCount: 2,
+        bootStartedAtMs: 90,
+        lockfileChanged: true,
+        rollbackRequired: true,
+      },
+    });
+    const calls: string[] = [];
+    const runner: CommandRunner = (command, args) => {
+      const key = args.join(" ");
+      calls.push([command, key].join(" "));
+      if (key === "rev-parse --show-toplevel") {
+        return { status: 0, stdout: root + "\n", stderr: "" };
+      }
+      if (key === "rev-parse HEAD") {
+        return { status: 0, stdout: targetCommit + "\n", stderr: "" };
+      }
+      if (key === `checkout --detach ${currentCommit}`) {
+        return { status: 0, stdout: "old checkout", stderr: "" };
+      }
+      if (key === `checkout --detach ${targetCommit}`) {
+        return { status: 0, stdout: "target checkout", stderr: "" };
+      }
+      if (command === "bun") {
+        return { status: 1, stdout: "", stderr: "install failed" };
+      }
+      return { status: 1, stdout: "", stderr: "unexpected command" };
+    };
+    const log = vi.fn();
+    const exit = vi.fn();
+    const setTimer = vi.fn();
+    const controller = new AutoUpdateController({
+      env: { BGOS_AUTO_UPDATE: "on" },
+      checkoutDir: root,
+      statePath,
+      runner,
+      log,
+      exit,
+      setTimer,
+      bunPath: "bun",
+    });
+
+    await expect(controller.start()).resolves.toBe("running");
+    expect(calls).toContain(`git checkout --detach ${currentCommit}`);
+    expect(calls).toContain(`git checkout --detach ${targetCommit}`);
+    expect(readAutoUpdateState(statePath)).toMatchObject({
+      disabled: false,
+      pending: {
+        previousCommit: currentCommit,
+        targetCommit,
+        rollbackRequired: true,
+      },
+    });
+    expect(exit).not.toHaveBeenCalled();
+    expect(setTimer).not.toHaveBeenCalled();
+    expect(
+      log.mock.calls.some(([message]) => String(message).includes("rolled back to")),
+    ).toBe(false);
+  });
+
   it("rolls back with a detached checkout and latches updates off", async () => {
     const root = tempDir();
     const statePath = join(root, "state", "bgos_auto_update.json");
@@ -570,6 +799,7 @@ describe("git update inspection", () => {
         crashCount: 1,
         bootStartedAtMs: 90,
         lockfileChanged: false,
+        rollbackRequired: false,
       },
     });
     const calls: string[] = [];

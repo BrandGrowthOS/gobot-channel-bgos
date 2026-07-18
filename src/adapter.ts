@@ -190,6 +190,7 @@ export class BGOSAdapter {
       drain: () => this.drainForUpdate(),
       resume: () => this.resumeAfterUpdateFailure(),
       shutdown: () => this.stop(),
+      hasActiveWork: () => this.activeMessageCount > 0,
       ...(process.execPath.endsWith("bun") ? { bunPath: process.execPath } : {}),
     });
 
@@ -325,7 +326,8 @@ export class BGOSAdapter {
       this.heartbeat.setWsConnected(false, null);
     });
     this.ws.on("reconnect", () => {
-      void this.onReconnect();
+      if (this.updateDraining) return;
+      this.trackMessageProcessing(() => this.onReconnect());
     });
     this.ws.on("backfill_ok", () => {
       // Clear a stale backfill error once a clean backfill lands.
@@ -393,7 +395,8 @@ export class BGOSAdapter {
 
     // 4. Outbox replay loop (every 60s while non-empty).
     this.spoolTimer = setInterval(() => {
-      void this.outbound.replaySpool();
+      if (this.updateDraining) return;
+      void this.replaySpoolTracked();
     }, 60_000);
     this.spoolTimer.unref?.();
   }
@@ -426,12 +429,22 @@ export class BGOSAdapter {
   }
 
   private trackMessageProcessing(task: () => Promise<unknown>): void {
+    void this.withActiveMessageProcessing(task);
+  }
+
+  private async withActiveMessageProcessing<T>(
+    task: () => Promise<T>,
+  ): Promise<T> {
     this.activeMessageCount += 1;
-    void Promise.resolve()
-      .then(task)
-      .finally(() => {
-        this.activeMessageCount = Math.max(0, this.activeMessageCount - 1);
-      });
+    try {
+      return await task();
+    } finally {
+      this.activeMessageCount = Math.max(0, this.activeMessageCount - 1);
+    }
+  }
+
+  private replaySpoolTracked(): Promise<void> {
+    return this.withActiveMessageProcessing(() => this.outbound.replaySpool());
   }
 
   private async drainForUpdate(): Promise<void> {
@@ -464,6 +477,7 @@ export class BGOSAdapter {
   }
 
   private async resumeAfterUpdateFailure(): Promise<void> {
+    if (!this.updateDraining) return;
     this.updateDraining = false;
     if (!this.started || !this.networkStarted) return;
     await this.ws.connect();
@@ -655,10 +669,11 @@ export class BGOSAdapter {
   }
 
   private async onReconnect(): Promise<void> {
-    if (this.fatalLatched) return;
+    if (this.fatalLatched || this.updateDraining) return;
     await this.refreshIdentity();
     await this.ws.triggerBackfill();
-    await this.outbound.replaySpool();
+    if (this.updateDraining) return;
+    await this.replaySpoolTracked();
   }
 
   // -------------------------------------------------------------------
@@ -881,7 +896,7 @@ export class BGOSAdapter {
         await this.ws.triggerBackfill();
       }
       this.startPollLoop();
-      await this.outbound.replaySpool();
+      if (!this.updateDraining) await this.replaySpoolTracked();
     } catch (err) {
       // eslint-disable-next-line no-console
       console.warn(

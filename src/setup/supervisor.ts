@@ -12,7 +12,25 @@ import { join } from "node:path";
  * fork's configure-launchd refuses to also install com.go.telegram-relay when
  * this label is loaded. Keep the value in sync with the fork. */
 export const LAUNCHD_LABEL = "ai.brandgrowthos.gobot";
+export const LEGACY_AUTO_UPDATE_LABEL = "com.go.auto-update";
 export const SYSTEMD_UNIT = "gobot-bgos.service";
+
+export function forkRelaySetupArgs(): string[] {
+  return ["run", "setup:launchd", "--", "--service", "telegram-relay"];
+}
+
+export function legacyAutoUpdatePlist(home: string): string {
+  return join(
+    home,
+    "Library",
+    "LaunchAgents",
+    `${LEGACY_AUTO_UPDATE_LABEL}.plist`,
+  );
+}
+
+export function disableLegacyAutoUpdateArgs(plistPath: string): string[] {
+  return ["unload", "-w", plistPath];
+}
 
 export type SupervisorKind = "launchd" | "systemd" | "manual";
 

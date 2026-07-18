@@ -1,11 +1,39 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  disableLegacyAutoUpdateArgs,
+  forkRelaySetupArgs,
   LAUNCHD_LABEL,
+  LEGACY_AUTO_UPDATE_LABEL,
+  legacyAutoUpdatePlist,
   pickSupervisor,
   renderLaunchdPlist,
   renderSystemdUnit,
 } from "../src/setup/supervisor.js";
+
+describe("private fork supervisor isolation", () => {
+  it("configures only the relay and identifies the old updater plist", () => {
+    expect(forkRelaySetupArgs()).toEqual([
+      "run",
+      "setup:launchd",
+      "--",
+      "--service",
+      "telegram-relay",
+    ]);
+    expect(legacyAutoUpdatePlist("/Users/kc")).toBe(
+      `/Users/kc/Library/LaunchAgents/${LEGACY_AUTO_UPDATE_LABEL}.plist`,
+    );
+    expect(
+      disableLegacyAutoUpdateArgs(
+        `/Users/kc/Library/LaunchAgents/${LEGACY_AUTO_UPDATE_LABEL}.plist`,
+      ),
+    ).toEqual([
+      "unload",
+      "-w",
+      `/Users/kc/Library/LaunchAgents/${LEGACY_AUTO_UPDATE_LABEL}.plist`,
+    ]);
+  });
+});
 
 describe("pickSupervisor", () => {
   it("maps platform to supervisor kind", () => {

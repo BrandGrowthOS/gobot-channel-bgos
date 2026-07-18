@@ -32,7 +32,9 @@ describe("planStages", () => {
       "verify",
     ]);
     expect(stage(stages, "acquire-source").action).toBe("run");
-    expect(stage(stages, "acquire-source").reason).toContain("clone upstream");
+    expect(stage(stages, "acquire-source").reason).toContain(
+      "verify BGOS hook",
+    );
     expect(stage(stages, "supervisor").reason).toContain("launchd");
   });
 

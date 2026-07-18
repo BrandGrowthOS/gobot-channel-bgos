@@ -12,7 +12,7 @@ On the host where you want Gobot to run, paste the command the BGOS app shows on
 bunx gobot-channel-bgos setup BGOS-XXXX-XX
 ```
 
-That one command runs the whole integration: it detects the host, scans for a competing Telegram poller (the only y/n it may ask), clones upstream Gobot and applies the public BGOS channel hook ([`BrandGrowthOS/gobot-bgos-patch`](https://github.com/BrandGrowthOS/gobot-bgos-patch)) when there is no existing install, installs this package, pairs against your BGOS account, writes the managed env block, wires a supervisor (launchd on macOS, systemd on Linux), and verifies the connection. It is idempotent: a re-run skips whatever is already done.
+That one command runs the whole integration: it detects the host, scans for a competing Telegram poller (the only y/n it may ask), clones the private `BrandGrowthOS/gobot-bgos-fork` checkout from its tracked `bgos-integration` branch with the BGOS hook already in history, installs this package, pairs against your BGOS account, writes the managed env block, wires a supervisor (launchd on macOS, systemd on Linux), and verifies the connection. It is idempotent: a re-run skips whatever is already done. A custom `--upstream-repo` remains supported; setup applies the public [`BrandGrowthOS/gobot-bgos-patch`](https://github.com/BrandGrowthOS/gobot-bgos-patch) only when the acquired checkout does not contain the hook.
 
 Preview everything it would do without changing anything:
 
@@ -91,15 +91,21 @@ Inbound is deduplicated (a message is dispatched exactly once across the live WS
 
 ## Opt-in checkout updates
 
-The one-paste setup clones or reuses the Gobot host checkout, installs this npm package into that checkout, and supervises the host `src/bot.ts`. The adapter lifecycle is therefore the update integration point. Automatic update never assumes that the npm package directory itself is the host. It first proves that the working directory, or `GOBOT_INSTALL_DIR` when set, is a git checkout whose package name is `gobot`. Other install layouts are logged and skipped.
+The recommended one-paste setup clones or reuses the private Gobot fork, installs this npm package into that checkout, and supervises the host `src/bot.ts`. A fresh clone keeps `HEAD` aligned with its tracked upstream so fast-forward updates remain possible. The adapter lifecycle is the update integration point. Automatic update never assumes that the npm package directory itself is the host. It first proves that the working directory, or `GOBOT_INSTALL_DIR` when set, is a git checkout whose package name is `gobot`. Other install layouts are logged and skipped.
 
 Set `BGOS_AUTO_UPDATE=on` to opt in. The default and every unrecognized value are off. An exact `BGOS_AUTO_UPDATE=off` prevents every update check, timer, and git command. A boot with `off` may write only the durable reset marker needed after an automatic rollback.
 
-An opted-in daemon checks at boot, then every 24 hours plus a fresh random delay from zero through six hours. It fetches the configured upstream, compares the checkout package version with the upstream package version, and proceeds only for a newer version in the same major. The apply step is `git merge --ff-only <validated-target-sha>`. It never resets, forces, or rewrites local history. A merge that cannot fast-forward is logged and skipped. Bun installs dependencies only when a recognized lockfile changed.
+The private fork also contains an older host updater controlled by `GOBOT_AUTO_UPDATE_FORK`. That is a separate legacy lane and is not used by this adapter. Recommended setup configures only the Telegram relay service and persistently unloads `com.go.auto-update` when its plist is present. This keeps the legacy lane from changing the checkout when `BGOS_AUTO_UPDATE=off`. Existing private-fork hosts should rerun setup before relying on the new flag, or unload the legacy service with `launchctl unload -w ~/Library/LaunchAgents/com.go.auto-update.plist`.
 
-Before changing the checkout, the adapter stops accepting new BGOS work, disconnects its intake, and waits for active message processing to finish. After a successful update it exits with status 0 so launchd or systemd restarts it. Update check failures are logged and the daemon continues.
+An opted-in daemon checks at boot, then every 24 hours plus a fresh random delay from zero through six hours. A scheduled check waits while message or spool replay work is active. Commands have a finite timeout and git prompts are disabled. The updater fetches the configured upstream, compares the checkout package version with the upstream package version, and proceeds only for a newer version in the same major. The apply step is `git merge --ff-only <validated-target-sha>`. It never resets, forces, or rewrites local history. A merge that cannot fast-forward is logged and skipped. Bun installs dependencies only when a recognized lockfile changed.
 
-Rollback state is stored at `$GOBOT_HOME/bgos_auto_update.json`, next to the heartbeat state. The previous commit is monitored for the first 60 seconds of each boot. Two consecutive short boots restore that recorded commit with a detached checkout, then disable further automatic updates. To re-enable after a rollback, run one supervised boot with `BGOS_AUTO_UPDATE=off`, then set it back to `on` and restart again.
+Before changing the checkout, the adapter stops accepting new BGOS work, disconnects its intake, and waits for active message processing and outbound spool replay to finish. After a successful update it exits with status 0 so launchd or systemd restarts it. Update check failures are logged and the daemon continues.
+
+Rollback state is stored at `$GOBOT_HOME/bgos_auto_update.json`, next to the heartbeat state. The previous commit is monitored for the first 60 seconds of each boot. Two consecutive short boots restore that recorded commit with a detached checkout, then disable further automatic updates. A failed rollback dependency restore remains pending and does not exit into the incomplete checkout. Malformed state fails closed. In either case, run one supervised boot with `BGOS_AUTO_UPDATE=off`, then set it back to `on` and restart again to reset the latch or malformed state.
+
+Legacy installs that applied the public hook as a local commit can be divergent from their tracked upstream. The updater reports `not-fast-forward` and leaves them unchanged. Move custom work onto the private fork or reconcile that history manually before opting in. The updater never resets or forces a legacy checkout.
+
+Crash monitoring begins when the host reaches `BGOSAdapter.start()`. The recommended private fork owns its supervisor configuration, so this package cannot safely insert a pre-import boot marker. A host failure before the adapter is imported remains outside this package's rollback boundary.
 
 ## Prerequisites
 
@@ -196,6 +202,7 @@ cd gobot-channel-bgos
 npm install
 npm test          # vitest
 npm run build     # tsc + finalize-daemon
+npm run self-update:dry-run  # fetch refs and inspect this checkout without applying
 ```
 
 The package is also mirrored inside the BGOS monorepo at `gobot-channel-bgos/`; the public repo is the source of truth (matching the Hermes pattern).

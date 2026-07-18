@@ -73,7 +73,7 @@ export function planStages(
     stages.push({
       stage: "acquire-source",
       action: "run",
-      reason: "clone upstream + apply patch",
+      reason: "clone configured upstream and verify BGOS hook",
     });
   }
 

@@ -32,11 +32,17 @@ import { BgosApi } from "./bgos-api.js";
 import { pairBgos } from "./pair-cli.js";
 import { getPackageVersion } from "./version.js";
 import type { AgentCatalogEntry } from "./types.js";
-import { parseSetupArgs, type SetupOptions } from "./setup/args.js";
+import {
+  parseSetupArgs,
+  type SetupOptions,
+} from "./setup/args.js";
 import { invokedAsCliEntry } from "./setup/entry.js";
 import { composeEnvBlock, mergeEnvFile } from "./setup/env-block.js";
 import {
+  disableLegacyAutoUpdateArgs,
+  forkRelaySetupArgs,
   LAUNCHD_LABEL,
+  legacyAutoUpdatePlist,
   SYSTEMD_UNIT,
   pickSupervisor,
   renderLaunchdPlist,
@@ -44,6 +50,11 @@ import {
   type SupervisorKind,
 } from "./setup/supervisor.js";
 import { parseCompetitorScan, type Competitor } from "./setup/competitors.js";
+import {
+  buildCloneArgs,
+  decidePatchAfterAcquire,
+  hasBgosHook,
+} from "./setup/source.js";
 import { planStages, type EnvFacts, type Stage } from "./setup/plan.js";
 import { competitorPrompt, formatSuccessLine } from "./setup/messages.js";
 
@@ -188,9 +199,7 @@ function gatherFacts(opts: SetupOptions): EnvFacts {
     platform: plat,
     installDirExists: existsSync(opts.installDir),
     installDirIsGitRepo: existsSync(join(opts.installDir, ".git")),
-    hookPresent: existsSync(
-      join(opts.installDir, "src", "adapters", "bgos", "loader.ts"),
-    ),
+    hookPresent: hasBgosHook(opts.installDir),
     vendorInstalled: existsSync(
       join(opts.installDir, "node_modules", "gobot-channel-bgos"),
     ),
@@ -216,12 +225,13 @@ function stageAcquireSource(opts: SetupOptions, facts: EnvFacts): void {
       return;
     }
     if (!facts.installDirExists) {
-      log(`   [dry-run] git clone ${opts.upstreamRepo} ${opts.installDir}`);
+      log(`   [dry-run] git ${buildCloneArgs(opts.upstreamRepo, opts.installDir).join(" ")}`);
     }
-    log(`   [dry-run] download ${opts.patchUrl} -> ${patchTmp}`);
-    log(`   [dry-run] git -C ${opts.installDir} am --3way ${patchTmp}`);
+    log(`   [dry-run] re-check the acquired checkout for the BGOS hook`);
+    log(`   [dry-run] only if missing: download ${opts.patchUrl} -> ${patchTmp}`);
+    log(`   [dry-run] only if missing: git -C ${opts.installDir} am --3way ${patchTmp}`);
     log(
-      `   [dry-run] on am failure: git am --abort; checkout recorded base; git am`,
+      `   [dry-run] only if missing, on am failure: git am --abort; checkout recorded base; git am`,
     );
     return;
   }
@@ -233,7 +243,8 @@ function stageAcquireSource(opts: SetupOptions, facts: EnvFacts): void {
 
   if (!facts.installDirExists) {
     mkdirSync(dirname(opts.installDir), { recursive: true });
-    const c = run("git", ["clone", opts.upstreamRepo, opts.installDir]);
+    const cloneArgs = buildCloneArgs(opts.upstreamRepo, opts.installDir);
+    const c = run("git", cloneArgs);
     if (!c.ok) {
       throw new Error(
         `git clone of ${opts.upstreamRepo} failed. Gobot is a private repo, so ` +
@@ -242,6 +253,11 @@ function stageAcquireSource(opts: SetupOptions, facts: EnvFacts): void {
           `pointing at it; setup applies the BGOS hook in place without cloning.`,
       );
     }
+  }
+
+  if (decidePatchAfterAcquire(opts.installDir) === "skip") {
+    log("   acquired checkout already contains the BGOS hook, preserving its history");
+    return;
   }
 
   // Download the public hook patch.
@@ -349,15 +365,44 @@ function stageSupervisor(
 ): void {
   const bun = resolveBunPath();
   const gobotHome = resolveGobotHome();
+  const oldUpdaterPlist = legacyAutoUpdatePlist(homedir());
 
-  // Full private fork path: reuse its launchd configurator when present.
-  if (kind === "launchd" && facts.hasSetupLaunchdScript) {
+  const disableOldUpdater = (): void => {
     if (opts.dryRun) {
-      log(`   [dry-run] (cd ${opts.installDir} && bun run setup:launchd)`);
+      log(
+        `   [dry-run] launchctl unload -w ${oldUpdaterPlist} ` +
+          `(if present)`,
+      );
       return;
     }
-    if (!run(bun, ["run", "setup:launchd"], opts.installDir).ok)
+    if (!existsSync(oldUpdaterPlist)) return;
+    const unloaded = run(
+      "launchctl",
+      disableLegacyAutoUpdateArgs(oldUpdaterPlist),
+      undefined,
+      true,
+    );
+    if (unloaded.ok) {
+      log(`   disabled legacy launchd updater com.go.auto-update`);
+    } else {
+      warn(`could not disable legacy launchd updater com.go.auto-update`);
+    }
+  };
+
+  // Full private fork path: reuse its launchd configurator when present.
+  if (
+    kind === "launchd" &&
+    (facts.hasSetupLaunchdScript || hasScript(opts.installDir, "setup:launchd"))
+  ) {
+    const setupArgs = forkRelaySetupArgs();
+    if (opts.dryRun) {
+      log(`   [dry-run] (cd ${opts.installDir} && bun ${setupArgs.join(" ")})`);
+      disableOldUpdater();
+      return;
+    }
+    if (!run(bun, setupArgs, opts.installDir).ok)
       throw new Error("bun run setup:launchd failed");
+    disableOldUpdater();
     return;
   }
 
@@ -379,6 +424,7 @@ function stageSupervisor(
       for (const line of plist.trimEnd().split("\n")) log(`     ${line}`);
       log(`   [dry-run] launchctl unload ${plistPath} (ignore errors)`);
       log(`   [dry-run] launchctl load ${plistPath}`);
+      disableOldUpdater();
       return;
     }
     mkdirSync(join(gobotHome, "logs"), { recursive: true });
@@ -387,6 +433,7 @@ function stageSupervisor(
     run("launchctl", ["unload", plistPath], undefined, true);
     if (!run("launchctl", ["load", plistPath]).ok)
       throw new Error("launchctl load failed");
+    disableOldUpdater();
     log(`   loaded launchd agent ${LAUNCHD_LABEL}`);
     return;
   }
