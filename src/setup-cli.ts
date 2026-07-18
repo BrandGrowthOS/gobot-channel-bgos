@@ -4,9 +4,9 @@
  *
  * Collapses the 13-step Gobot integration playbook into one command: detect
  * the host, scan for a competing Telegram poller (the only interactive y/n),
- * acquire the fork source (clone upstream + apply the public BGOS hook patch,
- * or reuse an existing clone), install deps + the vendor package, pair against
- * BGOS, write the managed env block, wire a supervisor, and verify.
+ * acquire the private fork or patch a custom clone when its hook is missing,
+ * install deps plus the vendor package, pair against BGOS, write the managed
+ * env block, wire the stable wrapper supervisor, and verify.
  *
  * Idempotent: a re-run skips stages already satisfied (hook applied, valid
  * secrets, supervisor loaded). `--dry-run` prints the exact per-stage commands
@@ -18,25 +18,41 @@
 import { spawnSync } from "node:child_process";
 import {
   chmodSync,
+  copyFileSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  renameSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { homedir, hostname, platform, tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { createInterface } from "node:readline";
+import { fileURLToPath } from "node:url";
 
 import { BgosApi } from "./bgos-api.js";
 import { pairBgos } from "./pair-cli.js";
 import { getPackageVersion } from "./version.js";
 import type { AgentCatalogEntry } from "./types.js";
-import { parseSetupArgs, type SetupOptions } from "./setup/args.js";
+import {
+  parseSetupArgs,
+  type SetupOptions,
+} from "./setup/args.js";
 import { invokedAsCliEntry } from "./setup/entry.js";
 import { composeEnvBlock, mergeEnvFile } from "./setup/env-block.js";
 import {
+  disableLegacyLaunchdArgs,
+  disableLegacyAutoUpdateArgs,
   LAUNCHD_LABEL,
+  LEGACY_AUTO_UPDATE_LABEL,
+  LEGACY_RELAY_LABEL,
+  legacyAutoUpdatePlist,
+  legacyRelayPlist,
+  removeLegacyLaunchdArgs,
+  stableSupervisorAssetCopies,
+  stableSupervisorPaths,
   SYSTEMD_UNIT,
   pickSupervisor,
   renderLaunchdPlist,
@@ -44,6 +60,11 @@ import {
   type SupervisorKind,
 } from "./setup/supervisor.js";
 import { parseCompetitorScan, type Competitor } from "./setup/competitors.js";
+import {
+  buildCloneArgs,
+  decidePatchAfterAcquire,
+  hasBgosHook,
+} from "./setup/source.js";
 import { planStages, type EnvFacts, type Stage } from "./setup/plan.js";
 import { competitorPrompt, formatSuccessLine } from "./setup/messages.js";
 
@@ -188,9 +209,7 @@ function gatherFacts(opts: SetupOptions): EnvFacts {
     platform: plat,
     installDirExists: existsSync(opts.installDir),
     installDirIsGitRepo: existsSync(join(opts.installDir, ".git")),
-    hookPresent: existsSync(
-      join(opts.installDir, "src", "adapters", "bgos", "loader.ts"),
-    ),
+    hookPresent: hasBgosHook(opts.installDir),
     vendorInstalled: existsSync(
       join(opts.installDir, "node_modules", "gobot-channel-bgos"),
     ),
@@ -216,12 +235,13 @@ function stageAcquireSource(opts: SetupOptions, facts: EnvFacts): void {
       return;
     }
     if (!facts.installDirExists) {
-      log(`   [dry-run] git clone ${opts.upstreamRepo} ${opts.installDir}`);
+      log(`   [dry-run] git ${buildCloneArgs(opts.upstreamRepo, opts.installDir).join(" ")}`);
     }
-    log(`   [dry-run] download ${opts.patchUrl} -> ${patchTmp}`);
-    log(`   [dry-run] git -C ${opts.installDir} am --3way ${patchTmp}`);
+    log(`   [dry-run] re-check the acquired checkout for the BGOS hook`);
+    log(`   [dry-run] only if missing: download ${opts.patchUrl} -> ${patchTmp}`);
+    log(`   [dry-run] only if missing: git -C ${opts.installDir} am --3way ${patchTmp}`);
     log(
-      `   [dry-run] on am failure: git am --abort; checkout recorded base; git am`,
+      `   [dry-run] only if missing, on am failure: git am --abort; checkout recorded base; git am`,
     );
     return;
   }
@@ -233,7 +253,8 @@ function stageAcquireSource(opts: SetupOptions, facts: EnvFacts): void {
 
   if (!facts.installDirExists) {
     mkdirSync(dirname(opts.installDir), { recursive: true });
-    const c = run("git", ["clone", opts.upstreamRepo, opts.installDir]);
+    const cloneArgs = buildCloneArgs(opts.upstreamRepo, opts.installDir);
+    const c = run("git", cloneArgs);
     if (!c.ok) {
       throw new Error(
         `git clone of ${opts.upstreamRepo} failed. Gobot is a private repo, so ` +
@@ -242,6 +263,11 @@ function stageAcquireSource(opts: SetupOptions, facts: EnvFacts): void {
           `pointing at it; setup applies the BGOS hook in place without cloning.`,
       );
     }
+  }
+
+  if (decidePatchAfterAcquire(opts.installDir) === "skip") {
+    log("   acquired checkout already contains the BGOS hook, preserving its history");
+    return;
   }
 
   // Download the public hook patch.
@@ -344,24 +370,88 @@ function stageWriteEnv(opts: SetupOptions): void {
 
 function stageSupervisor(
   opts: SetupOptions,
-  facts: EnvFacts,
+  _facts: EnvFacts,
   kind: SupervisorKind,
 ): void {
   const bun = resolveBunPath();
   const gobotHome = resolveGobotHome();
+  const stablePaths = stableSupervisorPaths(gobotHome);
+  const oldRelayPlist = legacyRelayPlist(homedir());
+  const oldUpdaterPlist = legacyAutoUpdatePlist(homedir());
 
-  // Full private fork path: reuse its launchd configurator when present.
-  if (kind === "launchd" && facts.hasSetupLaunchdScript) {
+  const runtimeDirectory = dirname(fileURLToPath(import.meta.url));
+  const atomicCopy = (source: string, destination: string): void => {
+    const temporary = join(
+      dirname(destination),
+      `.${basename(destination)}.tmp-${process.pid}`,
+    );
+    try {
+      copyFileSync(source, temporary);
+      renameSync(temporary, destination);
+    } finally {
+      if (existsSync(temporary)) unlinkSync(temporary);
+    }
+  };
+  const installStableAssets = (): void => {
+    const siblingAssets = stableSupervisorAssetCopies(
+      runtimeDirectory,
+      gobotHome,
+    );
+    const packageDistDirectory = siblingAssets.every((asset) =>
+      existsSync(asset.source),
+    )
+      ? runtimeDirectory
+      : join(runtimeDirectory, "..", "dist");
+    const copies = stableSupervisorAssetCopies(
+      packageDistDirectory,
+      gobotHome,
+    );
     if (opts.dryRun) {
-      log(`   [dry-run] (cd ${opts.installDir} && bun run setup:launchd)`);
+      log(`   [dry-run] mkdir -p ${stablePaths.directory}`);
+      for (const asset of copies) {
+        log(
+          `   [dry-run] atomically copy ${asset.source} -> ${asset.destination}`,
+        );
+      }
       return;
     }
-    if (!run(bun, ["run", "setup:launchd"], opts.installDir).ok)
-      throw new Error("bun run setup:launchd failed");
-    return;
-  }
+    mkdirSync(stablePaths.directory, { recursive: true });
+    for (const asset of copies) {
+      atomicCopy(asset.source, asset.destination);
+    }
+  };
+
+  if (kind === "launchd" || kind === "systemd") installStableAssets();
 
   if (kind === "launchd") {
+    const disableLegacy = (
+      label: string,
+      plistPath: string,
+      args: string[],
+    ): void => {
+      if (opts.dryRun) {
+        log(`   [dry-run] launchctl ${args.join(" ")} (ignore errors)`);
+        log(
+          `   [dry-run] launchctl ${removeLegacyLaunchdArgs(label).join(" ")} ` +
+            `(ignore errors)`,
+        );
+        return;
+      }
+      const unloaded = run("launchctl", args, undefined, true);
+      const removed = run(
+        "launchctl",
+        removeLegacyLaunchdArgs(label),
+        undefined,
+        true,
+      );
+      if (unloaded.ok) {
+        log(`   disabled legacy launchd agent ${label}`);
+      } else if (removed.ok) {
+        log(`   stopped legacy launchd agent ${label}`);
+      } else if (existsSync(plistPath)) {
+        warn(`could not disable legacy launchd agent ${label}`);
+      }
+    };
     const plist = renderLaunchdPlist({
       bunPath: bun,
       installDir: opts.installDir,
@@ -377,14 +467,34 @@ function stageSupervisor(
       log(`   [dry-run] mkdir -p ${join(gobotHome, "logs")}`);
       log(`   [dry-run] write launchd plist -> ${plistPath}`);
       for (const line of plist.trimEnd().split("\n")) log(`     ${line}`);
+      disableLegacy(
+        LEGACY_RELAY_LABEL,
+        oldRelayPlist,
+        disableLegacyLaunchdArgs(oldRelayPlist),
+      );
+      disableLegacy(
+        LEGACY_AUTO_UPDATE_LABEL,
+        oldUpdaterPlist,
+        disableLegacyAutoUpdateArgs(oldUpdaterPlist),
+      );
       log(`   [dry-run] launchctl unload ${plistPath} (ignore errors)`);
       log(`   [dry-run] launchctl load ${plistPath}`);
       return;
     }
     mkdirSync(join(gobotHome, "logs"), { recursive: true });
     mkdirSync(dirname(plistPath), { recursive: true });
-    writeFileSync(plistPath, plist);
+    disableLegacy(
+      LEGACY_RELAY_LABEL,
+      oldRelayPlist,
+      disableLegacyLaunchdArgs(oldRelayPlist),
+    );
+    disableLegacy(
+      LEGACY_AUTO_UPDATE_LABEL,
+      oldUpdaterPlist,
+      disableLegacyAutoUpdateArgs(oldUpdaterPlist),
+    );
     run("launchctl", ["unload", plistPath], undefined, true);
+    writeFileSync(plistPath, plist);
     if (!run("launchctl", ["load", plistPath]).ok)
       throw new Error("launchctl load failed");
     log(`   loaded launchd agent ${LAUNCHD_LABEL}`);
@@ -408,14 +518,17 @@ function stageSupervisor(
       log(`   [dry-run] write systemd unit -> ${unitPath}`);
       for (const line of unit.trimEnd().split("\n")) log(`     ${line}`);
       log(`   [dry-run] systemctl --user daemon-reload`);
-      log(`   [dry-run] systemctl --user enable --now ${SYSTEMD_UNIT}`);
+      log(`   [dry-run] systemctl --user enable ${SYSTEMD_UNIT}`);
+      log(`   [dry-run] systemctl --user restart ${SYSTEMD_UNIT}`);
       return;
     }
     mkdirSync(dirname(unitPath), { recursive: true });
     writeFileSync(unitPath, unit);
     run("systemctl", ["--user", "daemon-reload"]);
-    if (!run("systemctl", ["--user", "enable", "--now", SYSTEMD_UNIT]).ok)
+    if (!run("systemctl", ["--user", "enable", SYSTEMD_UNIT]).ok)
       throw new Error("systemctl enable failed");
+    if (!run("systemctl", ["--user", "restart", SYSTEMD_UNIT]).ok)
+      throw new Error("systemctl restart failed");
     log(`   enabled systemd user unit ${SYSTEMD_UNIT}`);
     return;
   }

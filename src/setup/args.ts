@@ -31,7 +31,9 @@ export const DEFAULT_BASE_URL = "https://api.brandgrowthos.ai";
 export const DEFAULT_PATCH_URL =
   "https://raw.githubusercontent.com/BrandGrowthOS/gobot-bgos-patch/main/" +
   "patches/0001-bgos-channel-hook.patch";
-export const DEFAULT_UPSTREAM_REPO = "https://github.com/autonomee/gobot.git";
+export const DEFAULT_UPSTREAM_REPO =
+  "https://github.com/BrandGrowthOS/gobot-bgos-fork.git";
+export const DEFAULT_UPSTREAM_BRANCH = "bgos-integration";
 
 const HOME_CHANNELS: readonly HomeChannel[] = ["both", "telegram", "bgos"];
 

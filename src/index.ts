@@ -1,5 +1,5 @@
 /**
- * gobot-channel-bgos — public exports.
+ * gobot-channel-bgos public exports.
  *
  * The fork (`BrandGrowthOS/gobot-bgos-fork`) loads this package via
  * `optionalDependencies`. If the package is installed, the fork:
@@ -10,18 +10,63 @@
  *   4. Starts: `await adapter.start()`
  *   5. On shutdown: `await adapter.stop()`
  *
- * Public surface kept narrow — the fork only needs adapter lifecycle +
+ * Public surface kept narrow because the fork only needs adapter lifecycle +
  * outbound primitives + the agent-hints + default-commands constants.
  */
 export {
   BGOSAdapter,
+  requestGracefulHostRestart,
   type BgosConfig,
   type ButtonClickInfo,
   type FatalInfo,
+  type HostRestartSignalTarget,
 } from "./adapter.js";
 export { getPackageVersion } from "./version.js";
 export {
+  AutoUpdateController,
+  autoUpdateStatePath,
+  checkGitUpdate,
+  compareVersions,
+  decideDrainBeforeUpdate,
+  decideVersionUpdate,
+  formatGitUpdateDecision,
+  parseAutoUpdateFlag,
+  readInstalledPluginVersion,
+  readLatestRegistryVersion,
+  readAutoUpdateState,
+  transitionRollbackState,
+  updateJitterMs,
+  writeAutoUpdateState,
+  ACTIVE_WORK_RETRY_MS,
+  COMMAND_TIMEOUT_MS,
+  HEALTHY_BOOT_MS,
+  MAX_UPDATE_JITTER_MS,
+  UPDATE_INTERVAL_MS,
+  PLUGIN_PACKAGE_NAME,
+  PLUGIN_REGISTRY_URL,
+  REGISTRY_TIMEOUT_MS,
+  WRAPPED_BOOT_COMMIT_ENV,
+  type AutoUpdateControllerDeps,
+  type AutoUpdateFlag,
+  type AutoUpdateStartResult,
+  type AutoUpdateState,
+  type CommandResult,
+  type CommandRunner,
+  type DrainDecision,
+  type GitCheckDecision,
+  type GitUpdateCheck,
+  type GitUpdateOptions,
+  type RegistryVersionReader,
+  MalformedAutoUpdateStateError,
+  type PendingUpdateState,
+  type RollbackAction,
+  type RollbackEvent,
+  type VersionDecision,
+} from "./self-update.js";
+export { resolveGobotStateHome } from "./state-home.js";
+export {
   HeartbeatController,
+  heartbeatStatePath,
   type HeartbeatDto,
   type HeartbeatFileState,
   type HeartbeatLastError,

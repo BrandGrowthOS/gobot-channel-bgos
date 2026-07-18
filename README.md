@@ -12,7 +12,7 @@ On the host where you want Gobot to run, paste the command the BGOS app shows on
 bunx gobot-channel-bgos setup BGOS-XXXX-XX
 ```
 
-That one command runs the whole integration: it detects the host, scans for a competing Telegram poller (the only y/n it may ask), clones upstream Gobot and applies the public BGOS channel hook ([`BrandGrowthOS/gobot-bgos-patch`](https://github.com/BrandGrowthOS/gobot-bgos-patch)) when there is no existing install, installs this package, pairs against your BGOS account, writes the managed env block, wires a supervisor (launchd on macOS, systemd on Linux), and verifies the connection. It is idempotent: a re-run skips whatever is already done.
+That one command runs the whole integration: it detects the host, scans for a competing Telegram poller (the only y/n it may ask), clones the private `BrandGrowthOS/gobot-bgos-fork` checkout from its tracked `bgos-integration` branch with the BGOS hook already in history, installs this package, pairs against your BGOS account, writes the managed env block, installs a package-owned wrapper supervisor (launchd on macOS, systemd on Linux), and verifies the connection. It is idempotent: a re-run skips whatever is already done. A custom `--upstream-repo` remains supported; setup applies the public [`BrandGrowthOS/gobot-bgos-patch`](https://github.com/BrandGrowthOS/gobot-bgos-patch) only when the acquired checkout does not contain the hook.
 
 Preview everything it would do without changing anything:
 
@@ -62,6 +62,7 @@ The adapter resolves config in order: explicit constructor arg → env var → `
 | `BGOS_VOICE_VOICE` | `marin` | Realtime voice name. |
 | `BGOS_VOICE_PERSONA` | _(empty)_ | Extra persona text baked into the voice session instructions. |
 | `GOBOT_BGOS_HEARTBEAT_INTERVAL` | `60` (seconds) | Cadence for the daemon heartbeat that reports `daemon_version` + last error to the backend (surfaced in the BGOS Integrations card). `0` disables the network heartbeat; a local `$GOBOT_HOME/bgos_heartbeat.json` is always written for the watchdog. |
+| `BGOS_AUTO_UPDATE` | `off` | Exact value `on` opts the supervised Gobot checkout into same-major automatic updates. Exact value `off` is the hard kill switch. |
 | `GOBOT_BGOS_BACKFILL_STORM_LIMIT` | `25` | If a single REST backfill returns more than this many messages, the cursor fast-forwards and dispatch is skipped (prevents a history-replay storm after a long outage). `0` disables the guard. |
 | `GOBOT_BGOS_CHAT_ID` / `GOBOT_BGOS_CHAT_ID_<assistantId>` | _(auto)_ | **Rarely needed.** Proactive messages (check-ins, briefings) self-resolve their delivery chat via the backend, so you do not normally set this. Set it only to pin a specific chat. |
 
@@ -87,6 +88,26 @@ The running daemon watches the secrets directory and re-authenticates the moment
 ## Reliability
 
 Inbound is deduplicated (a message is dispatched exactly once across the live WS push and the REST backfill), the cursor is durable, revocation surfaces as a visible error plus a recover-on-new-token state, and outbound sends retry the network-error class with a bounded on-disk spool. A `daemon_version` heartbeat keeps the Integrations card honest about what the host is running.
+
+## Opt-in checkout updates
+
+The recommended one-paste setup clones or reuses the private Gobot fork and installs this npm package into that checkout. It copies a small wrapper runtime to `$GOBOT_HOME/supervisor`, outside the checkout that updates, and points launchd or systemd at that stable wrapper. The wrapper records boot state before it starts `bun run src/bot.ts`. A fresh clone keeps `HEAD` aligned with its tracked upstream so fast-forward updates remain possible. Automatic update first proves that the working directory, or `GOBOT_INSTALL_DIR` when set, is a git checkout whose package name is `gobot`. Other install layouts are logged and skipped.
+
+Set `BGOS_AUTO_UPDATE=on` to opt in. The default and every unrecognized value are off. An exact `BGOS_AUTO_UPDATE=off` prevents every update check, timer, and git command. A boot with `off` may write only the durable reset marker needed after an automatic rollback.
+
+The private fork also contains an older host updater controlled by `GOBOT_AUTO_UPDATE_FORK`. That is a separate legacy lane and is not used by this adapter. Recommended setup persistently unloads both `com.go.telegram-relay` and `com.go.auto-update`, then loads the package-owned `ai.brandgrowthos.gobot` wrapper. This prevents duplicate Telegram pollers and keeps the legacy lane from changing the checkout when `BGOS_AUTO_UPDATE=off`. Existing private-fork hosts must rerun setup before relying on the new flag.
+
+An opted-in daemon checks at boot, then every 24 hours plus a fresh random delay from zero through six hours. A scheduled check waits while message or spool replay work is active. Commands have a finite timeout and git prompts are disabled. The updater reads the exact latest `gobot-channel-bgos` version from official npm registry metadata and compares it with the running `daemonVersion`. The daemon package update path rejects malformed, cross-major, and constraint-incompatible candidates. A compatible fork-only fast-forward remains eligible when the registry daemon is already current. The registry version is data only and is passed to commands through fixed argument arrays after validation.
+
+The checkout apply step is `git merge --ff-only <validated-target-sha>`. It never resets, forces, or rewrites local history. A merge that cannot fast-forward is logged and skipped. A fork-only update requires the running daemon to satisfy the dependency constraint in the fetched fork manifest. A changed `package.json` or supported tracked lockfile triggers a normal dependency install. The private fork intentionally ignores `bun.lock`, so the updater always follows with `bun install gobot-channel-bgos@<validated-exact-version> --no-save` and verifies the installed `node_modules` package version. This exact refresh also delivers a newer compatible daemon when the fork commit itself has not changed. Tracked dependency files are snapshotted and atomically restored around Bun commands so the updater does not dirty the checkout.
+
+Before changing the checkout, the adapter stops accepting new BGOS work, disconnects its intake, and waits for active message processing, accepted voice dispatches, and outbound spool replay to finish. After a successful update it requests SIGTERM on the Gobot process. The fork's real shutdown handler stops Telegram, saves host state, removes `bot.lock`, stops the adapter, and exits with status 0 so launchd or systemd restarts it. Update check failures before mutation are logged and the daemon continues. A failure after mutation keeps intake stopped and requests supervised recovery.
+
+Rollback state is stored at `$GOBOT_HOME/bgos_auto_update.json`, next to the heartbeat state. Tilde-valued `GOBOT_HOME` uses the same expansion for both files. The state records the previous checkout commit and exact previous daemon package version. The stable parent wrapper starts the 60-second health window before any host import. The child adapter owns the remaining health timer, while the parent owns clean supervisor signals. A child-originated exit is unclean even when its exit status is 0, and a clean supervisor shutdown resets the crash streak. After two consecutive short boots, the next wrapper launch restores the recorded commit and exact package version, then disables further automatic updates. A failed state read, state write, rollback, or verified target recovery prevents the wrapper from starting Gobot and retries under the supervisor. Malformed state also fails closed. In either case, run one supervised boot with `BGOS_AUTO_UPDATE=off`, then set it back to `on` and restart again to reset the latch or malformed state.
+
+Legacy installs that applied the public hook as a local commit can be divergent from their tracked upstream. The updater reports `not-fast-forward` and leaves them unchanged. Move custom work onto the private fork or reconcile that history manually before opting in. The updater never resets or forces a legacy checkout.
+
+The pre-import guarantee applies to the package-owned wrapper installed by recommended setup. A manual `bun run src/bot.ts` launch does not have the parent wrapper, so rerun setup after upgrading an existing host.
 
 ## Prerequisites
 
@@ -183,6 +204,7 @@ cd gobot-channel-bgos
 npm install
 npm test          # vitest
 npm run build     # tsc + finalize-daemon
+GOBOT_INSTALL_DIR=/path/to/gobot npm run self-update:dry-run  # fetch and inspect without applying
 ```
 
 The package is also mirrored inside the BGOS monorepo at `gobot-channel-bgos/`; the public repo is the source of truth (matching the Hermes pattern).

@@ -29,11 +29,10 @@
  *             registered dispatch function, with a capture ReplyHandle
  *             that resolves on the brain's first sendText instead of
  *             posting to the chat. 38 s inner cap < the backend's 45 s.
- *   dispatch → accept-first (the backend only waits 10 s for the accept),
- *             then run the same brain turn DETACHED (10 min cap) and POST
- *             the outcome to /integrations/voice-tasks/:taskId/result
- *             (resilient: retry once, then give up loudly — the backend's
- *             stale-running reaper closes the row).
+ *   dispatch accepts first because the backend waits only 10 s for that
+ *             response. The same brain turn can then run for up to 10 min.
+ *             This handler stays pending so update drain tracks the work,
+ *             while the outcome is posted on the voice task result route.
  *
  * Deadline discipline (ported from openclaw-channel-bgos/voice-rpc-handler):
  * the daemon's inner cap must stay UNDER the backend's, because the backend
@@ -295,8 +294,8 @@ export interface VoiceRpcTiming {
   mintTimeoutMs: number;
   /** Whole-consult wall clock (brain turn incl. dispatch). < backend 45 s. */
   consultTimeoutMs: number;
-  /** Wall-clock cap for a detached dispatch run. Generous by design — the
-   *  whole point is that the call is NOT waiting on it. */
+  /** Wall-clock cap for an accepted dispatch run. The voice call does not
+   *  wait for the work, but the adapter tracks it for safe update drain. */
   dispatchTimeoutMs: number;
   /** Grace for a reply text that lands just after the brain turn's promise
    *  resolves (some forks send the final text right at turn end). */
@@ -618,7 +617,7 @@ export class VoiceRpcHandler {
   /** Duplicate-frame guard: the backend re-emits once when its ACK doesn't
    *  land within 1.5 s; a consult dispatched twice would run two turns. */
   private readonly inFlight = new Set<string>();
-  /** Dedupe detached dispatch runs by taskId (a re-emitted frame carries a
+  /** Dedupe accepted dispatch runs by taskId (a re-emitted frame carries a
    *  new rpcId only on backend restart; the taskId is the durable key). */
   private readonly dispatchInFlight = new Set<string>();
   /** One live consult per assistant — a second one gets a descriptive
@@ -690,7 +689,9 @@ export class VoiceRpcHandler {
           ok: true,
           payload: { accepted: true, taskId: String(taskId) },
         });
-        void this.runDispatch(frame, String(taskId));
+        // The accept response is already durable. Keep this handler pending
+        // for the real run so the adapter update drain can track it.
+        await this.runDispatch(frame, String(taskId));
         return;
       } else {
         // Whitelisted-but-unserved shapes get a LOUD error, never silence
@@ -912,7 +913,7 @@ export class VoiceRpcHandler {
     }
   }
 
-  // ── dispatch (detached) ──────────────────────────────────────────────
+  // Dispatch after the accept response.
 
   private async runDispatch(
     frame: VoiceRpcFrame,
