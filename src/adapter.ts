@@ -187,6 +187,7 @@ export class BGOSAdapter {
       postHeartbeat: (body) => this.api.postHeartbeat(body),
     });
     this.autoUpdate = new AutoUpdateController({
+      runningDaemonVersion: getPackageVersion(),
       drain: () => this.drainForUpdate(),
       resume: () => this.resumeAfterUpdateFailure(),
       shutdown: () => this.stop(),

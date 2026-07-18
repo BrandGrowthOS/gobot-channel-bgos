@@ -1,6 +1,6 @@
 // Post-build: ensure the bin entries are executable.
 //
-// This package ships two bins:
+// This package ships three bins and one executable supervisor wrapper:
 //   - `gobot-pair-bgos`              → `dist/pair-cli.js`
 //   - `gobot-bgos-reseed-commands`   → `dist/reseed-cli.js`
 // Node strips the shebang on TS compile, so we re-add it here and chmod
@@ -12,6 +12,12 @@ const BIN_FILES = [
   "dist/setup-cli.js",
   "dist/pair-cli.js",
   "dist/reseed-cli.js",
+  "dist/daemon-wrapper.js",
+];
+
+const SUPERVISOR_DEPENDENCIES = [
+  "dist/self-update.js",
+  "dist/update-version-policy.js",
 ];
 
 let exitCode = 0;
@@ -31,6 +37,15 @@ for (const rel of BIN_FILES) {
     chmodSync(target, 0o755);
   } catch {
     // chmod may not apply on Windows; best-effort.
+  }
+  console.log(`[finalize-daemon] ${rel} is ready`);
+}
+for (const rel of SUPERVISOR_DEPENDENCIES) {
+  const target = resolve(rel);
+  if (!existsSync(target)) {
+    console.error(`[finalize-daemon] ${target} does not exist`);
+    exitCode = 1;
+    continue;
   }
   console.log(`[finalize-daemon] ${rel} is ready`);
 }

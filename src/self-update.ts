@@ -1,20 +1,32 @@
 import { spawnSync } from "node:child_process";
 import {
-  existsSync,
   mkdirSync,
   readFileSync,
   realpathSync,
   renameSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+
+import {
+  candidateSatisfiesForkPluginConstraint,
+  parseExactStableNpmVersion,
+  parseForkPluginConstraint,
+} from "./update-version-policy.js";
 
 export const UPDATE_INTERVAL_MS = 24 * 60 * 60 * 1000;
 export const MAX_UPDATE_JITTER_MS = 6 * 60 * 60 * 1000;
 export const HEALTHY_BOOT_MS = 60_000;
 export const ACTIVE_WORK_RETRY_MS = 60_000;
 export const COMMAND_TIMEOUT_MS = 5 * 60 * 1000;
+export const REGISTRY_TIMEOUT_MS = 10_000;
+export const PLUGIN_PACKAGE_NAME = "gobot-channel-bgos";
+export const PLUGIN_REGISTRY_URL =
+  `https://registry.npmjs.org/${PLUGIN_PACKAGE_NAME}/latest`;
+export const WRAPPED_BOOT_COMMIT_ENV =
+  "BGOS_INTERNAL_WRAPPED_BOOT_COMMIT";
 
 const LOCKFILES = [
   "bun.lock",
@@ -23,6 +35,7 @@ const LOCKFILES = [
   "pnpm-lock.yaml",
   "yarn.lock",
 ] as const;
+const DEPENDENCY_FILES = ["package.json", ...LOCKFILES] as const;
 
 export type AutoUpdateFlag = "on" | "off" | "invalid";
 
@@ -123,12 +136,12 @@ export function decideDrainBeforeUpdate(input: {
 
 export interface PendingUpdateState {
   previousCommit: string;
-  previousVersion: string;
+  previousPluginVersion: string;
   targetCommit: string;
-  targetVersion: string;
+  targetPluginVersion: string;
   crashCount: number;
   bootStartedAtMs: number | null;
-  lockfileChanged: boolean;
+  dependencyFilesChanged: boolean;
   rollbackRequired: boolean;
 }
 
@@ -154,10 +167,10 @@ export type RollbackEvent =
   | {
       type: "update-staged";
       previousCommit: string;
-      previousVersion: string;
+      previousPluginVersion: string;
       targetCommit: string;
-      targetVersion: string;
-      lockfileChanged: boolean;
+      targetPluginVersion: string;
+      dependencyFilesChanged: boolean;
       upstreamRef: string;
     }
   | { type: "update-cancelled" }
@@ -194,12 +207,12 @@ export function transitionRollbackState(
   if (event.type === "update-staged") {
     current.pending = {
       previousCommit: event.previousCommit,
-      previousVersion: event.previousVersion,
+      previousPluginVersion: event.previousPluginVersion,
       targetCommit: event.targetCommit,
-      targetVersion: event.targetVersion,
+      targetPluginVersion: event.targetPluginVersion,
       crashCount: 0,
       bootStartedAtMs: null,
-      lockfileChanged: event.lockfileChanged,
+      dependencyFilesChanged: event.dependencyFilesChanged,
       rollbackRequired: false,
     };
     current.upstreamRef = event.upstreamRef;
@@ -264,16 +277,18 @@ function isPendingState(value: unknown): value is PendingUpdateState {
   return (
     typeof pending.previousCommit === "string" &&
     /^[0-9a-f]{40,64}$/i.test(pending.previousCommit) &&
-    typeof pending.previousVersion === "string" &&
+    typeof pending.previousPluginVersion === "string" &&
+    parseExactStableNpmVersion(pending.previousPluginVersion) !== null &&
     typeof pending.targetCommit === "string" &&
     /^[0-9a-f]{40,64}$/i.test(pending.targetCommit) &&
-    typeof pending.targetVersion === "string" &&
+    typeof pending.targetPluginVersion === "string" &&
+    parseExactStableNpmVersion(pending.targetPluginVersion) !== null &&
     Number.isInteger(pending.crashCount) &&
     (pending.crashCount ?? -1) >= 0 &&
     (pending.bootStartedAtMs === null ||
       (typeof pending.bootStartedAtMs === "number" &&
         Number.isFinite(pending.bootStartedAtMs))) &&
-    typeof pending.lockfileChanged === "boolean" &&
+    typeof pending.dependencyFilesChanged === "boolean" &&
     typeof pending.rollbackRequired === "boolean"
   );
 }
@@ -385,7 +400,6 @@ export const runCommand: CommandRunner = (command, args, cwd) => {
 
 interface CheckoutInfo {
   root: string;
-  version: string;
   commit: string;
 }
 
@@ -393,6 +407,8 @@ export type GitCheckDecision =
   | "update-available"
   | "current"
   | "major-blocked"
+  | "incompatible-plugin"
+  | "unsafe-plugin-constraint"
   | "not-fast-forward"
   | "not-gobot-checkout"
   | "no-upstream"
@@ -403,18 +419,23 @@ export interface GitUpdateCheck {
   decision: GitCheckDecision;
   detail: string;
   checkoutRoot?: string;
-  runningVersion?: string;
-  latestVersion?: string;
+  runningDaemonVersion?: string;
+  candidateDaemonVersion?: string;
   currentCommit?: string;
   targetCommit?: string;
-  lockfileChanged?: boolean;
+  dependencyFilesChanged?: boolean;
+  pluginConstraint?: string;
   upstreamRef?: string;
 }
+
+export type RegistryVersionReader = () => Promise<string>;
 
 export interface GitUpdateOptions {
   checkoutDir?: string;
   expectedPackageName?: string;
   upstreamRef?: string;
+  runningDaemonVersion?: string;
+  registryVersionReader?: RegistryVersionReader;
   runner?: CommandRunner;
 }
 
@@ -455,26 +476,74 @@ function readCheckout(
   try {
     const manifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8")) as {
       name?: string;
-      version?: string;
     };
     if (manifest.name !== (options.expectedPackageName ?? "gobot")) {
       return { detail: `checkout package is ${manifest.name ?? "unknown"}, expected ${options.expectedPackageName ?? "gobot"}` };
-    }
-    if (typeof manifest.version !== "string") {
-      return { detail: "checkout package version is missing" };
     }
     const head = runner("git", ["rev-parse", "HEAD"], root);
     const commit = head.stdout.trim();
     if (head.status !== 0 || !/^[0-9a-f]{40,64}$/i.test(commit)) {
       return { detail: "checkout HEAD could not be resolved" };
     }
-    return { info: { root, version: manifest.version, commit } };
+    return { info: { root, commit } };
   } catch {
     return { detail: "checkout package.json could not be read" };
   }
 }
 
-export function checkGitUpdate(options: GitUpdateOptions = {}): GitUpdateCheck {
+export async function readLatestRegistryVersion(): Promise<string> {
+  const response = await fetch(PLUGIN_REGISTRY_URL, {
+    headers: { accept: "application/json" },
+    signal: AbortSignal.timeout(REGISTRY_TIMEOUT_MS),
+  });
+  if (!response.ok) {
+    throw new Error(`npm registry returned HTTP ${response.status}`);
+  }
+  const body = (await response.json()) as { version?: unknown };
+  if (typeof body.version !== "string") {
+    throw new Error("npm registry response has no version");
+  }
+  return body.version;
+}
+
+function pluginConstraintFromManifest(
+  manifest: Record<string, unknown>,
+): string | null {
+  const dependencyGroups = ["optionalDependencies", "dependencies"] as const;
+  const specs = new Set<string>();
+  for (const groupName of dependencyGroups) {
+    const group = manifest[groupName];
+    if (!group || typeof group !== "object") continue;
+    const spec = (group as Record<string, unknown>)[PLUGIN_PACKAGE_NAME];
+    if (typeof spec === "string") specs.add(spec);
+  }
+  return specs.size === 1 ? [...specs][0] : null;
+}
+
+export function readInstalledPluginVersion(
+  checkoutRoot: string,
+): string | null {
+  try {
+    const manifest = JSON.parse(
+      readFileSync(
+        join(
+          checkoutRoot,
+          "node_modules",
+          PLUGIN_PACKAGE_NAME,
+          "package.json",
+        ),
+        "utf8",
+      ),
+    ) as { version?: unknown };
+    return typeof manifest.version === "string" ? manifest.version : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function checkGitUpdate(
+  options: GitUpdateOptions = {},
+): Promise<GitUpdateCheck> {
   const runner = options.runner ?? runCommand;
   try {
     const checkout = readCheckout(options);
@@ -484,7 +553,16 @@ export function checkGitUpdate(options: GitUpdateOptions = {}): GitUpdateCheck {
         detail: checkout.detail ?? "install checkout could not be verified",
       };
     }
-    const { root, version, commit } = checkout.info;
+    const { root, commit } = checkout.info;
+    const runningDaemonVersion = options.runningDaemonVersion ?? "";
+    if (!parseExactStableNpmVersion(runningDaemonVersion)) {
+      return {
+        decision: "invalid-version",
+        detail: `running daemon version is not an exact stable version: ${runningDaemonVersion || "missing"}`,
+        checkoutRoot: root,
+        currentCommit: commit,
+      };
+    }
     let upstreamRef = options.upstreamRef ?? "";
     if (!upstreamRef) {
       const upstream = runner(
@@ -499,7 +577,7 @@ export function checkGitUpdate(options: GitUpdateOptions = {}): GitUpdateCheck {
         decision: "no-upstream",
         detail: "checkout has no safe remote tracking ref",
         checkoutRoot: root,
-        runningVersion: version,
+        runningDaemonVersion,
         currentCommit: commit,
       };
     }
@@ -510,7 +588,7 @@ export function checkGitUpdate(options: GitUpdateOptions = {}): GitUpdateCheck {
         decision: "check-failed",
         detail: `git fetch failed: ${commandFailure(fetched)}`,
         checkoutRoot: root,
-        runningVersion: version,
+        runningDaemonVersion,
         currentCommit: commit,
       };
     }
@@ -522,38 +600,26 @@ export function checkGitUpdate(options: GitUpdateOptions = {}): GitUpdateCheck {
         decision: "check-failed",
         detail: "upstream commit could not be resolved",
         checkoutRoot: root,
-        runningVersion: version,
+        runningDaemonVersion,
         currentCommit: commit,
       };
     }
-    if (targetCommit === commit) {
-      return {
-        decision: "current",
-        detail: `version ${version} is current`,
-        checkoutRoot: root,
-        runningVersion: version,
-        latestVersion: version,
-        currentCommit: commit,
-        targetCommit,
-        lockfileChanged: false,
-        upstreamRef,
-      };
-    }
-
-    const ancestor = runner(
-      "git",
-      ["merge-base", "--is-ancestor", "HEAD", targetCommit],
-      root,
-    );
-    if (ancestor.status !== 0) {
-      return {
-        decision: "not-fast-forward",
-        detail: "upstream cannot be applied as a fast-forward",
-        checkoutRoot: root,
-        runningVersion: version,
-        currentCommit: commit,
-        targetCommit,
-      };
+    if (targetCommit !== commit) {
+      const ancestor = runner(
+        "git",
+        ["merge-base", "--is-ancestor", "HEAD", targetCommit],
+        root,
+      );
+      if (ancestor.status !== 0) {
+        return {
+          decision: "not-fast-forward",
+          detail: "upstream cannot be applied as a fast-forward",
+          checkoutRoot: root,
+          runningDaemonVersion,
+          currentCommit: commit,
+          targetCommit,
+        };
+      }
     }
 
     const latestManifest = runner(
@@ -566,28 +632,97 @@ export function checkGitUpdate(options: GitUpdateOptions = {}): GitUpdateCheck {
         decision: "check-failed",
         detail: "upstream package.json could not be read",
         checkoutRoot: root,
-        runningVersion: version,
+        runningDaemonVersion,
         currentCommit: commit,
         targetCommit,
       };
     }
-    let latestVersion: string;
+    let targetManifest: Record<string, unknown>;
     try {
-      const parsed = JSON.parse(latestManifest.stdout) as { version?: string };
-      if (typeof parsed.version !== "string") throw new Error("missing version");
-      latestVersion = parsed.version;
+      targetManifest = JSON.parse(latestManifest.stdout) as Record<
+        string,
+        unknown
+      >;
+      if (
+        targetManifest.name !== (options.expectedPackageName ?? "gobot")
+      ) {
+        throw new Error("unexpected package");
+      }
     } catch {
       return {
-        decision: "invalid-version",
-        detail: "upstream package version is invalid",
+        decision: "check-failed",
+        detail: "upstream package.json is invalid",
         checkoutRoot: root,
-        runningVersion: version,
+        runningDaemonVersion,
         currentCommit: commit,
         targetCommit,
       };
     }
 
-    const versionDecision = decideVersionUpdate(version, latestVersion);
+    const pluginConstraint = pluginConstraintFromManifest(targetManifest);
+    const parsedConstraint = pluginConstraint
+      ? parseForkPluginConstraint(pluginConstraint)
+      : null;
+    if (!pluginConstraint || !parsedConstraint) {
+      return {
+        decision: "unsafe-plugin-constraint",
+        detail: "upstream package.json has no safe exact or caret gobot-channel-bgos constraint",
+        checkoutRoot: root,
+        runningDaemonVersion,
+        currentCommit: commit,
+        targetCommit,
+      };
+    }
+
+    let candidateDaemonVersion: string;
+    try {
+      candidateDaemonVersion = await (
+        options.registryVersionReader ?? readLatestRegistryVersion
+      )();
+    } catch (error) {
+      return {
+        decision: "check-failed",
+        detail: `npm registry lookup failed: ${error instanceof Error ? error.message : String(error)}`,
+        checkoutRoot: root,
+        runningDaemonVersion,
+        currentCommit: commit,
+        targetCommit,
+        pluginConstraint,
+      };
+    }
+    if (!parseExactStableNpmVersion(candidateDaemonVersion)) {
+      return {
+        decision: "invalid-version",
+        detail: `npm registry candidate is not an exact stable version: ${candidateDaemonVersion}`,
+        checkoutRoot: root,
+        runningDaemonVersion,
+        currentCommit: commit,
+        targetCommit,
+        pluginConstraint,
+      };
+    }
+    if (
+      !candidateSatisfiesForkPluginConstraint(
+        candidateDaemonVersion,
+        parsedConstraint,
+      )
+    ) {
+      return {
+        decision: "incompatible-plugin",
+        detail: `registry daemon ${candidateDaemonVersion} is outside fork constraint ${pluginConstraint}`,
+        checkoutRoot: root,
+        runningDaemonVersion,
+        candidateDaemonVersion,
+        currentCommit: commit,
+        targetCommit,
+        pluginConstraint,
+      };
+    }
+
+    const versionDecision = decideVersionUpdate(
+      runningDaemonVersion,
+      candidateDaemonVersion,
+    );
     if (versionDecision !== "update") {
       const decision =
         versionDecision === "major-blocked"
@@ -599,47 +734,66 @@ export function checkGitUpdate(options: GitUpdateOptions = {}): GitUpdateCheck {
         decision,
         detail:
           decision === "major-blocked"
-            ? `version ${latestVersion} changes major from ${version}`
+            ? `registry daemon ${candidateDaemonVersion} changes major from ${runningDaemonVersion}`
             : decision === "invalid-version"
-              ? `could not compare versions ${version} and ${latestVersion}`
-              : `version ${version} is not older than ${latestVersion}`,
+              ? `could not compare daemon versions ${runningDaemonVersion} and ${candidateDaemonVersion}`
+              : `running daemon ${runningDaemonVersion} is not older than registry ${candidateDaemonVersion}`,
         checkoutRoot: root,
-        runningVersion: version,
-        latestVersion,
+        runningDaemonVersion,
+        candidateDaemonVersion,
         currentCommit: commit,
         targetCommit,
+        pluginConstraint,
+        upstreamRef,
       };
     }
 
-    const lockDiff = runner(
-      "git",
-      ["diff", "--name-only", commit, targetCommit, "--", ...LOCKFILES],
-      root,
-    );
-    if (lockDiff.status !== 0) {
-      return {
-        decision: "check-failed",
-        detail: "lockfile comparison failed",
-        checkoutRoot: root,
-        runningVersion: version,
-        latestVersion,
-        currentCommit: commit,
-        targetCommit,
-      };
+    let dependencyFilesChanged = false;
+    if (targetCommit !== commit) {
+      const dependencyDiff = runner(
+        "git",
+        [
+          "diff",
+          "--name-only",
+          commit,
+          targetCommit,
+          "--",
+          ...DEPENDENCY_FILES,
+        ],
+        root,
+      );
+      if (dependencyDiff.status !== 0) {
+        return {
+          decision: "check-failed",
+          detail: "dependency file comparison failed",
+          checkoutRoot: root,
+          runningDaemonVersion,
+          candidateDaemonVersion,
+          currentCommit: commit,
+          targetCommit,
+          pluginConstraint,
+        };
+      }
+      const changedNames = new Set(
+        dependencyDiff.stdout
+          .split(/\r?\n/)
+          .map((line) => line.trim())
+          .filter(Boolean),
+      );
+      dependencyFilesChanged = DEPENDENCY_FILES.some((name) =>
+        changedNames.has(name),
+      );
     }
-    const changedNames = new Set(
-      lockDiff.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean),
-    );
-    const lockfileChanged = LOCKFILES.some((name) => changedNames.has(name));
     return {
       decision: "update-available",
-      detail: `version ${latestVersion} is available within major ${parseVersion(version)?.major}`,
+      detail: `registry daemon ${candidateDaemonVersion} is available for running ${runningDaemonVersion} within fork constraint ${pluginConstraint}`,
       checkoutRoot: root,
-      runningVersion: version,
-      latestVersion,
+      runningDaemonVersion,
+      candidateDaemonVersion,
       currentCommit: commit,
       targetCommit,
-      lockfileChanged,
+      dependencyFilesChanged,
+      pluginConstraint,
       upstreamRef,
     };
   } catch (error) {
@@ -668,9 +822,15 @@ export interface AutoUpdateControllerDeps extends GitUpdateOptions {
   clearTimer?: (timer: NodeJS.Timeout) => void;
   bunPath?: string;
   hasActiveWork?: () => boolean;
+  preImportOnly?: boolean;
+  installedPluginVersionReader?: (checkoutRoot: string) => string | null;
 }
 
-export type AutoUpdateStartResult = "inactive" | "running" | "exit-requested";
+export type AutoUpdateStartResult =
+  | "inactive"
+  | "running"
+  | "retry-required"
+  | "exit-requested";
 
 export class AutoUpdateController {
   private readonly env: Record<string, string | undefined>;
@@ -689,11 +849,16 @@ export class AutoUpdateController {
   ) => NodeJS.Timeout;
   private readonly clearTimer: (timer: NodeJS.Timeout) => void;
   private readonly hasActiveWork: () => boolean;
+  private readonly preImportOnly: boolean;
+  private readonly installedPluginVersionReader: (
+    checkoutRoot: string,
+  ) => string | null;
   private timer: NodeJS.Timeout | null = null;
   private healthyTimer: NodeJS.Timeout | null = null;
   private stopped = false;
   private currentCommit: string | null = null;
   private checking = false;
+  private cleanShutdownOwnedByWrapper = false;
 
   constructor(private readonly deps: AutoUpdateControllerDeps = {}) {
     this.env = deps.env ?? process.env;
@@ -709,6 +874,9 @@ export class AutoUpdateController {
     this.setTimer = deps.setTimer ?? ((callback, delay) => setTimeout(callback, delay));
     this.clearTimer = deps.clearTimer ?? ((timer) => clearTimeout(timer));
     this.hasActiveWork = deps.hasActiveWork ?? (() => false);
+    this.preImportOnly = deps.preImportOnly ?? false;
+    this.installedPluginVersionReader =
+      deps.installedPluginVersionReader ?? readInstalledPluginVersion;
   }
 
   async start(): Promise<AutoUpdateStartResult> {
@@ -752,21 +920,36 @@ export class AutoUpdateController {
         return "inactive";
       }
       this.currentCommit = checkout.info.commit;
-      const boot = transitionRollbackState(state, {
-        type: "boot",
-        nowMs: this.now(),
-        currentCommit: checkout.info.commit,
-      });
+      const wrappedCommit = this.env[WRAPPED_BOOT_COMMIT_ENV];
+      this.cleanShutdownOwnedByWrapper =
+        !this.preImportOnly && wrappedCommit === checkout.info.commit;
+      const boot = this.cleanShutdownOwnedByWrapper
+        ? { state, action: "continue" as const }
+        : transitionRollbackState(state, {
+            type: "boot",
+            nowMs: this.now(),
+            currentCommit: checkout.info.commit,
+          });
       state = boot.state;
-      writeAutoUpdateState(this.statePath, state);
+      if (!this.cleanShutdownOwnedByWrapper) {
+        writeAutoUpdateState(this.statePath, state);
+      }
+      if (this.preImportOnly) {
+        this.env[WRAPPED_BOOT_COMMIT_ENV] = checkout.info.commit;
+      }
 
       if (boot.action === "rollback" && state.pending) {
         return await this.rollback(checkout.info.root, state);
       }
       if (state.pending) {
-        this.armHealthyTimer(checkout.info.commit);
+        if (this.preImportOnly) return "running";
+        this.armHealthyTimer(
+          checkout.info.commit,
+          this.remainingHealthyDelay(state.pending.bootStartedAtMs),
+        );
         return "running";
       }
+      if (this.preImportOnly) return "running";
 
       const result = await this.checkAndApply();
       if (result === "exit-requested") return result;
@@ -786,6 +969,7 @@ export class AutoUpdateController {
     if (this.healthyTimer) this.clearTimer(this.healthyTimer);
     this.timer = null;
     this.healthyTimer = null;
+    if (this.cleanShutdownOwnedByWrapper) return;
     if (!this.currentCommit) return;
     try {
       const state = readAutoUpdateState(this.statePath);
@@ -802,9 +986,11 @@ export class AutoUpdateController {
   }
 
   async dryRunCheck(): Promise<GitUpdateCheck> {
-    const check = checkGitUpdate({
+    const check = await checkGitUpdate({
       checkoutDir: this.deps.checkoutDir,
       expectedPackageName: this.deps.expectedPackageName,
+      runningDaemonVersion: this.deps.runningDaemonVersion,
+      registryVersionReader: this.deps.registryVersionReader,
       runner: this.runner,
     });
     this.log(formatGitUpdateDecision(check));
@@ -837,7 +1023,13 @@ export class AutoUpdateController {
     }
   }
 
-  private armHealthyTimer(commit: string): void {
+  private remainingHealthyDelay(bootStartedAtMs: number | null): number {
+    if (bootStartedAtMs === null) return HEALTHY_BOOT_MS;
+    const age = Math.max(0, this.now() - bootStartedAtMs);
+    return Math.max(0, HEALTHY_BOOT_MS - age);
+  }
+
+  private armHealthyTimer(commit: string, delayMs = HEALTHY_BOOT_MS): void {
     this.healthyTimer = this.setTimer(() => {
       try {
         const state = readAutoUpdateState(this.statePath);
@@ -852,7 +1044,7 @@ export class AutoUpdateController {
           "[gobot-channel-bgos] auto-update could not record healthy boot; rollback protection remains armed",
         );
       }
-    }, HEALTHY_BOOT_MS);
+    }, delayMs);
     this.healthyTimer.unref?.();
   }
 
@@ -877,9 +1069,11 @@ export class AutoUpdateController {
     this.checking = true;
     try {
       const persisted = readAutoUpdateState(this.statePath);
-      const check = checkGitUpdate({
+      const check = await checkGitUpdate({
         checkoutDir: this.deps.checkoutDir,
         expectedPackageName: this.deps.expectedPackageName,
+        runningDaemonVersion: this.deps.runningDaemonVersion,
+        registryVersionReader: this.deps.registryVersionReader,
         ...(persisted.upstreamRef
           ? { upstreamRef: persisted.upstreamRef }
           : {}),
@@ -889,8 +1083,8 @@ export class AutoUpdateController {
       if (
         check.decision !== "update-available" ||
         !check.checkoutRoot ||
-        !check.runningVersion ||
-        !check.latestVersion ||
+        !check.runningDaemonVersion ||
+        !check.candidateDaemonVersion ||
         !check.currentCommit ||
         !check.targetCommit ||
         !check.upstreamRef
@@ -903,10 +1097,10 @@ export class AutoUpdateController {
         {
           type: "update-staged",
           previousCommit: check.currentCommit,
-          previousVersion: check.runningVersion,
+          previousPluginVersion: check.runningDaemonVersion,
           targetCommit: check.targetCommit,
-          targetVersion: check.latestVersion,
-          lockfileChanged: check.lockfileChanged ?? false,
+          targetPluginVersion: check.candidateDaemonVersion,
+          dependencyFilesChanged: check.dependencyFilesChanged ?? false,
           upstreamRef: check.upstreamRef,
         },
       );
@@ -927,40 +1121,44 @@ export class AutoUpdateController {
         return "running";
       }
 
-      if (check.lockfileChanged) {
+      let installFailure: CommandResult | null = null;
+      if (check.dependencyFilesChanged) {
         const installed = this.installDependencies(check.checkoutRoot);
-        if (installed.status !== 0) {
+        if (installed.status !== 0) installFailure = installed;
+      }
+      if (!installFailure) {
+        const pluginInstalled = this.installExactPlugin(
+          check.checkoutRoot,
+          check.candidateDaemonVersion,
+        );
+        if (pluginInstalled.status !== 0) installFailure = pluginInstalled;
+      }
+      if (installFailure) {
+        this.log(
+          `[gobot-channel-bgos] dependency refresh failed after update: ${commandFailure(installFailure)}`,
+        );
+        const restored = this.restoreCommit(
+          check.checkoutRoot,
+          check.currentCommit,
+          check.dependencyFilesChanged ?? false,
+          check.runningDaemonVersion,
+        );
+        if (this.restoreReady(restored)) {
+          this.cancelStagedUpdate();
+        } else {
+          this.markRollbackRequired();
+          this.stopped = true;
           this.log(
-            `[gobot-channel-bgos] dependency install failed after update: ${commandFailure(installed)}`,
+            "[gobot-channel-bgos] update recovery is incomplete; rollback remains pending for the next supervised boot",
           );
-          const restored = this.restoreCommit(
-            check.checkoutRoot,
-            check.currentCommit,
-            true,
-          );
-          if (restored.checkoutRestored && restored.dependenciesReady) {
-            this.cancelStagedUpdate();
-          } else if (restored.checkoutRestored) {
-            const disabled = transitionRollbackState(
-              readAutoUpdateState(this.statePath),
-              { type: "rolled-back" },
-            );
-            writeAutoUpdateState(this.statePath, disabled.state);
-            this.stopped = true;
-            this.log(
-              "[gobot-channel-bgos] auto-update restored the previous commit but could not restore dependencies; updates are disabled until the flag is reset",
-            );
-          } else {
-            this.stopped = true;
-          }
-          await this.resume();
-          return "running";
         }
+        await this.resume();
+        return "running";
       }
 
       await this.shutdownForRestart();
       this.log(
-        `[gobot-channel-bgos] auto-update applied ${check.runningVersion} to ${check.latestVersion}; exiting cleanly for supervisor restart`,
+        `[gobot-channel-bgos] auto-update installed daemon ${check.runningDaemonVersion} to ${check.candidateDaemonVersion} at checkout ${check.targetCommit}; exiting cleanly for supervisor restart`,
       );
       this.stopped = true;
       this.exit(0);
@@ -989,6 +1187,13 @@ export class AutoUpdateController {
     writeAutoUpdateState(this.statePath, next.state);
   }
 
+  private markRollbackRequired(): void {
+    const state = readAutoUpdateState(this.statePath);
+    if (!state.pending) return;
+    state.pending.rollbackRequired = true;
+    writeAutoUpdateState(this.statePath, state);
+  }
+
   private async rollback(
     checkoutRoot: string,
     state: AutoUpdateState,
@@ -999,33 +1204,30 @@ export class AutoUpdateController {
     const restored = this.restoreCommit(
       checkoutRoot,
       pending.previousCommit,
-      pending.lockfileChanged,
+      pending.dependencyFilesChanged,
+      pending.previousPluginVersion,
     );
-    if (!restored.checkoutRestored || !restored.dependenciesReady) {
+    if (!this.restoreReady(restored)) {
       this.stopped = true;
-      if (restored.checkoutRestored) {
-        const returned = this.checkoutDetached(
-          checkoutRoot,
-          pending.targetCommit,
-        );
-        this.log(
-          returned
-            ? "[gobot-channel-bgos] rollback dependency restoration failed; the target checkout was restored and rollback will retry on the next boot"
-            : "[gobot-channel-bgos] rollback dependency restoration failed; rollback remains pending and requires operator attention",
-        );
-      } else {
-        this.log(
-          "[gobot-channel-bgos] rollback could not restore the previous commit; rollback remains pending and will retry on the next boot",
-        );
-      }
+      const targetRestored = this.restoreCommit(
+        checkoutRoot,
+        pending.targetCommit,
+        pending.dependencyFilesChanged,
+        pending.targetPluginVersion,
+      );
+      this.log(
+        this.restoreReady(targetRestored)
+          ? "[gobot-channel-bgos] rollback restoration failed; the target environment was restored and rollback will retry on the next boot"
+          : "[gobot-channel-bgos] rollback restoration failed; rollback remains pending and requires operator attention",
+      );
       await this.resume();
-      return "running";
+      return this.preImportOnly ? "retry-required" : "running";
     }
     const rolledBack = transitionRollbackState(state, { type: "rolled-back" });
     writeAutoUpdateState(this.statePath, rolledBack.state);
     await this.shutdownForRestart();
     this.log(
-      `[gobot-channel-bgos] auto-update rolled back to ${pending.previousVersion} after two short boots; updates are disabled until the flag is reset`,
+      `[gobot-channel-bgos] auto-update rolled back checkout ${pending.previousCommit} and daemon ${pending.previousPluginVersion} after two short boots; updates are disabled until the flag is reset`,
     );
     this.stopped = true;
     this.exit(0);
@@ -1035,10 +1237,19 @@ export class AutoUpdateController {
   private restoreCommit(
     checkoutRoot: string,
     commit: string,
-    reinstall: boolean,
-  ): { checkoutRestored: boolean; dependenciesReady: boolean } {
+    reinstallDependencies: boolean,
+    pluginVersion: string,
+  ): {
+    checkoutRestored: boolean;
+    dependenciesReady: boolean;
+    pluginReady: boolean;
+  } {
     if (!/^[0-9a-f]{40,64}$/i.test(commit)) {
-      return { checkoutRestored: false, dependenciesReady: false };
+      return {
+        checkoutRestored: false,
+        dependenciesReady: false,
+        pluginReady: false,
+      };
     }
     const restored = this.runner(
       "git",
@@ -1049,34 +1260,45 @@ export class AutoUpdateController {
       this.log(
         `[gobot-channel-bgos] rollback checkout failed: ${commandFailure(restored)}`,
       );
-      return { checkoutRestored: false, dependenciesReady: false };
+      return {
+        checkoutRestored: false,
+        dependenciesReady: false,
+        pluginReady: false,
+      };
     }
-    if (reinstall) {
+    let dependenciesReady = true;
+    if (reinstallDependencies) {
       const installed = this.installDependencies(checkoutRoot);
       if (installed.status !== 0) {
         this.log(
           `[gobot-channel-bgos] rollback dependency install failed: ${commandFailure(installed)}`,
         );
-        return { checkoutRestored: true, dependenciesReady: false };
+        dependenciesReady = false;
       }
     }
-    return { checkoutRestored: true, dependenciesReady: true };
+    const pluginInstalled = this.installExactPlugin(
+      checkoutRoot,
+      pluginVersion,
+    );
+    const pluginReady = pluginInstalled.status === 0;
+    if (!pluginReady) {
+      this.log(
+        `[gobot-channel-bgos] rollback daemon package restore failed: ${commandFailure(pluginInstalled)}`,
+      );
+    }
+    return { checkoutRestored: true, dependenciesReady, pluginReady };
   }
 
-  private checkoutDetached(checkoutRoot: string, commit: string): boolean {
-    if (!/^[0-9a-f]{40,64}$/i.test(commit)) return false;
-    const checkedOut = this.runner(
-      "git",
-      ["checkout", "--detach", commit],
-      checkoutRoot,
+  private restoreReady(restored: {
+    checkoutRestored: boolean;
+    dependenciesReady: boolean;
+    pluginReady: boolean;
+  }): boolean {
+    return (
+      restored.checkoutRestored &&
+      restored.dependenciesReady &&
+      restored.pluginReady
     );
-    if (checkedOut.status !== 0) {
-      this.log(
-        `[gobot-channel-bgos] checkout restore failed: ${commandFailure(checkedOut)}`,
-      );
-      return false;
-    }
-    return true;
   }
 
   private async shutdownForRestart(): Promise<void> {
@@ -1090,13 +1312,143 @@ export class AutoUpdateController {
   }
 
   private installDependencies(checkoutRoot: string): CommandResult {
-    const hasLockfile = LOCKFILES.some((name) =>
-      existsSync(join(checkoutRoot, name)),
+    const tracked = this.trackedDependencyFiles(checkoutRoot);
+    if (!tracked.files) return tracked.failure;
+    const hasTrackedLockfile = tracked.files.some((name) =>
+      (LOCKFILES as readonly string[]).includes(name),
     );
-    return this.runner(
-      this.deps.bunPath ?? "bun",
-      hasLockfile ? ["install", "--frozen-lockfile"] : ["install"],
+    return this.runBunPreservingTrackedFiles(
+      checkoutRoot,
+      hasTrackedLockfile
+        ? ["install", "--frozen-lockfile"]
+        : ["install"],
+      tracked.files,
+    );
+  }
+
+  private installExactPlugin(
+    checkoutRoot: string,
+    version: string,
+  ): CommandResult {
+    if (!parseExactStableNpmVersion(version)) {
+      return {
+        status: null,
+        stdout: "",
+        stderr: "",
+        error: `unsafe daemon package version: ${version}`,
+      };
+    }
+    const tracked = this.trackedDependencyFiles(checkoutRoot);
+    if (!tracked.files) return tracked.failure;
+    const installed = this.runBunPreservingTrackedFiles(
+      checkoutRoot,
+      ["install", `${PLUGIN_PACKAGE_NAME}@${version}`, "--no-save"],
+      tracked.files,
+    );
+    if (installed.status !== 0) return installed;
+    const actual = this.installedPluginVersionReader(checkoutRoot);
+    if (actual !== version) {
+      return {
+        status: null,
+        stdout: installed.stdout,
+        stderr: installed.stderr,
+        error: `installed daemon version is ${actual ?? "missing"}, expected ${version}`,
+      };
+    }
+    return installed;
+  }
+
+  private trackedDependencyFiles(checkoutRoot: string):
+    | { files: string[]; failure?: never }
+    | { files?: never; failure: CommandResult } {
+    const listed = this.runner(
+      "git",
+      ["ls-files", "--", ...DEPENDENCY_FILES],
       checkoutRoot,
     );
+    if (listed.status !== 0) {
+      return {
+        failure: {
+          status: listed.status,
+          stdout: listed.stdout,
+          stderr: listed.stderr,
+          error: listed.error ?? "tracked dependency files could not be listed",
+        },
+      };
+    }
+    const allowed = new Set<string>(DEPENDENCY_FILES);
+    const files = listed.stdout
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => allowed.has(line));
+    if (!files.includes("package.json")) {
+      return {
+        failure: {
+          status: null,
+          stdout: "",
+          stderr: "",
+          error: "tracked package.json could not be verified",
+        },
+      };
+    }
+    return { files };
+  }
+
+  private runBunPreservingTrackedFiles(
+    checkoutRoot: string,
+    args: readonly string[],
+    trackedFiles: readonly string[],
+  ): CommandResult {
+    let snapshots: Array<{
+      path: string;
+      contents: Buffer;
+      mode: number;
+    }>;
+    try {
+      snapshots = trackedFiles.map((name) => {
+        const path = join(checkoutRoot, name);
+        return {
+          path,
+          contents: readFileSync(path),
+          mode: statSync(path).mode & 0o777,
+        };
+      });
+    } catch (error) {
+      return {
+        status: null,
+        stdout: "",
+        stderr: "",
+        error: `tracked dependency snapshot failed: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+
+    const result = this.runner(
+      this.deps.bunPath ?? "bun",
+      args,
+      checkoutRoot,
+    );
+    try {
+      for (const snapshot of snapshots) {
+        try {
+          if (readFileSync(snapshot.path).equals(snapshot.contents)) continue;
+        } catch {
+          // Restore a missing or unreadable tracked file below.
+        }
+        const temporary = `${snapshot.path}.${process.pid}.restore.tmp`;
+        writeFileSync(temporary, snapshot.contents, { mode: snapshot.mode });
+        renameSync(temporary, snapshot.path);
+        if (!readFileSync(snapshot.path).equals(snapshot.contents)) {
+          throw new Error(`${snapshot.path} did not verify after restore`);
+        }
+      }
+    } catch (error) {
+      return {
+        status: null,
+        stdout: result.stdout,
+        stderr: result.stderr,
+        error: `tracked dependency restore failed: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+    return result;
   }
 }

@@ -1,22 +1,61 @@
-/**
- * Pure process-supervisor rendering. No IO.
- *
- * A fresh public-patch install has no fork setup scripts, so setup writes a
- * bot-only supervisor directly: a launchd agent on macOS, a systemd user unit
- * on Linux. The label is the BGOS-managed relay label the watchdog and the
- * fork's launchd guard both key on.
- */
+/** Pure process-supervisor paths and rendering. No IO. */
 import { join } from "node:path";
 
-/** The BGOS-managed relay label. Two pollers on one token = 409 loop, so the
- * fork's configure-launchd refuses to also install com.go.telegram-relay when
- * this label is loaded. Keep the value in sync with the fork. */
 export const LAUNCHD_LABEL = "ai.brandgrowthos.gobot";
+export const LEGACY_RELAY_LABEL = "com.go.telegram-relay";
 export const LEGACY_AUTO_UPDATE_LABEL = "com.go.auto-update";
 export const SYSTEMD_UNIT = "gobot-bgos.service";
 
-export function forkRelaySetupArgs(): string[] {
-  return ["run", "setup:launchd", "--", "--service", "telegram-relay"];
+export interface StableSupervisorPaths {
+  directory: string;
+  wrapper: string;
+  selfUpdate: string;
+  versionPolicy: string;
+}
+
+export interface StableSupervisorAssetCopy {
+  source: string;
+  destination: string;
+}
+
+export function stableSupervisorPaths(gobotHome: string): StableSupervisorPaths {
+  const directory = join(gobotHome, "supervisor");
+  return {
+    directory,
+    wrapper: join(directory, "daemon-wrapper.js"),
+    selfUpdate: join(directory, "self-update.js"),
+    versionPolicy: join(directory, "update-version-policy.js"),
+  };
+}
+
+export function stableSupervisorAssetCopies(
+  packageDistDirectory: string,
+  gobotHome: string,
+): StableSupervisorAssetCopy[] {
+  const paths = stableSupervisorPaths(gobotHome);
+  return [
+    {
+      source: join(packageDistDirectory, "update-version-policy.js"),
+      destination: paths.versionPolicy,
+    },
+    {
+      source: join(packageDistDirectory, "self-update.js"),
+      destination: paths.selfUpdate,
+    },
+    {
+      source: join(packageDistDirectory, "daemon-wrapper.js"),
+      destination: paths.wrapper,
+    },
+  ];
+}
+
+export function legacyRelayPlist(home: string): string {
+  return join(
+    home,
+    "Library",
+    "LaunchAgents",
+    `${LEGACY_RELAY_LABEL}.plist`,
+  );
 }
 
 export function legacyAutoUpdatePlist(home: string): string {
@@ -28,8 +67,16 @@ export function legacyAutoUpdatePlist(home: string): string {
   );
 }
 
-export function disableLegacyAutoUpdateArgs(plistPath: string): string[] {
+export function disableLegacyLaunchdArgs(plistPath: string): string[] {
   return ["unload", "-w", plistPath];
+}
+
+export function removeLegacyLaunchdArgs(label: string): string[] {
+  return ["remove", label];
+}
+
+export function disableLegacyAutoUpdateArgs(plistPath: string): string[] {
+  return disableLegacyLaunchdArgs(plistPath);
 }
 
 export type SupervisorKind = "launchd" | "systemd" | "manual";
@@ -47,28 +94,49 @@ export interface SupervisorRenderOptions {
   label?: string;
 }
 
+export function wrapperProgramArguments(
+  opts: SupervisorRenderOptions,
+): string[] {
+  return [
+    opts.bunPath,
+    "run",
+    stableSupervisorPaths(opts.gobotHome).wrapper,
+    opts.installDir,
+  ];
+}
+
+function plistString(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&apos;");
+}
+
 export function renderLaunchdPlist(opts: SupervisorRenderOptions): string {
   const label = opts.label ?? LAUNCHD_LABEL;
-  const botEntry = join(opts.installDir, "src", "bot.ts");
   const outLog = join(opts.gobotHome, "logs", "gobot.log");
   const errLog = join(opts.gobotHome, "logs", "gobot.err");
+  const programArguments = wrapperProgramArguments(opts)
+    .map((value) => `    <string>${plistString(value)}</string>`)
+    .join("\n");
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key><string>${label}</string>
+  <key>Label</key><string>${plistString(label)}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>${opts.bunPath}</string>
-    <string>run</string>
-    <string>${botEntry}</string>
+${programArguments}
   </array>
-  <key>WorkingDirectory</key><string>${opts.installDir}</string>
+  <key>WorkingDirectory</key><string>${plistString(opts.installDir)}</string>
   <key>EnvironmentVariables</key><dict>
     <key>NODE_ENV</key><string>production</string>
+    <key>GOBOT_INSTALL_DIR</key><string>${plistString(opts.installDir)}</string>
   </dict>
-  <key>StandardOutPath</key><string>${outLog}</string>
-  <key>StandardErrorPath</key><string>${errLog}</string>
+  <key>StandardOutPath</key><string>${plistString(outLog)}</string>
+  <key>StandardErrorPath</key><string>${plistString(errLog)}</string>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
 </dict>
@@ -76,9 +144,13 @@ export function renderLaunchdPlist(opts: SupervisorRenderOptions): string {
 `;
 }
 
+function systemdQuote(value: string): string {
+  return `"${value.replaceAll("\\", "\\\\").replaceAll('"', '\\"')}"`;
+}
+
 export function renderSystemdUnit(opts: SupervisorRenderOptions): string {
-  const botEntry = join("src", "bot.ts");
   const envFile = join(opts.installDir, ".env");
+  const execStart = wrapperProgramArguments(opts).map(systemdQuote).join(" ");
   return `[Unit]
 Description=Gobot with BGOS integration
 After=network-online.target
@@ -86,10 +158,11 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=${opts.installDir}
-EnvironmentFile=${envFile}
+WorkingDirectory=${systemdQuote(opts.installDir)}
+EnvironmentFile=${systemdQuote(envFile)}
 Environment=NODE_ENV=production
-ExecStart=${opts.bunPath} run ${botEntry}
+Environment=${systemdQuote(`GOBOT_INSTALL_DIR=${opts.installDir}`)}
+ExecStart=${execStart}
 Restart=always
 RestartSec=5
 

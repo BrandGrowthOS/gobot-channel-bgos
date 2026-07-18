@@ -1,10 +1,9 @@
 /**
  * Pure composition + merge of the managed GOBOT env block. No IO.
  *
- * The setup subcommand owns only the GOBOT_ / BGOS_ lines of the target
- * `.env`. Every other line (TELEGRAM_BOT_TOKEN, ANTHROPIC_API_KEY, custom
- * host config) is preserved verbatim on a re-run, so setup never clobbers
- * the existing Telegram install.
+ * The setup subcommand owns only the lines emitted below. Every other line,
+ * including BGOS_AUTO_UPDATE and custom endpoint settings, is preserved on a
+ * re-run so setup never changes an operator's opt-in decision.
  */
 import type { HomeChannel } from "./args.js";
 
@@ -29,7 +28,8 @@ export function composeEnvBlock(opts: EnvBlockOptions): string {
   return lines.join("\n") + "\n";
 }
 
-const MANAGED_LINE = /^\s*(GOBOT_[A-Z_]+|BGOS_[A-Z_]+)\s*=/;
+const MANAGED_LINE =
+  /^\s*(GOBOT_HOME|GOBOT_HOME_CHANNEL|GOBOT_AGENTS|GOBOT_POLL_INTERVAL)\s*=/;
 const MANAGED_COMMENT = /^# Gobot \+ BGOS integration/;
 
 /**

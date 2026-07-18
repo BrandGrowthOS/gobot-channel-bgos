@@ -108,12 +108,11 @@ export function planStages(
   stages.push({
     stage: "supervisor",
     action: facts.supervisorPresent ? "reload" : "run",
-    reason: facts.hasSetupLaunchdScript
-      ? "reuse fork setup:launchd"
-      : facts.platform === "darwin"
-        ? "install launchd agent"
+    reason:
+      facts.platform === "darwin"
+        ? "install package-owned launchd wrapper"
         : facts.platform === "linux"
-          ? "install systemd user unit"
+          ? "install package-owned systemd wrapper"
           : "manual supervisor (unsupported platform)",
   });
 

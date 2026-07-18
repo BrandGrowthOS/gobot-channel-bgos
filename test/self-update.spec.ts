@@ -17,6 +17,7 @@ import {
   MAX_UPDATE_JITTER_MS,
   MalformedAutoUpdateStateError,
   UPDATE_INTERVAL_MS,
+  WRAPPED_BOOT_COMMIT_ENV,
   checkGitUpdate,
   compareVersions,
   decideDrainBeforeUpdate,
@@ -151,6 +152,18 @@ describe("auto-update flag gate", () => {
       if (key === "fetch --quiet") {
         return { status: 0, stdout: "", stderr: "" };
       }
+      if (key === `show ${currentCommit}:package.json`) {
+        return {
+          status: 0,
+          stdout: JSON.stringify({
+            name: "gobot",
+            optionalDependencies: {
+              "gobot-channel-bgos": "^0.15.0",
+            },
+          }),
+          stderr: "",
+        };
+      }
       return { status: 1, stdout: "", stderr: "unexpected command" };
     };
     const timer = { unref: vi.fn() } as unknown as NodeJS.Timeout;
@@ -235,10 +248,10 @@ describe("rollback state machine", () => {
     return transitionRollbackState(EMPTY_AUTO_UPDATE_STATE, {
       type: "update-staged",
       previousCommit,
-      previousVersion: "2.1.0",
+      previousPluginVersion: "0.15.0",
       targetCommit,
-      targetVersion: "2.2.0",
-      lockfileChanged: false,
+      targetPluginVersion: "0.15.1",
+      dependencyFilesChanged: false,
       upstreamRef: "refs/remotes/origin/main",
     }).state;
   }
@@ -307,6 +320,83 @@ describe("rollback state machine", () => {
   });
 });
 
+describe("wrapped boot ownership", () => {
+  const previousCommit = "a".repeat(40);
+  const targetCommit = "b".repeat(40);
+
+  it("records before host start, avoids a duplicate boot, and uses remaining health time", async () => {
+    const root = tempDir();
+    const statePath = join(root, "bgos_auto_update.json");
+    writeFileSync(
+      join(root, "package.json"),
+      JSON.stringify({ name: "gobot", version: "2.11.0" }),
+    );
+    writeAutoUpdateState(
+      statePath,
+      transitionRollbackState(EMPTY_AUTO_UPDATE_STATE, {
+        type: "update-staged",
+        previousCommit,
+        previousPluginVersion: "0.15.0",
+        targetCommit,
+        targetPluginVersion: "0.15.1",
+        dependencyFilesChanged: false,
+        upstreamRef: "refs/remotes/origin/bgos-integration",
+      }).state,
+    );
+    const runner: CommandRunner = (_command, args) => {
+      const key = args.join(" ");
+      if (key === "rev-parse --show-toplevel") {
+        return { status: 0, stdout: root + "\n", stderr: "" };
+      }
+      if (key === "rev-parse HEAD") {
+        return { status: 0, stdout: targetCommit + "\n", stderr: "" };
+      }
+      return { status: 1, stdout: "", stderr: "unexpected command" };
+    };
+    const env: Record<string, string | undefined> = {
+      BGOS_AUTO_UPDATE: "on",
+    };
+    const parent = new AutoUpdateController({
+      env,
+      checkoutDir: root,
+      statePath,
+      runner,
+      now: () => 100,
+      preImportOnly: true,
+    });
+
+    await expect(parent.start()).resolves.toBe("running");
+    expect(env[WRAPPED_BOOT_COMMIT_ENV]).toBe(targetCommit);
+    expect(readAutoUpdateState(statePath).pending).toMatchObject({
+      bootStartedAtMs: 100,
+      crashCount: 0,
+    });
+
+    const setTimer = vi.fn(
+      () => ({ unref: vi.fn() }) as unknown as NodeJS.Timeout,
+    );
+    const child = new AutoUpdateController({
+      env,
+      checkoutDir: root,
+      statePath,
+      runner,
+      now: () => 20_100,
+      setTimer,
+    });
+    await expect(child.start()).resolves.toBe("running");
+    expect(setTimer).toHaveBeenCalledWith(expect.any(Function), 40_000);
+    expect(readAutoUpdateState(statePath).pending).toMatchObject({
+      bootStartedAtMs: 100,
+      crashCount: 0,
+    });
+
+    child.stop();
+    expect(readAutoUpdateState(statePath).pending?.bootStartedAtMs).toBe(100);
+    parent.stop();
+    expect(readAutoUpdateState(statePath).pending?.bootStartedAtMs).toBeNull();
+  });
+});
+
 describe("state persistence", () => {
   it("writes atomically with owner-only mode and reads the same state", () => {
     const dir = tempDir();
@@ -359,6 +449,9 @@ describe("state persistence", () => {
 describe("git update inspection", () => {
   const currentCommit = "a".repeat(40);
   const targetCommit = "b".repeat(40);
+  const runningDaemonVersion = "0.15.0";
+  const candidateDaemonVersion = "0.15.1";
+  const registryVersionReader = async () => candidateDaemonVersion;
 
   function fixtureRunner(root: string) {
     const calls: Array<{ command: string; args: readonly string[]; cwd: string }> = [];
@@ -386,19 +479,32 @@ describe("git update inspection", () => {
       if (key === `show ${targetCommit}:package.json`) {
         return {
           status: 0,
-          stdout: JSON.stringify({ name: "gobot", version: "2.2.0" }),
+          stdout: JSON.stringify({
+            name: "gobot",
+            version: "2.2.0",
+            optionalDependencies: {
+              "gobot-channel-bgos": "^0.15.0",
+            },
+          }),
           stderr: "",
         };
       }
+      if (key.startsWith("ls-files -- package.json")) {
+        return { status: 0, stdout: "package.json\n", stderr: "" };
+      }
       if (args[0] === "diff") {
-        return { status: 0, stdout: "bun.lock\n", stderr: "" };
+        return {
+          status: 0,
+          stdout: "package.json\nbun.lock\n",
+          stderr: "",
+        };
       }
       return { status: 1, stdout: "", stderr: "unexpected command" };
     };
     return { runner, calls };
   }
 
-  it("uses fixed git arguments and identifies a same-major fast-forward", () => {
+  it("uses fixed git arguments and identifies a same-major fast-forward", async () => {
     const root = tempDir();
     writeFileSync(
       join(root, "package.json"),
@@ -406,15 +512,20 @@ describe("git update inspection", () => {
     );
     const { runner, calls } = fixtureRunner(root);
 
-    const check = checkGitUpdate({ checkoutDir: root, runner });
+    const check = await checkGitUpdate({
+      checkoutDir: root,
+      runningDaemonVersion,
+      registryVersionReader,
+      runner,
+    });
 
     expect(check).toMatchObject({
       decision: "update-available",
       currentCommit,
       targetCommit,
-      runningVersion: "2.1.0",
-      latestVersion: "2.2.0",
-      lockfileChanged: true,
+      runningDaemonVersion,
+      candidateDaemonVersion,
+      dependencyFilesChanged: true,
     });
     expect(calls.map((call) => [call.command, ...call.args])).toContainEqual([
       "git",
@@ -432,7 +543,96 @@ describe("git update inspection", () => {
     expect(calls.slice(1).every((call) => call.cwd === calls[1].cwd)).toBe(true);
   });
 
-  it("rejects unsafe remote ref text before fetch or apply", () => {
+  it("installs a newer exact registry daemon even when the fork commit is unchanged", async () => {
+    const root = tempDir();
+    const statePath = join(root, "state.json");
+    writeFileSync(
+      join(root, "package.json"),
+      JSON.stringify({ name: "gobot", version: "2.11.0" }),
+    );
+    const calls: string[] = [];
+    const runner: CommandRunner = (command, args) => {
+      const key = args.join(" ");
+      calls.push([command, key].join(" "));
+      if (key === "rev-parse --show-toplevel") {
+        return { status: 0, stdout: root + "\n", stderr: "" };
+      }
+      if (
+        key === "rev-parse HEAD" ||
+        key === "rev-parse refs/remotes/origin/bgos-integration"
+      ) {
+        return { status: 0, stdout: currentCommit + "\n", stderr: "" };
+      }
+      if (key === "rev-parse --symbolic-full-name @{upstream}") {
+        return {
+          status: 0,
+          stdout: "refs/remotes/origin/bgos-integration\n",
+          stderr: "",
+        };
+      }
+      if (key === "fetch --quiet") {
+        return { status: 0, stdout: "", stderr: "" };
+      }
+      if (key === `show ${currentCommit}:package.json`) {
+        return {
+          status: 0,
+          stdout: JSON.stringify({
+            name: "gobot",
+            optionalDependencies: {
+              "gobot-channel-bgos": "^0.15.0",
+            },
+          }),
+          stderr: "",
+        };
+      }
+      if (key === `merge --ff-only ${currentCommit}`) {
+        return { status: 0, stdout: "already current", stderr: "" };
+      }
+      if (key.startsWith("ls-files -- package.json")) {
+        return { status: 0, stdout: "package.json\n", stderr: "" };
+      }
+      if (
+        command === "bun" &&
+        key === `install gobot-channel-bgos@${candidateDaemonVersion} --no-save`
+      ) {
+        writeFileSync(join(root, "package.json"), "temporarily mutated");
+        return { status: 0, stdout: "installed", stderr: "" };
+      }
+      return { status: 1, stdout: "", stderr: "unexpected command" };
+    };
+    const exit = vi.fn();
+    const controller = new AutoUpdateController({
+      env: { BGOS_AUTO_UPDATE: "on" },
+      checkoutDir: root,
+      runningDaemonVersion,
+      registryVersionReader,
+      statePath,
+      runner,
+      exit,
+      installedPluginVersionReader: () => candidateDaemonVersion,
+    });
+
+    await expect(controller.start()).resolves.toBe("exit-requested");
+    expect(calls).toContain(`git merge --ff-only ${currentCommit}`);
+    expect(calls).toContain(
+      `bun install gobot-channel-bgos@${candidateDaemonVersion} --no-save`,
+    );
+    expect(calls).not.toContain("bun install");
+    expect(JSON.parse(readFileSync(join(root, "package.json"), "utf8"))).toEqual({
+      name: "gobot",
+      version: "2.11.0",
+    });
+    expect(readAutoUpdateState(statePath).pending).toMatchObject({
+      previousCommit: currentCommit,
+      targetCommit: currentCommit,
+      previousPluginVersion: runningDaemonVersion,
+      targetPluginVersion: candidateDaemonVersion,
+      dependencyFilesChanged: false,
+    });
+    expect(exit).toHaveBeenCalledWith(0);
+  });
+
+  it("rejects unsafe remote ref text before fetch or apply", async () => {
     const root = tempDir();
     writeFileSync(
       join(root, "package.json"),
@@ -458,7 +658,12 @@ describe("git update inspection", () => {
       return { status: 1, stdout: "", stderr: "unexpected command" };
     };
 
-    expect(checkGitUpdate({ checkoutDir: root, runner })).toMatchObject({
+    await expect(checkGitUpdate({
+      checkoutDir: root,
+      runningDaemonVersion,
+      registryVersionReader,
+      runner,
+    })).resolves.toMatchObject({
       decision: "no-upstream",
     });
     expect(calls.some((call) => call.includes("fetch"))).toBe(false);
@@ -493,6 +698,18 @@ describe("git update inspection", () => {
       if (key === "fetch --quiet") {
         return { status: 0, stdout: "", stderr: "" };
       }
+      if (key === `show ${currentCommit}:package.json`) {
+        return {
+          status: 0,
+          stdout: JSON.stringify({
+            name: "gobot",
+            optionalDependencies: {
+              "gobot-channel-bgos": "^0.15.0",
+            },
+          }),
+          stderr: "",
+        };
+      }
       return { status: 1, stdout: "", stderr: "unexpected command" };
     };
     const timer = { unref: vi.fn() } as unknown as NodeJS.Timeout;
@@ -500,6 +717,8 @@ describe("git update inspection", () => {
     const controller = new AutoUpdateController({
       env: { BGOS_AUTO_UPDATE: "on" },
       checkoutDir: root,
+      runningDaemonVersion,
+      registryVersionReader: async () => runningDaemonVersion,
       statePath,
       runner,
       random: () => 0.5,
@@ -541,6 +760,18 @@ describe("git update inspection", () => {
         fetchCount += 1;
         return { status: 0, stdout: "", stderr: "" };
       }
+      if (key === `show ${currentCommit}:package.json`) {
+        return {
+          status: 0,
+          stdout: JSON.stringify({
+            name: "gobot",
+            optionalDependencies: {
+              "gobot-channel-bgos": "^0.15.0",
+            },
+          }),
+          stderr: "",
+        };
+      }
       return { status: 1, stdout: "", stderr: "unexpected command" };
     };
     const timers: Array<{ callback: () => void; delay: number }> = [];
@@ -552,6 +783,8 @@ describe("git update inspection", () => {
     const controller = new AutoUpdateController({
       env: { BGOS_AUTO_UPDATE: "on" },
       checkoutDir: root,
+      runningDaemonVersion,
+      registryVersionReader: async () => runningDaemonVersion,
       statePath,
       runner,
       setTimer,
@@ -586,6 +819,8 @@ describe("git update inspection", () => {
     const exit = vi.fn();
     const controller = new AutoUpdateController({
       checkoutDir: root,
+      runningDaemonVersion,
+      registryVersionReader,
       statePath,
       runner,
       log,
@@ -605,7 +840,7 @@ describe("git update inspection", () => {
     expect(calls.some((call) => call.command === "bun")).toBe(false);
   });
 
-  it("drains before fast-forward and installs only for a changed lockfile", async () => {
+  it("drains before fast-forward and refreshes manifest dependencies plus the exact daemon", async () => {
     const root = tempDir();
     const statePath = join(root, "state", "bgos_auto_update.json");
     writeFileSync(
@@ -637,31 +872,40 @@ describe("git update inspection", () => {
     const controller = new AutoUpdateController({
       env: { BGOS_AUTO_UPDATE: "on" },
       checkoutDir: root,
+      runningDaemonVersion,
+      registryVersionReader,
       statePath,
       runner,
       drain,
       shutdown,
       exit,
       bunPath: "bun",
+      installedPluginVersionReader: () => candidateDaemonVersion,
     });
 
     await expect(controller.start()).resolves.toBe("exit-requested");
     const drainIndex = events.indexOf("drain");
     const mergeIndex = events.indexOf(`git merge --ff-only ${targetCommit}`);
-    const installIndex = events.indexOf("bun install --frozen-lockfile");
+    const installIndex = events.indexOf("bun install");
+    const pluginInstallIndex = events.indexOf(
+      `bun install gobot-channel-bgos@${candidateDaemonVersion} --no-save`,
+    );
     expect(drainIndex).toBeGreaterThanOrEqual(0);
     expect(mergeIndex).toBeGreaterThan(drainIndex);
     expect(installIndex).toBeGreaterThan(mergeIndex);
-    expect(events.indexOf("shutdown")).toBeGreaterThan(installIndex);
+    expect(pluginInstallIndex).toBeGreaterThan(installIndex);
+    expect(events.indexOf("shutdown")).toBeGreaterThan(pluginInstallIndex);
     expect(events.at(-1)).toBe("exit 0");
     expect(readAutoUpdateState(statePath).pending).toMatchObject({
       previousCommit: currentCommit,
       targetCommit,
-      lockfileChanged: true,
+      dependencyFilesChanged: true,
+      previousPluginVersion: runningDaemonVersion,
+      targetPluginVersion: candidateDaemonVersion,
     });
   });
 
-  it("latches updates off when dependency recovery also fails", async () => {
+  it("keeps update recovery pending when dependency recovery also fails", async () => {
     const root = tempDir();
     const statePath = join(root, "state", "bgos_auto_update.json");
     writeFileSync(
@@ -686,6 +930,8 @@ describe("git update inspection", () => {
     const controller = new AutoUpdateController({
       env: { BGOS_AUTO_UPDATE: "on" },
       checkoutDir: root,
+      runningDaemonVersion,
+      registryVersionReader,
       statePath,
       runner,
       setTimer,
@@ -694,10 +940,14 @@ describe("git update inspection", () => {
 
     await expect(controller.start()).resolves.toBe("running");
     expect(readAutoUpdateState(statePath)).toMatchObject({
-      disabled: true,
+      disabled: false,
       resetSeen: false,
       upstreamRef: "refs/remotes/origin/main",
-      pending: null,
+      pending: {
+        previousPluginVersion: runningDaemonVersion,
+        targetPluginVersion: candidateDaemonVersion,
+        rollbackRequired: true,
+      },
     });
     expect(setTimer).not.toHaveBeenCalled();
   });
@@ -717,12 +967,12 @@ describe("git update inspection", () => {
       upstreamRef: "refs/remotes/origin/main",
       pending: {
         previousCommit: currentCommit,
-        previousVersion: "2.1.0",
+        previousPluginVersion: "0.15.0",
         targetCommit,
-        targetVersion: "2.2.0",
+        targetPluginVersion: "0.15.1",
         crashCount: 2,
         bootStartedAtMs: 90,
-        lockfileChanged: true,
+        dependencyFilesChanged: true,
         rollbackRequired: true,
       },
     });
@@ -742,6 +992,9 @@ describe("git update inspection", () => {
       if (key === `checkout --detach ${targetCommit}`) {
         return { status: 0, stdout: "target checkout", stderr: "" };
       }
+      if (key.startsWith("ls-files -- package.json")) {
+        return { status: 0, stdout: "package.json\n", stderr: "" };
+      }
       if (command === "bun") {
         return { status: 1, stdout: "", stderr: "install failed" };
       }
@@ -753,15 +1006,18 @@ describe("git update inspection", () => {
     const controller = new AutoUpdateController({
       env: { BGOS_AUTO_UPDATE: "on" },
       checkoutDir: root,
+      runningDaemonVersion,
+      registryVersionReader,
       statePath,
       runner,
       log,
       exit,
       setTimer,
       bunPath: "bun",
+      preImportOnly: true,
     });
 
-    await expect(controller.start()).resolves.toBe("running");
+    await expect(controller.start()).resolves.toBe("retry-required");
     expect(calls).toContain(`git checkout --detach ${currentCommit}`);
     expect(calls).toContain(`git checkout --detach ${targetCommit}`);
     expect(readAutoUpdateState(statePath)).toMatchObject({
@@ -793,12 +1049,12 @@ describe("git update inspection", () => {
       upstreamRef: "refs/remotes/origin/main",
       pending: {
         previousCommit: currentCommit,
-        previousVersion: "2.1.0",
+        previousPluginVersion: "0.15.0",
         targetCommit,
-        targetVersion: "2.2.0",
+        targetPluginVersion: "0.15.1",
         crashCount: 1,
         bootStartedAtMs: 90,
-        lockfileChanged: false,
+        dependencyFilesChanged: false,
         rollbackRequired: false,
       },
     });
@@ -815,20 +1071,35 @@ describe("git update inspection", () => {
       if (key === `checkout --detach ${currentCommit}`) {
         return { status: 0, stdout: "restored", stderr: "" };
       }
+      if (key.startsWith("ls-files -- package.json")) {
+        return { status: 0, stdout: "package.json\n", stderr: "" };
+      }
+      if (
+        command === "bun" &&
+        key === "install gobot-channel-bgos@0.15.0 --no-save"
+      ) {
+        return { status: 0, stdout: "restored package", stderr: "" };
+      }
       return { status: 1, stdout: "", stderr: "unexpected command" };
     };
     const exit = vi.fn();
     const controller = new AutoUpdateController({
       env: { BGOS_AUTO_UPDATE: "on" },
       checkoutDir: root,
+      runningDaemonVersion,
+      registryVersionReader,
       statePath,
       runner,
       now: () => 100,
       exit,
+      installedPluginVersionReader: () => "0.15.0",
     });
 
     await expect(controller.start()).resolves.toBe("exit-requested");
     expect(calls).toContain(`git checkout --detach ${currentCommit}`);
+    expect(calls).toContain(
+      "bun install gobot-channel-bgos@0.15.0 --no-save",
+    );
     expect(calls.some((call) => call.includes("reset"))).toBe(false);
     expect(calls.some((call) => call.includes("force"))).toBe(false);
     expect(exit).toHaveBeenCalledWith(0);
@@ -875,6 +1146,8 @@ describe("git update inspection", () => {
     const onBoot = new AutoUpdateController({
       env: { BGOS_AUTO_UPDATE: "on" },
       checkoutDir: root,
+      runningDaemonVersion,
+      registryVersionReader: async () => runningDaemonVersion,
       statePath,
       runner: rearmRunner,
       setTimer: () => timer,
@@ -894,6 +1167,8 @@ describe("git update inspection", () => {
     const controller = new AutoUpdateController({
       env: { BGOS_AUTO_UPDATE: "on" },
       checkoutDir: root,
+      runningDaemonVersion,
+      registryVersionReader,
       statePath: join(root, "state.json"),
       runner: () => {
         throw new Error("probe exploded");

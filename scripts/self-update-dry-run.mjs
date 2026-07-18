@@ -8,8 +8,14 @@ const checkoutDir = resolve(
 const manifest = JSON.parse(
   readFileSync(join(checkoutDir, "package.json"), "utf8"),
 );
+const daemonManifest = JSON.parse(
+  readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+);
 if (typeof manifest.name !== "string") {
   throw new Error("dry-run checkout package name is missing");
+}
+if (typeof daemonManifest.version !== "string") {
+  throw new Error("dry-run daemon package version is missing");
 }
 
 process.stdout.write(
@@ -19,6 +25,7 @@ process.stdout.write(
 const controller = new AutoUpdateController({
   checkoutDir,
   expectedPackageName: manifest.name,
+  runningDaemonVersion: daemonManifest.version,
 });
 
 const result = await controller.dryRunCheck();

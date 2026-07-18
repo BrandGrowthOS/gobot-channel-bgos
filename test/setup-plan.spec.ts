@@ -57,13 +57,13 @@ describe("planStages", () => {
     expect(stage(stages, "pair").reason).toContain("needs a pair code");
   });
 
-  it("reloads the supervisor when already present and reuses fork setup:launchd", () => {
+  it("reloads the package-owned supervisor when already present", () => {
     const stages = planStages(
       { ...fresh, supervisorPresent: true, hasSetupLaunchdScript: true },
       { hasCode: true },
     );
     expect(stage(stages, "supervisor").action).toBe("reload");
-    expect(stage(stages, "supervisor").reason).toContain("setup:launchd");
+    expect(stage(stages, "supervisor").reason).toContain("package-owned");
   });
 
   it("uses systemd on linux", () => {
