@@ -62,7 +62,7 @@ The adapter resolves config in order: explicit constructor arg → env var → `
 | `BGOS_VOICE_VOICE` | `marin` | Realtime voice name. |
 | `BGOS_VOICE_PERSONA` | _(empty)_ | Extra persona text baked into the voice session instructions. |
 | `GOBOT_BGOS_HEARTBEAT_INTERVAL` | `60` (seconds) | Cadence for the daemon heartbeat that reports `daemon_version` + last error to the backend (surfaced in the BGOS Integrations card). `0` disables the network heartbeat; a local `$GOBOT_HOME/bgos_heartbeat.json` is always written for the watchdog. |
-| `BGOS_AUTO_UPDATE` | `off` | Exact value `on` opts the supervised Gobot checkout into same-major automatic updates. Exact value `off` is the hard kill switch. |
+| `BGOS_AUTO_UPDATE` | `on` | Same-major automatic updates are ON by default (unset or empty counts as on). Exact value `off` is the hard kill switch; any other value fails closed to disabled. |
 | `GOBOT_BGOS_BACKFILL_STORM_LIMIT` | `25` | If a single REST backfill returns more than this many messages, the cursor fast-forwards and dispatch is skipped (prevents a history-replay storm after a long outage). `0` disables the guard. |
 | `GOBOT_BGOS_CHAT_ID` / `GOBOT_BGOS_CHAT_ID_<assistantId>` | _(auto)_ | **Rarely needed.** Proactive messages (check-ins, briefings) self-resolve their delivery chat via the backend, so you do not normally set this. Set it only to pin a specific chat. |
 
@@ -93,7 +93,7 @@ Inbound is deduplicated (a message is dispatched exactly once across the live WS
 
 The recommended one-paste setup clones or reuses the private Gobot fork and installs this npm package into that checkout. It copies a small wrapper runtime to `$GOBOT_HOME/supervisor`, outside the checkout that updates, and points launchd or systemd at that stable wrapper. The wrapper records boot state before it starts `bun run src/bot.ts`. A fresh clone keeps `HEAD` aligned with its tracked upstream so fast-forward updates remain possible. Automatic update first proves that the working directory, or `GOBOT_INSTALL_DIR` when set, is a git checkout whose package name is `gobot`. Other install layouts are logged and skipped.
 
-Set `BGOS_AUTO_UPDATE=on` to opt in. The default and every unrecognized value are off. An exact `BGOS_AUTO_UPDATE=off` prevents every update check, timer, and git command. A boot with `off` may write only the durable reset marker needed after an automatic rollback.
+Automatic updates are on by default (unset or empty counts as on). Every unrecognized value is off. An exact `BGOS_AUTO_UPDATE=off` prevents every update check, timer, and git command. A boot with `off` may write only the durable reset marker needed after an automatic rollback.
 
 The private fork also contains an older host updater controlled by `GOBOT_AUTO_UPDATE_FORK`. That is a separate legacy lane and is not used by this adapter. Recommended setup persistently unloads both `com.go.telegram-relay` and `com.go.auto-update`, then loads the package-owned `ai.brandgrowthos.gobot` wrapper. This prevents duplicate Telegram pollers and keeps the legacy lane from changing the checkout when `BGOS_AUTO_UPDATE=off`. Existing private-fork hosts must rerun setup before relying on the new flag.
 

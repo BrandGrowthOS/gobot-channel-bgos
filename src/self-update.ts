@@ -41,7 +41,10 @@ const DEPENDENCY_FILES = ["package.json", ...LOCKFILES] as const;
 export type AutoUpdateFlag = "on" | "off" | "invalid";
 
 export function parseAutoUpdateFlag(value: string | undefined): AutoUpdateFlag {
-  if (value === "on") return "on";
+  // Default ON (KC 2026-07-18): unset or empty means enabled. "off" stays the
+  // hard kill switch; any other explicit value is invalid and fails closed
+  // to disabled.
+  if (value === undefined || value === "" || value === "on") return "on";
   if (value === "off") return "off";
   return "invalid";
 }
