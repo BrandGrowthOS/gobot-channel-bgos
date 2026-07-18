@@ -14,6 +14,14 @@ import {
 import type { VoiceRpcResultBody } from "./voice-rpc.js";
 import type { HeartbeatDto } from "./heartbeat.js";
 
+const CONDITIONAL_GET_CACHE_LIMIT = 50;
+const CHAT_HISTORY_PAGE_SIZE = 50;
+
+interface ConditionalGetCacheEntry {
+  etag: string;
+  body: unknown;
+}
+
 /**
  * Thin typed wrapper around the BGOS integration endpoints. All methods
  * attach the X-BGOS-Pairing header from cfg.pairingToken.
@@ -24,6 +32,10 @@ import type { HeartbeatDto } from "./heartbeat.js";
  */
 export class BgosApi {
   private readonly http: AxiosInstance;
+  private readonly conditionalGetCache = new Map<
+    string,
+    ConditionalGetCacheEntry
+  >();
 
   constructor(cfg: PluginConfig) {
     this.http = axios.create({
@@ -47,6 +59,88 @@ export class BgosApi {
         return Promise.reject(err);
       },
     );
+  }
+
+  /**
+   * GET with an in-memory validator and body cache keyed by the full URL.
+   * The body is retained with its ETag so a 304 can preserve the method's
+   * normal return shape. Cache reads refresh access order.
+   */
+  private async conditionalGet<T>(
+    url: string,
+    params: Record<string, string | number | undefined>,
+    useValidator = true,
+  ): Promise<T> {
+    const cacheKey = this.http.getUri({ url, params });
+    const expectedEntry = this.conditionalGetCache.get(cacheKey);
+    const cached = useValidator ? expectedEntry : undefined;
+    if (cached) {
+      this.conditionalGetCache.delete(cacheKey);
+      this.conditionalGetCache.set(cacheKey, cached);
+    }
+
+    const response = await this.http.get<T>(url, {
+      params,
+      headers: cached ? { "If-None-Match": cached.etag } : undefined,
+      validateStatus: (status) =>
+        status === 304 || (status >= 200 && status < 300),
+    });
+
+    if (response.status === 304) {
+      if (!cached) {
+        if (useValidator) {
+          return this.conditionalGet(url, params, false);
+        }
+        throw new Error(
+          `BGOS returned 304 twice without a cached body for ${cacheKey}`,
+        );
+      }
+      if (this.conditionalGetCache.get(cacheKey) === expectedEntry) {
+        const responseEtag = response.headers.etag;
+        if (
+          typeof responseEtag === "string" &&
+          responseEtag.length > 0 &&
+          responseEtag !== cached.etag
+        ) {
+          this.storeConditionalGetEntry(cacheKey, {
+            etag: responseEtag,
+            body: cached.body,
+          });
+        }
+      }
+      return cached.body as T;
+    }
+
+    if (this.conditionalGetCache.get(cacheKey) === expectedEntry) {
+      if (response.status === 200) {
+        const etag = response.headers.etag;
+        if (typeof etag === "string" && etag.length > 0) {
+          this.storeConditionalGetEntry(cacheKey, {
+            etag,
+            body: response.data,
+          });
+        } else {
+          this.conditionalGetCache.delete(cacheKey);
+        }
+      } else {
+        this.conditionalGetCache.delete(cacheKey);
+      }
+    }
+
+    return response.data;
+  }
+
+  private storeConditionalGetEntry(
+    cacheKey: string,
+    entry: ConditionalGetCacheEntry,
+  ): void {
+    this.conditionalGetCache.delete(cacheKey);
+    this.conditionalGetCache.set(cacheKey, entry);
+    while (this.conditionalGetCache.size > CONDITIONAL_GET_CACHE_LIMIT) {
+      const oldest = this.conditionalGetCache.keys().next().value;
+      if (oldest === undefined) break;
+      this.conditionalGetCache.delete(oldest);
+    }
   }
 
   /** GET /integrations/me — confirms token + touches last_seen_at.
@@ -152,23 +246,27 @@ export class BgosApi {
   async inboundSince(sinceMessageId: number): Promise<{
     messages: InboundMessagePayload[];
   }> {
-    const r = await this.http.get("integrations/inbound", {
-      params: { since_message_id: sinceMessageId },
+    return this.conditionalGet("integrations/inbound", {
+      since_message_id: sinceMessageId,
     });
-    return r.data;
   }
 
   /** Fetch the recent message history for a chat — used by the daemon to
    *  rebuild conversation context before dispatching to a stateless
-   *  gateway. Backend returns up to 100 entries ASC by created_at. */
+   *  gateway. Requests 50 entries ASC by created_at. */
   async getMessages(
     chatId: number,
     userId: string,
+    afterId?: number,
   ): Promise<BgosMessageEnvelope[]> {
-    const r = await this.http.get(`chats/${chatId}/messages`, {
-      params: { userId },
+    const data = await this.conditionalGet<{
+      messages?: BgosMessageEnvelope[];
+    }>(`chats/${chatId}/messages`, {
+      userId,
+      limit: CHAT_HISTORY_PAGE_SIZE,
+      ...(afterId !== undefined ? { afterId } : {}),
     });
-    const rows = r.data?.messages;
+    const rows = data?.messages;
     return Array.isArray(rows) ? (rows as BgosMessageEnvelope[]) : [];
   }
 

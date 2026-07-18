@@ -4,6 +4,7 @@ import type { AddressInfo } from "node:net";
 interface StagedResponse {
   status: number;
   body: unknown;
+  headers?: Record<string, string>;
   delayMs?: number;
 }
 
@@ -56,8 +57,16 @@ export class MockBgosServer {
       if (staged.delayMs) {
         await new Promise((r) => setTimeout(r, staged.delayMs));
       }
-      res.writeHead(staged.status, { "Content-Type": "application/json" });
-      res.end(JSON.stringify(staged.body ?? null));
+      res.writeHead(staged.status, {
+        "Content-Type": "application/json",
+        Connection: "close",
+        ...staged.headers,
+      });
+      if (staged.status === 304 || staged.body === undefined) {
+        res.end();
+      } else {
+        res.end(JSON.stringify(staged.body));
+      }
     });
 
     await new Promise<void>((resolve) => this.server!.listen(0, resolve));
@@ -65,10 +74,17 @@ export class MockBgosServer {
     return `http://127.0.0.1:${port}`;
   }
 
-  stage(method: string, path: string, status: number, body: unknown): this {
+  stage(
+    method: string,
+    path: string,
+    status: number,
+    body: unknown,
+    headers?: Record<string, string>,
+    delayMs?: number,
+  ): this {
     const key = `${method} ${path}`;
     const existing = this.staged.get(key) ?? [];
-    existing.push({ status, body });
+    existing.push({ status, body, headers, delayMs });
     this.staged.set(key, existing);
     return this;
   }
