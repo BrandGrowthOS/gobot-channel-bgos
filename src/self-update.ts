@@ -15,6 +15,7 @@ import {
   parseExactStableNpmVersion,
   parseForkPluginConstraint,
 } from "./update-version-policy.js";
+import { resolveGobotStateHome } from "./state-home.js";
 
 export const UPDATE_INTERVAL_MS = 24 * 60 * 60 * 1000;
 export const MAX_UPDATE_JITTER_MS = 6 * 60 * 60 * 1000;
@@ -234,6 +235,7 @@ export function transitionRollbackState(
   if (event.type === "clean-shutdown") {
     if (current.pending?.targetCommit === event.currentCommit) {
       current.pending.bootStartedAtMs = null;
+      current.pending.crashCount = 0;
     }
     return { state: current, action: "continue" };
   }
@@ -348,13 +350,7 @@ export function writeAutoUpdateState(
 export function autoUpdateStatePath(
   env: Record<string, string | undefined> = process.env,
 ): string {
-  const configured = env.GOBOT_HOME?.trim();
-  const root = configured
-    ? configured.startsWith("~")
-      ? join(homedir(), configured.slice(1))
-      : configured
-    : join(homedir(), ".gobot");
-  return join(root, "bgos_auto_update.json");
+  return join(resolveGobotStateHome(env), "bgos_auto_update.json");
 }
 
 export interface CommandResult {
@@ -421,8 +417,11 @@ export interface GitUpdateCheck {
   checkoutRoot?: string;
   runningDaemonVersion?: string;
   candidateDaemonVersion?: string;
+  targetDaemonVersion?: string;
   currentCommit?: string;
   targetCommit?: string;
+  checkoutUpdateRequired?: boolean;
+  daemonUpdateRequired?: boolean;
   dependencyFilesChanged?: boolean;
   pluginConstraint?: string;
   upstreamRef?: string;
@@ -701,31 +700,32 @@ export async function checkGitUpdate(
         pluginConstraint,
       };
     }
-    if (
-      !candidateSatisfiesForkPluginConstraint(
+    const checkoutUpdateRequired = targetCommit !== commit;
+    const runningDaemonCompatible =
+      candidateSatisfiesForkPluginConstraint(
+        runningDaemonVersion,
+        parsedConstraint,
+      );
+    const candidateDaemonCompatible =
+      candidateSatisfiesForkPluginConstraint(
         candidateDaemonVersion,
         parsedConstraint,
-      )
-    ) {
-      return {
-        decision: "incompatible-plugin",
-        detail: `registry daemon ${candidateDaemonVersion} is outside fork constraint ${pluginConstraint}`,
-        checkoutRoot: root,
-        runningDaemonVersion,
-        candidateDaemonVersion,
-        currentCommit: commit,
-        targetCommit,
-        pluginConstraint,
-      };
-    }
-
+      );
     const versionDecision = decideVersionUpdate(
       runningDaemonVersion,
       candidateDaemonVersion,
     );
-    if (versionDecision !== "update") {
+    const daemonUpdateRequired =
+      candidateDaemonCompatible && versionDecision === "update";
+    const targetDaemonVersion = daemonUpdateRequired
+      ? candidateDaemonVersion
+      : runningDaemonVersion;
+
+    if (!checkoutUpdateRequired && !daemonUpdateRequired) {
       const decision =
-        versionDecision === "major-blocked"
+        !candidateDaemonCompatible
+          ? "incompatible-plugin"
+          : versionDecision === "major-blocked"
           ? "major-blocked"
           : versionDecision === "invalid"
             ? "invalid-version"
@@ -733,11 +733,38 @@ export async function checkGitUpdate(
       return {
         decision,
         detail:
-          decision === "major-blocked"
+          decision === "incompatible-plugin"
+            ? `registry daemon ${candidateDaemonVersion} is outside fork constraint ${pluginConstraint}`
+            : decision === "major-blocked"
             ? `registry daemon ${candidateDaemonVersion} changes major from ${runningDaemonVersion}`
             : decision === "invalid-version"
               ? `could not compare daemon versions ${runningDaemonVersion} and ${candidateDaemonVersion}`
               : `running daemon ${runningDaemonVersion} is not older than registry ${candidateDaemonVersion}`,
+        checkoutRoot: root,
+        runningDaemonVersion,
+        candidateDaemonVersion,
+        currentCommit: commit,
+        targetCommit,
+        pluginConstraint,
+        upstreamRef,
+      };
+    }
+
+    if (
+      checkoutUpdateRequired &&
+      !runningDaemonCompatible &&
+      !daemonUpdateRequired
+    ) {
+      const decision =
+        candidateDaemonCompatible && versionDecision === "major-blocked"
+          ? "major-blocked"
+          : "incompatible-plugin";
+      return {
+        decision,
+        detail:
+          decision === "major-blocked"
+            ? `checkout requires ${pluginConstraint}, but registry daemon ${candidateDaemonVersion} changes major from ${runningDaemonVersion}`
+            : `checkout requires ${pluginConstraint}, which is incompatible with running daemon ${runningDaemonVersion}`,
         checkoutRoot: root,
         runningDaemonVersion,
         candidateDaemonVersion,
@@ -786,12 +813,17 @@ export async function checkGitUpdate(
     }
     return {
       decision: "update-available",
-      detail: `registry daemon ${candidateDaemonVersion} is available for running ${runningDaemonVersion} within fork constraint ${pluginConstraint}`,
+      detail: daemonUpdateRequired
+        ? `registry daemon ${candidateDaemonVersion} is available for running ${runningDaemonVersion} within fork constraint ${pluginConstraint}`
+        : `checkout fast-forward ${targetCommit} is available with compatible running daemon ${runningDaemonVersion}`,
       checkoutRoot: root,
       runningDaemonVersion,
       candidateDaemonVersion,
+      targetDaemonVersion,
       currentCommit: commit,
       targetCommit,
+      checkoutUpdateRequired,
+      daemonUpdateRequired,
       dependencyFilesChanged,
       pluginConstraint,
       upstreamRef,
@@ -816,6 +848,7 @@ export interface AutoUpdateControllerDeps extends GitUpdateOptions {
   resume?: () => Promise<void>;
   shutdown?: () => Promise<void>;
   exit?: (code: number) => void;
+  restart?: (code: number) => void;
   now?: () => number;
   random?: () => number;
   setTimer?: (callback: () => void, delayMs: number) => NodeJS.Timeout;
@@ -824,6 +857,8 @@ export interface AutoUpdateControllerDeps extends GitUpdateOptions {
   hasActiveWork?: () => boolean;
   preImportOnly?: boolean;
   installedPluginVersionReader?: (checkoutRoot: string) => string | null;
+  stateReader?: (path: string) => AutoUpdateState;
+  stateWriter?: (path: string, state: AutoUpdateState) => void;
 }
 
 export type AutoUpdateStartResult =
@@ -841,6 +876,7 @@ export class AutoUpdateController {
   private readonly resume: () => Promise<void>;
   private readonly shutdown: () => Promise<void>;
   private readonly exit: (code: number) => void;
+  private readonly restart: (code: number) => void;
   private readonly now: () => number;
   private readonly random: () => number;
   private readonly setTimer: (
@@ -853,6 +889,8 @@ export class AutoUpdateController {
   private readonly installedPluginVersionReader: (
     checkoutRoot: string,
   ) => string | null;
+  private readonly stateReader: (path: string) => AutoUpdateState;
+  private readonly stateWriter: (path: string, state: AutoUpdateState) => void;
   private timer: NodeJS.Timeout | null = null;
   private healthyTimer: NodeJS.Timeout | null = null;
   private stopped = false;
@@ -869,6 +907,7 @@ export class AutoUpdateController {
     this.resume = deps.resume ?? (async () => undefined);
     this.shutdown = deps.shutdown ?? (async () => undefined);
     this.exit = deps.exit ?? ((code) => process.exit(code));
+    this.restart = deps.restart ?? this.exit;
     this.now = deps.now ?? (() => Date.now());
     this.random = deps.random ?? (() => Math.random());
     this.setTimer = deps.setTimer ?? ((callback, delay) => setTimeout(callback, delay));
@@ -877,6 +916,8 @@ export class AutoUpdateController {
     this.preImportOnly = deps.preImportOnly ?? false;
     this.installedPluginVersionReader =
       deps.installedPluginVersionReader ?? readInstalledPluginVersion;
+    this.stateReader = deps.stateReader ?? readAutoUpdateState;
+    this.stateWriter = deps.stateWriter ?? writeAutoUpdateState;
   }
 
   async start(): Promise<AutoUpdateStartResult> {
@@ -891,13 +932,15 @@ export class AutoUpdateController {
     try {
       let state: AutoUpdateState;
       try {
-        state = readAutoUpdateState(this.statePath);
+        state = this.stateReader(this.statePath);
       } catch (error) {
         if (error instanceof MalformedAutoUpdateStateError) {
           this.log(
-            "[gobot-channel-bgos] auto-update state is malformed; updates are disabled until one off boot resets the state",
+            this.preImportOnly
+              ? "[gobot-channel-bgos] auto-update state is malformed; Gobot was not started until one off boot resets the state"
+              : "[gobot-channel-bgos] auto-update state is malformed; updates are disabled until one off boot resets the state",
           );
-          return "inactive";
+          return this.preImportOnly ? "retry-required" : "inactive";
         }
         throw error;
       }
@@ -915,9 +958,11 @@ export class AutoUpdateController {
       });
       if (!checkout.info) {
         this.log(
-          `[gobot-channel-bgos] auto-update skipped: ${checkout.detail ?? "Gobot checkout was not verified"}`,
+          this.preImportOnly
+            ? `[gobot-channel-bgos] auto-update preflight could not verify the checkout; Gobot was not started: ${checkout.detail ?? "checkout verification failed"}`
+            : `[gobot-channel-bgos] auto-update skipped: ${checkout.detail ?? "Gobot checkout was not verified"}`,
         );
-        return "inactive";
+        return this.preImportOnly ? "retry-required" : "inactive";
       }
       this.currentCommit = checkout.info.commit;
       const wrappedCommit = this.env[WRAPPED_BOOT_COMMIT_ENV];
@@ -932,7 +977,7 @@ export class AutoUpdateController {
           });
       state = boot.state;
       if (!this.cleanShutdownOwnedByWrapper) {
-        writeAutoUpdateState(this.statePath, state);
+        this.stateWriter(this.statePath, state);
       }
       if (this.preImportOnly) {
         this.env[WRAPPED_BOOT_COMMIT_ENV] = checkout.info.commit;
@@ -957,9 +1002,11 @@ export class AutoUpdateController {
       return "running";
     } catch (error) {
       this.log(
-        `[gobot-channel-bgos] auto-update check failed; daemon will continue: ${error instanceof Error ? error.message : String(error)}`,
+        this.preImportOnly
+          ? `[gobot-channel-bgos] auto-update preflight failed; Gobot was not started: ${error instanceof Error ? error.message : String(error)}`
+          : `[gobot-channel-bgos] auto-update check failed; daemon will continue: ${error instanceof Error ? error.message : String(error)}`,
       );
-      return "running";
+      return this.preImportOnly ? "retry-required" : "running";
     }
   }
 
@@ -972,12 +1019,12 @@ export class AutoUpdateController {
     if (this.cleanShutdownOwnedByWrapper) return;
     if (!this.currentCommit) return;
     try {
-      const state = readAutoUpdateState(this.statePath);
+      const state = this.stateReader(this.statePath);
       const next = transitionRollbackState(state, {
         type: "clean-shutdown",
         currentCommit: this.currentCommit,
       });
-      writeAutoUpdateState(this.statePath, next.state);
+      this.stateWriter(this.statePath, next.state);
     } catch {
       this.log(
         "[gobot-channel-bgos] auto-update could not record clean shutdown; daemon shutdown will continue",
@@ -1001,10 +1048,10 @@ export class AutoUpdateController {
     try {
       let state: AutoUpdateState;
       try {
-        state = readAutoUpdateState(this.statePath);
+        state = this.stateReader(this.statePath);
       } catch (error) {
         if (!(error instanceof MalformedAutoUpdateStateError)) throw error;
-        writeAutoUpdateState(this.statePath, {
+        this.stateWriter(this.statePath, {
           schemaVersion: 1,
           disabled: true,
           resetSeen: true,
@@ -1015,7 +1062,7 @@ export class AutoUpdateController {
       }
       if (!state.disabled || state.resetSeen) return;
       const next = transitionRollbackState(state, { type: "flag-off" });
-      writeAutoUpdateState(this.statePath, next.state);
+      this.stateWriter(this.statePath, next.state);
     } catch {
       this.log(
         "[gobot-channel-bgos] auto-update reset marker could not be recorded; updates remain off",
@@ -1031,18 +1078,21 @@ export class AutoUpdateController {
 
   private armHealthyTimer(commit: string, delayMs = HEALTHY_BOOT_MS): void {
     this.healthyTimer = this.setTimer(() => {
+      this.healthyTimer = null;
+      if (this.stopped) return;
       try {
-        const state = readAutoUpdateState(this.statePath);
+        const state = this.stateReader(this.statePath);
         const next = transitionRollbackState(state, {
           type: "healthy",
           currentCommit: commit,
         });
-        writeAutoUpdateState(this.statePath, next.state);
+        this.stateWriter(this.statePath, next.state);
         this.armNextCheck();
       } catch {
         this.log(
           "[gobot-channel-bgos] auto-update could not record healthy boot; rollback protection remains armed",
         );
+        this.armHealthyTimer(commit, ACTIVE_WORK_RETRY_MS);
       }
     }, delayMs);
     this.healthyTimer.unref?.();
@@ -1067,8 +1117,10 @@ export class AutoUpdateController {
   private async checkAndApply(): Promise<AutoUpdateStartResult> {
     if (this.checking || this.stopped) return "running";
     this.checking = true;
+    let mutationStarted = false;
+    let updateStaged = false;
     try {
-      const persisted = readAutoUpdateState(this.statePath);
+      const persisted = this.stateReader(this.statePath);
       const check = await checkGitUpdate({
         checkoutDir: this.deps.checkoutDir,
         expectedPackageName: this.deps.expectedPackageName,
@@ -1085,6 +1137,7 @@ export class AutoUpdateController {
         !check.checkoutRoot ||
         !check.runningDaemonVersion ||
         !check.candidateDaemonVersion ||
+        !check.targetDaemonVersion ||
         !check.currentCommit ||
         !check.targetCommit ||
         !check.upstreamRef
@@ -1093,18 +1146,19 @@ export class AutoUpdateController {
       }
 
       const staged = transitionRollbackState(
-        readAutoUpdateState(this.statePath),
+        this.stateReader(this.statePath),
         {
           type: "update-staged",
           previousCommit: check.currentCommit,
           previousPluginVersion: check.runningDaemonVersion,
           targetCommit: check.targetCommit,
-          targetPluginVersion: check.candidateDaemonVersion,
+          targetPluginVersion: check.targetDaemonVersion,
           dependencyFilesChanged: check.dependencyFilesChanged ?? false,
           upstreamRef: check.upstreamRef,
         },
       );
-      writeAutoUpdateState(this.statePath, staged.state);
+      this.stateWriter(this.statePath, staged.state);
+      updateStaged = true;
       await this.drain();
 
       const merged = this.runner(
@@ -1120,6 +1174,7 @@ export class AutoUpdateController {
         await this.resume();
         return "running";
       }
+      mutationStarted = true;
 
       let installFailure: CommandResult | null = null;
       if (check.dependencyFilesChanged) {
@@ -1129,7 +1184,7 @@ export class AutoUpdateController {
       if (!installFailure) {
         const pluginInstalled = this.installExactPlugin(
           check.checkoutRoot,
-          check.candidateDaemonVersion,
+          check.targetDaemonVersion,
         );
         if (pluginInstalled.status !== 0) installFailure = pluginInstalled;
       }
@@ -1145,28 +1200,61 @@ export class AutoUpdateController {
         );
         if (this.restoreReady(restored)) {
           this.cancelStagedUpdate();
+          await this.resume();
+          return "running";
         } else {
           this.markRollbackRequired();
-          this.stopped = true;
-          this.log(
-            "[gobot-channel-bgos] update recovery is incomplete; rollback remains pending for the next supervised boot",
+          const targetRestored = this.restoreCommit(
+            check.checkoutRoot,
+            check.targetCommit,
+            check.dependencyFilesChanged ?? false,
+            check.targetDaemonVersion,
           );
+          this.log(
+            this.restoreReady(targetRestored)
+              ? "[gobot-channel-bgos] previous environment restoration failed; a verified target is retained for supervised rollback"
+              : "[gobot-channel-bgos] neither previous nor target environment could be verified; Gobot will remain stopped while supervised recovery retries",
+          );
+          await this.shutdownForRestart();
+          this.stopped = true;
+          this.requestRestart(0);
+          return "exit-requested";
         }
-        await this.resume();
-        return "running";
       }
 
       await this.shutdownForRestart();
       this.log(
-        `[gobot-channel-bgos] auto-update installed daemon ${check.runningDaemonVersion} to ${check.candidateDaemonVersion} at checkout ${check.targetCommit}; exiting cleanly for supervisor restart`,
+        check.daemonUpdateRequired
+          ? `[gobot-channel-bgos] auto-update installed daemon ${check.runningDaemonVersion} to ${check.targetDaemonVersion} at checkout ${check.targetCommit}; requesting graceful supervisor restart`
+          : `[gobot-channel-bgos] auto-update fast-forwarded checkout ${check.currentCommit} to ${check.targetCommit} with daemon ${check.targetDaemonVersion}; requesting graceful supervisor restart`,
       );
       this.stopped = true;
-      this.exit(0);
+      this.requestRestart(0);
       return "exit-requested";
     } catch (error) {
       this.log(
-        `[gobot-channel-bgos] auto-update check failed; daemon will continue: ${error instanceof Error ? error.message : String(error)}`,
+        mutationStarted
+          ? `[gobot-channel-bgos] auto-update apply failed after checkout mutation: ${error instanceof Error ? error.message : String(error)}`
+          : `[gobot-channel-bgos] auto-update check failed; daemon will continue: ${error instanceof Error ? error.message : String(error)}`,
       );
+      if (mutationStarted) {
+        this.log(
+          "[gobot-channel-bgos] the update attempt changed the checkout; Gobot will remain stopped for supervised recovery",
+        );
+        await this.shutdownForRestart();
+        this.stopped = true;
+        this.requestRestart(0);
+        return "exit-requested";
+      }
+      if (updateStaged) {
+        try {
+          this.cancelStagedUpdate();
+        } catch {
+          this.log(
+            "[gobot-channel-bgos] auto-update could not clear its unapplied staged state",
+          );
+        }
+      }
       try {
         await this.resume();
       } catch {
@@ -1181,17 +1269,17 @@ export class AutoUpdateController {
   }
 
   private cancelStagedUpdate(): void {
-    const next = transitionRollbackState(readAutoUpdateState(this.statePath), {
+    const next = transitionRollbackState(this.stateReader(this.statePath), {
       type: "update-cancelled",
     });
-    writeAutoUpdateState(this.statePath, next.state);
+    this.stateWriter(this.statePath, next.state);
   }
 
   private markRollbackRequired(): void {
-    const state = readAutoUpdateState(this.statePath);
+    const state = this.stateReader(this.statePath);
     if (!state.pending) return;
     state.pending.rollbackRequired = true;
-    writeAutoUpdateState(this.statePath, state);
+    this.stateWriter(this.statePath, state);
   }
 
   private async rollback(
@@ -1220,18 +1308,34 @@ export class AutoUpdateController {
           ? "[gobot-channel-bgos] rollback restoration failed; the target environment was restored and rollback will retry on the next boot"
           : "[gobot-channel-bgos] rollback restoration failed; rollback remains pending and requires operator attention",
       );
-      await this.resume();
-      return this.preImportOnly ? "retry-required" : "running";
+      if (this.preImportOnly) return "retry-required";
+      if (this.restoreReady(targetRestored)) {
+        await this.resume();
+        return "running";
+      }
+      await this.shutdownForRestart();
+      this.requestRestart(0);
+      return "exit-requested";
     }
     const rolledBack = transitionRollbackState(state, { type: "rolled-back" });
-    writeAutoUpdateState(this.statePath, rolledBack.state);
+    this.stateWriter(this.statePath, rolledBack.state);
     await this.shutdownForRestart();
     this.log(
       `[gobot-channel-bgos] auto-update rolled back checkout ${pending.previousCommit} and daemon ${pending.previousPluginVersion} after two short boots; updates are disabled until the flag is reset`,
     );
     this.stopped = true;
-    this.exit(0);
+    this.requestRestart(0);
     return "exit-requested";
+  }
+
+  private requestRestart(code: number): void {
+    try {
+      this.restart(code);
+    } catch (error) {
+      this.log(
+        `[gobot-channel-bgos] graceful restart request failed; update intake remains stopped and an operator restart is required: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
   }
 
   private restoreCommit(

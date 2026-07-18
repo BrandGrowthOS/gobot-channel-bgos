@@ -4,10 +4,15 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 
-import { HeartbeatController, type HeartbeatDto } from "../src/heartbeat.js";
+import {
+  HeartbeatController,
+  heartbeatStatePath,
+  type HeartbeatDto,
+} from "../src/heartbeat.js";
+import { autoUpdateStatePath } from "../src/self-update.js";
 
 function heartbeatFile(home: string): Record<string, unknown> {
   return JSON.parse(readFileSync(join(home, "bgos_heartbeat.json"), "utf8"));
@@ -29,6 +34,14 @@ describe("HeartbeatController", () => {
     else process.env.GOBOT_HOME = originalGobotHome;
     if (originalInterval === undefined) delete process.env.GOBOT_BGOS_HEARTBEAT_INTERVAL;
     else process.env.GOBOT_BGOS_HEARTBEAT_INTERVAL = originalInterval;
+  });
+
+  it("expands tilde GOBOT_HOME beside the auto-update state", () => {
+    const env = { GOBOT_HOME: "~/.gobot-custom" };
+    const expectedRoot = join(homedir(), ".gobot-custom");
+
+    expect(dirname(heartbeatStatePath(env))).toBe(expectedRoot);
+    expect(dirname(autoUpdateStatePath(env))).toBe(expectedRoot);
   });
 
   it("writes the local file + posts once on start", () => {

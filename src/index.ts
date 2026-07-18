@@ -15,9 +15,11 @@
  */
 export {
   BGOSAdapter,
+  requestGracefulHostRestart,
   type BgosConfig,
   type ButtonClickInfo,
   type FatalInfo,
+  type HostRestartSignalTarget,
 } from "./adapter.js";
 export { getPackageVersion } from "./version.js";
 export {
@@ -61,8 +63,10 @@ export {
   type RollbackEvent,
   type VersionDecision,
 } from "./self-update.js";
+export { resolveGobotStateHome } from "./state-home.js";
 export {
   HeartbeatController,
+  heartbeatStatePath,
   type HeartbeatDto,
   type HeartbeatFileState,
   type HeartbeatLastError,

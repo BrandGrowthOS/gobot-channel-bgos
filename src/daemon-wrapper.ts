@@ -132,9 +132,9 @@ export async function runDaemonWrapper(
     preflight = await controller.start();
   } catch (error) {
     runtime.log(
-      `[gobot-channel-bgos] auto-update preflight failed; Gobot will continue: ${error instanceof Error ? error.message : String(error)}`,
+      `[gobot-channel-bgos] auto-update preflight failed; Gobot was not started: ${error instanceof Error ? error.message : String(error)}`,
     );
-    preflight = "running";
+    preflight = "retry-required";
   }
 
   if (cleanSignal) {
@@ -186,6 +186,9 @@ export async function runDaemonWrapper(
       finish(1);
     });
     child?.once("exit", (code) => {
+      // A child can exit 0 after requesting its own graceful update restart.
+      // Only a supervisor signal marks the parent boot clean. This preserves
+      // the pending health check for the newly installed code.
       finish(code ?? (cleanSignal ? 0 : 1));
     });
   });

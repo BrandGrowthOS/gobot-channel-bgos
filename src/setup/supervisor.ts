@@ -10,6 +10,7 @@ export interface StableSupervisorPaths {
   directory: string;
   wrapper: string;
   selfUpdate: string;
+  stateHome: string;
   versionPolicy: string;
 }
 
@@ -24,6 +25,7 @@ export function stableSupervisorPaths(gobotHome: string): StableSupervisorPaths 
     directory,
     wrapper: join(directory, "daemon-wrapper.js"),
     selfUpdate: join(directory, "self-update.js"),
+    stateHome: join(directory, "state-home.js"),
     versionPolicy: join(directory, "update-version-policy.js"),
   };
 }
@@ -37,6 +39,10 @@ export function stableSupervisorAssetCopies(
     {
       source: join(packageDistDirectory, "update-version-policy.js"),
       destination: paths.versionPolicy,
+    },
+    {
+      source: join(packageDistDirectory, "state-home.js"),
+      destination: paths.stateHome,
     },
     {
       source: join(packageDistDirectory, "self-update.js"),

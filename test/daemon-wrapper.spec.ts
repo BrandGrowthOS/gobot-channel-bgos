@@ -11,7 +11,9 @@ import {
   type WrapperController,
 } from "../src/daemon-wrapper.js";
 import {
+  EMPTY_AUTO_UPDATE_STATE,
   WRAPPED_BOOT_COMMIT_ENV,
+  transitionRollbackState,
   type AutoUpdateControllerDeps,
   type AutoUpdateStartResult,
 } from "../src/self-update.js";
@@ -166,7 +168,7 @@ describe("daemon wrapper lifecycle", () => {
     },
   );
 
-  it("keeps a child-originated zero exit unclean", async () => {
+  it("keeps an intentional child update exit pending for health validation", async () => {
     const harness = createHarness();
     const completion = runDaemonWrapper(
       "/Users/kc/src/gobot-bgos",
@@ -178,6 +180,28 @@ describe("daemon wrapper lifecycle", () => {
 
     await expect(completion).resolves.toBe(0);
     expect(harness.controller.stop).not.toHaveBeenCalled();
+
+    const handoff = transitionRollbackState(
+      transitionRollbackState(EMPTY_AUTO_UPDATE_STATE, {
+        type: "update-staged",
+        previousCommit: "a".repeat(40),
+        previousPluginVersion: "0.15.0",
+        targetCommit: "b".repeat(40),
+        targetPluginVersion: "0.15.1",
+        dependencyFilesChanged: false,
+        upstreamRef: "refs/remotes/origin/bgos-integration",
+      }).state,
+      {
+        type: "boot",
+        nowMs: 100,
+        currentCommit: "b".repeat(40),
+      },
+    );
+    expect(handoff.action).toBe("continue");
+    expect(handoff.state.pending).toMatchObject({
+      crashCount: 0,
+      bootStartedAtMs: 100,
+    });
   });
 
   it.each(["SIGINT", "SIGTERM", "SIGHUP"] as const)(
@@ -223,22 +247,18 @@ describe("daemon wrapper lifecycle", () => {
     expect(harness.spawnProcess).not.toHaveBeenCalled();
   });
 
-  it("continues to Gobot when the preflight throws", async () => {
+  it("fails closed without importing Gobot when the preflight throws", async () => {
     const harness = createHarness(async () => {
       throw new Error("unexpected preflight error");
     });
-    const completion = runDaemonWrapper(
-      "/Users/kc/src/gobot-bgos",
-      harness.runtime,
-    );
-    await letWrapperSpawn();
 
-    expect(harness.spawnProcess).toHaveBeenCalledTimes(1);
+    await expect(
+      runDaemonWrapper("/Users/kc/src/gobot-bgos", harness.runtime),
+    ).resolves.toBe(1);
+    expect(harness.spawnProcess).not.toHaveBeenCalled();
     expect(harness.logs.join("\n")).toContain(
-      "auto-update preflight failed; Gobot will continue",
+      "auto-update preflight failed; Gobot was not started",
     );
-    harness.child.emit("exit", 1, null);
-    await expect(completion).resolves.toBe(1);
     expect(harness.controller.stop).not.toHaveBeenCalled();
   });
 });

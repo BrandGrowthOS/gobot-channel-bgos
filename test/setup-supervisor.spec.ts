@@ -23,6 +23,7 @@ describe("stable supervisor paths", () => {
       directory: "/Users/kc/.gobot/supervisor",
       wrapper: "/Users/kc/.gobot/supervisor/daemon-wrapper.js",
       selfUpdate: "/Users/kc/.gobot/supervisor/self-update.js",
+      stateHome: "/Users/kc/.gobot/supervisor/state-home.js",
       versionPolicy: "/Users/kc/.gobot/supervisor/update-version-policy.js",
     });
     expect(
@@ -35,6 +36,10 @@ describe("stable supervisor paths", () => {
         source: "/package/dist/update-version-policy.js",
         destination:
           "/Users/kc/.gobot/supervisor/update-version-policy.js",
+      },
+      {
+        source: "/package/dist/state-home.js",
+        destination: "/Users/kc/.gobot/supervisor/state-home.js",
       },
       {
         source: "/package/dist/self-update.js",

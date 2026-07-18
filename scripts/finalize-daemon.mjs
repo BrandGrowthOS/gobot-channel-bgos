@@ -17,6 +17,7 @@ const BIN_FILES = [
 
 const SUPERVISOR_DEPENDENCIES = [
   "dist/self-update.js",
+  "dist/state-home.js",
   "dist/update-version-policy.js",
 ];
 

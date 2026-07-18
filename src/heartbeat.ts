@@ -13,8 +13,9 @@
  * but the local file keeps writing so the watchdog can see the lastError.
  */
 import { mkdirSync, renameSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, join } from "node:path";
+
+import { resolveGobotStateHome } from "./state-home.js";
 
 export interface HeartbeatLastError {
   code: string;
@@ -53,9 +54,10 @@ export interface HeartbeatDeps {
 
 const FILE_INTERVAL_MS = 30_000;
 
-function heartbeatPath(): string {
-  const root = process.env.GOBOT_HOME ?? join(homedir(), ".gobot");
-  return join(root, "bgos_heartbeat.json");
+export function heartbeatStatePath(
+  env: Record<string, string | undefined> = process.env,
+): string {
+  return join(resolveGobotStateHome(env), "bgos_heartbeat.json");
 }
 
 function resolveNetworkIntervalMs(): number {
@@ -192,7 +194,7 @@ export class HeartbeatController {
 
   private writeFile(): void {
     try {
-      const target = heartbeatPath();
+      const target = heartbeatStatePath();
       mkdirSync(dirname(target), { recursive: true });
       const tmp = `${target}.${process.pid}.tmp`;
       writeFileSync(tmp, JSON.stringify(this.snapshotFile(), null, 2), {

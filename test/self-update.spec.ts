@@ -294,6 +294,42 @@ describe("rollback state machine", () => {
     expect(healthy.state.pending).toBeNull();
   });
 
+  it("resets the crash streak after a clean shutdown", () => {
+    let result = transitionRollbackState(staged(), {
+      type: "boot",
+      nowMs: 1,
+      currentCommit: targetCommit,
+    });
+    result = transitionRollbackState(result.state, {
+      type: "boot",
+      nowMs: 2,
+      currentCommit: targetCommit,
+    });
+    expect(result.state.pending?.crashCount).toBe(1);
+
+    result = transitionRollbackState(result.state, {
+      type: "clean-shutdown",
+      currentCommit: targetCommit,
+    });
+    expect(result.state.pending).toMatchObject({
+      crashCount: 0,
+      bootStartedAtMs: null,
+    });
+
+    result = transitionRollbackState(result.state, {
+      type: "boot",
+      nowMs: 3,
+      currentCommit: targetCommit,
+    });
+    result = transitionRollbackState(result.state, {
+      type: "boot",
+      nowMs: 4,
+      currentCommit: targetCommit,
+    });
+    expect(result.action).toBe("continue");
+    expect(result.state.pending?.crashCount).toBe(1);
+  });
+
   it("keeps rollback disabled until off is observed before on", () => {
     let result = transitionRollbackState(staged(), { type: "rolled-back" });
     expect(result.action).toBe("disabled");
@@ -394,6 +430,123 @@ describe("wrapped boot ownership", () => {
     expect(readAutoUpdateState(statePath).pending?.bootStartedAtMs).toBe(100);
     parent.stop();
     expect(readAutoUpdateState(statePath).pending?.bootStartedAtMs).toBeNull();
+  });
+
+  it("fails closed when the parent cannot persist the pre-import boot marker", async () => {
+    const root = tempDir();
+    writeFileSync(join(root, "package.json"), JSON.stringify({ name: "gobot" }));
+    const runner: CommandRunner = (_command, args) => {
+      const key = args.join(" ");
+      if (key === "rev-parse --show-toplevel") {
+        return { status: 0, stdout: root + "\n", stderr: "" };
+      }
+      if (key === "rev-parse HEAD") {
+        return { status: 0, stdout: targetCommit + "\n", stderr: "" };
+      }
+      return { status: 1, stdout: "", stderr: "unexpected command" };
+    };
+    const env: Record<string, string | undefined> = {
+      BGOS_AUTO_UPDATE: "on",
+    };
+    const log = vi.fn();
+    const controller = new AutoUpdateController({
+      env,
+      checkoutDir: root,
+      runner,
+      preImportOnly: true,
+      stateWriter: () => {
+        throw new Error("disk full");
+      },
+      log,
+    });
+
+    await expect(controller.start()).resolves.toBe("retry-required");
+    expect(env[WRAPPED_BOOT_COMMIT_ENV]).toBeUndefined();
+    expect(log).toHaveBeenCalledWith(
+      expect.stringContaining("Gobot was not started"),
+    );
+  });
+
+  it("fails closed when the parent cannot read durable boot state", async () => {
+    const root = tempDir();
+    const runner = vi.fn<CommandRunner>();
+    const log = vi.fn();
+    const controller = new AutoUpdateController({
+      env: { BGOS_AUTO_UPDATE: "on" },
+      checkoutDir: root,
+      runner,
+      preImportOnly: true,
+      stateReader: () => {
+        throw new Error("state read failed");
+      },
+      log,
+    });
+
+    await expect(controller.start()).resolves.toBe("retry-required");
+    expect(runner).not.toHaveBeenCalled();
+    expect(log).toHaveBeenCalledWith(
+      expect.stringContaining("Gobot was not started"),
+    );
+  });
+
+  it("retries healthy persistence while rollback protection stays armed", async () => {
+    const root = tempDir();
+    const statePath = join(root, "bgos_auto_update.json");
+    writeFileSync(join(root, "package.json"), JSON.stringify({ name: "gobot" }));
+    const booted = transitionRollbackState(
+      transitionRollbackState(EMPTY_AUTO_UPDATE_STATE, {
+        type: "update-staged",
+        previousCommit,
+        previousPluginVersion: "0.15.0",
+        targetCommit,
+        targetPluginVersion: "0.15.1",
+        dependencyFilesChanged: false,
+        upstreamRef: "refs/remotes/origin/bgos-integration",
+      }).state,
+      { type: "boot", nowMs: 100, currentCommit: targetCommit },
+    ).state;
+    writeAutoUpdateState(statePath, booted);
+    const runner: CommandRunner = (_command, args) => {
+      const key = args.join(" ");
+      if (key === "rev-parse --show-toplevel") {
+        return { status: 0, stdout: root + "\n", stderr: "" };
+      }
+      if (key === "rev-parse HEAD") {
+        return { status: 0, stdout: targetCommit + "\n", stderr: "" };
+      }
+      return { status: 1, stdout: "", stderr: "unexpected command" };
+    };
+    const timers: Array<{ callback: () => void; delay: number }> = [];
+    const setTimer = vi.fn((callback: () => void, delay: number) => {
+      timers.push({ callback, delay });
+      return { unref: vi.fn() } as unknown as NodeJS.Timeout;
+    });
+    const log = vi.fn();
+    const controller = new AutoUpdateController({
+      env: {
+        BGOS_AUTO_UPDATE: "on",
+        [WRAPPED_BOOT_COMMIT_ENV]: targetCommit,
+      },
+      checkoutDir: root,
+      statePath,
+      runner,
+      now: () => 100,
+      setTimer,
+      stateWriter: () => {
+        throw new Error("disk full");
+      },
+      log,
+    });
+
+    await expect(controller.start()).resolves.toBe("running");
+    expect(timers[0]?.delay).toBe(HEALTHY_BOOT_MS);
+    timers.shift()?.callback();
+    expect(timers[0]?.delay).toBe(ACTIVE_WORK_RETRY_MS);
+    expect(readAutoUpdateState(statePath).pending).not.toBeNull();
+    expect(log).toHaveBeenCalledWith(
+      expect.stringContaining("rollback protection remains armed"),
+    );
+    controller.stop();
   });
 });
 
@@ -525,6 +678,9 @@ describe("git update inspection", () => {
       targetCommit,
       runningDaemonVersion,
       candidateDaemonVersion,
+      targetDaemonVersion: candidateDaemonVersion,
+      checkoutUpdateRequired: true,
+      daemonUpdateRequired: true,
       dependencyFilesChanged: true,
     });
     expect(calls.map((call) => [call.command, ...call.args])).toContainEqual([
@@ -541,6 +697,52 @@ describe("git update inspection", () => {
       calls.some((call) => call.args.some((arg) => arg.includes("touch"))),
     ).toBe(false);
     expect(calls.slice(1).every((call) => call.cwd === calls[1].cwd)).toBe(true);
+  });
+
+  it("applies a fork-only fast-forward when the registry daemon is current", async () => {
+    const root = tempDir();
+    const statePath = join(root, "state.json");
+    writeFileSync(
+      join(root, "package.json"),
+      JSON.stringify({ name: "gobot", version: "2.1.0" }),
+    );
+    const fixture = fixtureRunner(root);
+    const calls: string[] = [];
+    const runner: CommandRunner = (command, args, cwd) => {
+      calls.push([command, ...args].join(" "));
+      if (command === "git" && args[0] === "merge") {
+        return { status: 0, stdout: "fast-forwarded", stderr: "" };
+      }
+      if (command === "bun") {
+        return { status: 0, stdout: "installed", stderr: "" };
+      }
+      return fixture.runner(command, args, cwd);
+    };
+    const restart = vi.fn();
+    const controller = new AutoUpdateController({
+      env: { BGOS_AUTO_UPDATE: "on" },
+      checkoutDir: root,
+      runningDaemonVersion,
+      registryVersionReader: async () => runningDaemonVersion,
+      statePath,
+      runner,
+      restart,
+      installedPluginVersionReader: () => runningDaemonVersion,
+    });
+
+    await expect(controller.start()).resolves.toBe("exit-requested");
+    expect(calls).toContain(`git merge --ff-only ${targetCommit}`);
+    expect(calls).toContain(
+      `bun install gobot-channel-bgos@${runningDaemonVersion} --no-save`,
+    );
+    expect(restart).toHaveBeenCalledWith(0);
+    expect(readAutoUpdateState(statePath).pending).toMatchObject({
+      previousCommit: currentCommit,
+      targetCommit,
+      previousPluginVersion: runningDaemonVersion,
+      targetPluginVersion: runningDaemonVersion,
+      dependencyFilesChanged: true,
+    });
   });
 
   it("installs a newer exact registry daemon even when the fork commit is unchanged", async () => {
@@ -864,7 +1066,10 @@ describe("git update inspection", () => {
       events.push("drain");
     });
     const exit = vi.fn(() => {
-      events.push("exit 0");
+      events.push("direct exit");
+    });
+    const restart = vi.fn(() => {
+      events.push("restart 0");
     });
     const shutdown = vi.fn(async () => {
       events.push("shutdown");
@@ -879,6 +1084,7 @@ describe("git update inspection", () => {
       drain,
       shutdown,
       exit,
+      restart,
       bunPath: "bun",
       installedPluginVersionReader: () => candidateDaemonVersion,
     });
@@ -895,7 +1101,9 @@ describe("git update inspection", () => {
     expect(installIndex).toBeGreaterThan(mergeIndex);
     expect(pluginInstallIndex).toBeGreaterThan(installIndex);
     expect(events.indexOf("shutdown")).toBeGreaterThan(pluginInstallIndex);
-    expect(events.at(-1)).toBe("exit 0");
+    expect(events.at(-1)).toBe("restart 0");
+    expect(restart).toHaveBeenCalledWith(0);
+    expect(exit).not.toHaveBeenCalled();
     expect(readAutoUpdateState(statePath).pending).toMatchObject({
       previousCommit: currentCommit,
       targetCommit,
@@ -905,7 +1113,7 @@ describe("git update inspection", () => {
     });
   });
 
-  it("keeps update recovery pending when dependency recovery also fails", async () => {
+  it("fails closed when neither previous nor target recovery can be verified", async () => {
     const root = tempDir();
     const statePath = join(root, "state", "bgos_auto_update.json");
     writeFileSync(
@@ -927,6 +1135,9 @@ describe("git update inspection", () => {
       return fixture.runner(command, args, cwd);
     };
     const setTimer = vi.fn();
+    const resume = vi.fn(async () => undefined);
+    const shutdown = vi.fn(async () => undefined);
+    const restart = vi.fn();
     const controller = new AutoUpdateController({
       env: { BGOS_AUTO_UPDATE: "on" },
       checkoutDir: root,
@@ -935,10 +1146,13 @@ describe("git update inspection", () => {
       statePath,
       runner,
       setTimer,
+      resume,
+      shutdown,
+      restart,
       bunPath: "bun",
     });
 
-    await expect(controller.start()).resolves.toBe("running");
+    await expect(controller.start()).resolves.toBe("exit-requested");
     expect(readAutoUpdateState(statePath)).toMatchObject({
       disabled: false,
       resetSeen: false,
@@ -949,7 +1163,133 @@ describe("git update inspection", () => {
         rollbackRequired: true,
       },
     });
+    expect(resume).not.toHaveBeenCalled();
+    expect(shutdown).toHaveBeenCalledOnce();
+    expect(restart).toHaveBeenCalledWith(0);
     expect(setTimer).not.toHaveBeenCalled();
+  });
+
+  it("verifies the target after previous recovery fails and restarts without resuming", async () => {
+    const root = tempDir();
+    const statePath = join(root, "state", "bgos_auto_update.json");
+    writeFileSync(
+      join(root, "package.json"),
+      JSON.stringify({ name: "gobot", version: "2.1.0" }),
+    );
+    writeFileSync(join(root, "bun.lock"), "lock");
+    const fixture = fixtureRunner(root);
+    const calls: string[] = [];
+    let installDependenciesCount = 0;
+    let targetPluginAttempts = 0;
+    let installedVersion: string | null = runningDaemonVersion;
+    const runner: CommandRunner = (command, args, cwd) => {
+      const key = args.join(" ");
+      calls.push([command, key].join(" "));
+      if (command === "git" && args[0] === "merge") {
+        return { status: 0, stdout: "fast-forwarded", stderr: "" };
+      }
+      if (command === "git" && args[0] === "checkout") {
+        return { status: 0, stdout: "checked out", stderr: "" };
+      }
+      if (command === "bun" && key === "install") {
+        installDependenciesCount += 1;
+        return installDependenciesCount === 2
+          ? { status: 1, stdout: "", stderr: "previous install failed" }
+          : { status: 0, stdout: "installed", stderr: "" };
+      }
+      if (
+        command === "bun" &&
+        key === `install gobot-channel-bgos@${candidateDaemonVersion} --no-save`
+      ) {
+        targetPluginAttempts += 1;
+        if (targetPluginAttempts === 1) {
+          return { status: 1, stdout: "", stderr: "target install failed" };
+        }
+        installedVersion = candidateDaemonVersion;
+        return { status: 0, stdout: "installed target", stderr: "" };
+      }
+      if (
+        command === "bun" &&
+        key === `install gobot-channel-bgos@${runningDaemonVersion} --no-save`
+      ) {
+        installedVersion = runningDaemonVersion;
+        return { status: 0, stdout: "installed previous", stderr: "" };
+      }
+      return fixture.runner(command, args, cwd);
+    };
+    const resume = vi.fn(async () => undefined);
+    const shutdown = vi.fn(async () => undefined);
+    const restart = vi.fn();
+    const log = vi.fn();
+    const controller = new AutoUpdateController({
+      env: { BGOS_AUTO_UPDATE: "on" },
+      checkoutDir: root,
+      runningDaemonVersion,
+      registryVersionReader,
+      statePath,
+      runner,
+      resume,
+      shutdown,
+      restart,
+      log,
+      bunPath: "bun",
+      installedPluginVersionReader: () => installedVersion,
+    });
+
+    await expect(controller.start()).resolves.toBe("exit-requested");
+    expect(calls).toContain(`git checkout --detach ${currentCommit}`);
+    expect(calls).toContain(`git checkout --detach ${targetCommit}`);
+    expect(targetPluginAttempts).toBe(2);
+    expect(resume).not.toHaveBeenCalled();
+    expect(shutdown).toHaveBeenCalledOnce();
+    expect(restart).toHaveBeenCalledWith(0);
+    expect(log).toHaveBeenCalledWith(
+      expect.stringContaining("verified target is retained"),
+    );
+    expect(readAutoUpdateState(statePath).pending).toMatchObject({
+      rollbackRequired: true,
+      previousCommit: currentCommit,
+      targetCommit,
+    });
+  });
+
+  it("fails closed on an unexpected error after the checkout changes", async () => {
+    const root = tempDir();
+    const statePath = join(root, "state.json");
+    writeFileSync(join(root, "package.json"), JSON.stringify({ name: "gobot" }));
+    const fixture = fixtureRunner(root);
+    const runner: CommandRunner = (command, args, cwd) => {
+      if (command === "git" && args[0] === "merge") {
+        return { status: 0, stdout: "fast-forwarded", stderr: "" };
+      }
+      if (command === "bun") {
+        return { status: 0, stdout: "installed", stderr: "" };
+      }
+      return fixture.runner(command, args, cwd);
+    };
+    const resume = vi.fn(async () => undefined);
+    const shutdown = vi.fn(async () => undefined);
+    const restart = vi.fn();
+    const controller = new AutoUpdateController({
+      env: { BGOS_AUTO_UPDATE: "on" },
+      checkoutDir: root,
+      runningDaemonVersion,
+      registryVersionReader,
+      statePath,
+      runner,
+      resume,
+      shutdown,
+      restart,
+      installedPluginVersionReader: () => {
+        throw new Error("verification exploded");
+      },
+    });
+
+    await expect(controller.start()).resolves.toBe("exit-requested");
+    expect(resume).not.toHaveBeenCalled();
+    expect(shutdown).toHaveBeenCalledOnce();
+    expect(restart).toHaveBeenCalledWith(0);
+    expect(readAutoUpdateState(statePath).pending).not.toBeNull();
   });
 
   it("keeps rollback retryable when rollback dependencies cannot be restored", async () => {

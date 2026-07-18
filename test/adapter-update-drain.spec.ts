@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { BGOSAdapter } from "../src/adapter.js";
+import {
+  BGOSAdapter,
+  requestGracefulHostRestart,
+} from "../src/adapter.js";
 
 const TOKEN = "pair_" + "x".repeat(30);
 
@@ -23,6 +26,14 @@ function makeAdapter(): BGOSAdapter {
 }
 
 describe("BGOSAdapter update drain", () => {
+  it("requests the host SIGTERM shutdown path instead of exiting directly", () => {
+    const kill = vi.fn(() => true);
+
+    requestGracefulHostRestart({ pid: 4242, kill });
+
+    expect(kill).toHaveBeenCalledWith(4242, "SIGTERM");
+  });
+
   it("waits for an outbound spool send after its durable entry is claimed", async () => {
     const adapter = makeAdapter();
     let releaseSend: (() => void) | undefined;

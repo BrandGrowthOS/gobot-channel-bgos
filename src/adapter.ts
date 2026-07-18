@@ -56,6 +56,7 @@ import {
   VoiceRpcHandler,
   type VoiceConfig,
 } from "./voice-rpc.js";
+
 import {
   PairingRevokedError,
   type AssistantBoundPayload,
@@ -65,6 +66,19 @@ import {
   type PairingRevokedPayload,
   type PluginConfig,
 } from "./types.js";
+
+export interface HostRestartSignalTarget {
+  pid: number;
+  kill(pid: number, signal: NodeJS.Signals): boolean;
+}
+
+export function requestGracefulHostRestart(
+  target: HostRestartSignalTarget = process,
+): void {
+  if (!target.kill(target.pid, "SIGTERM")) {
+    throw new Error("host process did not accept SIGTERM");
+  }
+}
 
 /** Info passed to `onFatal` when the pairing becomes unusable (C2). */
 export interface FatalInfo {
@@ -191,6 +205,7 @@ export class BGOSAdapter {
       drain: () => this.drainForUpdate(),
       resume: () => this.resumeAfterUpdateFailure(),
       shutdown: () => this.stop(),
+      restart: () => requestGracefulHostRestart(),
       hasActiveWork: () => this.activeMessageCount > 0,
       ...(process.execPath.endsWith("bun") ? { bunPath: process.execPath } : {}),
     });

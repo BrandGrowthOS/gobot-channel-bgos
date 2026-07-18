@@ -567,7 +567,7 @@ describe("consult", () => {
 });
 
 // ---------------------------------------------------------------------
-// dispatch (accept-first + detached run)
+// dispatch (accept-first with an awaitable run)
 // ---------------------------------------------------------------------
 
 function dispatchFrame(over: Partial<VoiceRpcFrame> = {}): VoiceRpcFrame {
@@ -640,7 +640,7 @@ describe("dispatch", () => {
     expect(calls.taskResults[0]!.body.error!.code).toBe("NO_REPLY");
   });
 
-  it("dedupes detached runs by taskId across distinct rpcIds", async () => {
+  it("dedupes accepted runs by taskId across distinct rpcIds", async () => {
     let finishTurn: () => void = () => {};
     const turnGate = new Promise<void>((r) => (finishTurn = r));
     const { handler, calls } = makeHarness({
@@ -649,12 +649,42 @@ describe("dispatch", () => {
         await args.replyHandle.sendText("done");
       },
     });
-    await handler.handle(dispatchFrame({ rpcId: "rpc-a" }));
+    const first = handler.handle(dispatchFrame({ rpcId: "rpc-a" }));
     await waitUntil(() => calls.dispatches.length === 1);
     await handler.handle(dispatchFrame({ rpcId: "rpc-b" }));
     expect(calls.dispatches).toHaveLength(1); // second run never started
     finishTurn();
-    await waitUntil(() => calls.taskResults.length === 1);
+    await first;
+    expect(calls.taskResults).toHaveLength(1);
+  });
+
+  it("keeps the accepted dispatch awaitable until the real run finishes", async () => {
+    let finishTurn: () => void = () => {};
+    const turnGate = new Promise<void>((resolve) => {
+      finishTurn = resolve;
+    });
+    const { handler, calls } = makeHarness({
+      dispatchImpl: async (args) => {
+        await turnGate;
+        await args.replyHandle.sendText("done");
+      },
+    });
+    let settled = false;
+    const handled = handler.handle(dispatchFrame()).then(() => {
+      settled = true;
+    });
+
+    await waitUntil(() => calls.results.length === 1);
+    expect(calls.results[0]!.body).toMatchObject({
+      ok: true,
+      payload: { accepted: true },
+    });
+    expect(settled).toBe(false);
+
+    finishTurn();
+    await handled;
+    expect(settled).toBe(true);
+    expect(calls.taskResults).toHaveLength(1);
   });
 
   it("retries a failed voice-task result post once", async () => {
