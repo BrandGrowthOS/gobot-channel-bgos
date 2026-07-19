@@ -2,6 +2,13 @@ import type { BgosApi } from "./bgos-api.js";
 import { publishMediaPath } from "./attachment-bridge.js";
 import { sanitizeFromAgent } from "./agent-identity.js";
 import {
+  dispatchMissionOps,
+  MISSION_MARKER_OPEN,
+  parseMissionMarkers,
+  type MissionDispatchState,
+  type MissionOp,
+} from "./mission-markers.js";
+import {
   classifyOutboundError,
   OUTBOUND_BACKOFFS_MS,
 } from "./outbound-retry.js";
@@ -57,6 +64,7 @@ export class BgosOutbound {
     | null = null;
   private onLastError: ((code: string, message: string) => void) | null = null;
   private onOutbound: (() => void) | null = null;
+  private readonly missionStates = new Map<number, MissionDispatchState>();
   /** Single-flight guard for replaySpool: concurrent callers (the 60s spool
    *  timer, onReconnect, recover) await the same in-flight run instead of each
    *  loading + re-sending the same spooled entries (double-send). */
@@ -99,6 +107,25 @@ export class BgosOutbound {
       : this.api.postMessage(payload);
   }
 
+  private queueMissionOps(assistantId: number, ops: MissionOp[]): void {
+    let state = this.missionStates.get(assistantId);
+    if (!state) {
+      state = {};
+      this.missionStates.set(assistantId, state);
+    }
+
+    void dispatchMissionOps(this.api, assistantId, ops, state).catch((error) => {
+      const message = error instanceof Error ? error.message : String(error);
+      try {
+        console.warn(
+          `[gobot-channel-bgos] mission queue failed for assistant ${assistantId}: ${message}`,
+        );
+      } catch {
+        // Logging must not create an unhandled rejection.
+      }
+    });
+  }
+
   /**
    * Pick the reply endpoint + apply the outbound retry policy (contract C3).
    *
@@ -115,12 +142,14 @@ export class BgosOutbound {
   private async deliver(
     payload: OutboundMessagePayload,
     replyVia?: "messages" | "send-message",
+    mission?: { assistantId: number; ops: MissionOp[] },
   ): Promise<{ id: number }> {
     let attempt = 0;
     for (;;) {
       try {
         const r = await this.rawSend(payload, replyVia);
         this.onOutbound?.();
+        if (mission) this.queueMissionOps(mission.assistantId, mission.ops);
         return r;
       } catch (err) {
         const cls = classifyOutboundError(err);
@@ -137,6 +166,7 @@ export class BgosOutbound {
             ts: Date.now(),
             payload,
             ...(replyVia ? { replyVia } : {}),
+            ...(mission ? { mission } : {}),
           });
         }
         this.onLastError?.("outbound_failed", message);
@@ -178,6 +208,9 @@ export class BgosOutbound {
       try {
         await this.rawSend(entry.payload, entry.replyVia);
         this.onOutbound?.();
+        if (entry.mission && Array.isArray(entry.mission.ops)) {
+          this.queueMissionOps(entry.mission.assistantId, entry.mission.ops);
+        }
       } catch (err) {
         const cls = classifyOutboundError(err);
         if (cls.retriable) appendOutbox(entry);
@@ -218,7 +251,19 @@ export class BgosOutbound {
       ...(fromAgent ? { fromAgent } : {}),
       ...(params.replyToId !== undefined && { replyToId: params.replyToId }),
     };
-    return this.deliver(payload, params.replyVia);
+    if (!params.text.includes(MISSION_MARKER_OPEN)) {
+      return this.deliver(payload, params.replyVia);
+    }
+
+    const parsed = parseMissionMarkers(params.text);
+    payload.text = parsed.cleanText;
+    return this.deliver(
+      payload,
+      params.replyVia,
+      parsed.ops.length > 0
+        ? { assistantId: params.assistantId, ops: parsed.ops }
+        : undefined,
+    );
   }
 
   /**

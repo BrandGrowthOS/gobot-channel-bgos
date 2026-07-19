@@ -130,6 +130,23 @@ export { loadLastId, saveLastId } from "./last-id-store.js";
 export { ApprovalHandler, type ApprovalDecision } from "./approval-handler.js";
 export { CommandsSync } from "./commands-sync.js";
 export { BgosApi } from "./bgos-api.js";
+export {
+  dispatchMissionOps,
+  MISSION_MARKER_CLOSE,
+  MISSION_MARKER_OPEN,
+  parseMissionMarkers,
+  type AbandonMissionOp,
+  type CompleteMissionOp,
+  type CreateMissionOp,
+  type MissionApi,
+  type MissionDispatchState,
+  type MissionMarkerOp,
+  type MissionMarkerParseResult,
+  type MissionOp,
+  type ParsedMissionMarkers,
+  type ProgressMissionOp,
+  type TickMissionOp,
+} from "./mission-markers.js";
 export { BgosWs } from "./bgos-ws.js";
 export {
   pairBgos,

@@ -22,6 +22,49 @@ interface ConditionalGetCacheEntry {
   body: unknown;
 }
 
+export interface MissionMiniGoalInput {
+  name: string;
+  doneWhen: string;
+}
+
+export interface MissionProgressInput {
+  current: number;
+  total: number;
+  label?: string;
+}
+
+export interface MissionDto {
+  id: number;
+  [key: string]: unknown;
+}
+
+export interface MissionMutationResponse {
+  ok: true;
+  mission: MissionDto;
+}
+
+export interface CreateMissionBody {
+  title: string;
+  miniGoals?: MissionMiniGoalInput[];
+  progress?: MissionProgressInput;
+  origin: "self_report";
+  firstFeedText?: string;
+}
+
+export interface TickMissionBody {
+  goalId: number;
+  evidence?: string;
+}
+
+export interface ProgressMissionBody {
+  progress?: MissionProgressInput;
+  feedEntry?: { kind: "worked"; text: string };
+}
+
+export interface CompleteMissionBody {
+  summary?: string;
+}
+
 /**
  * Thin typed wrapper around the BGOS integration endpoints. All methods
  * attach the X-BGOS-Pairing header from cfg.pairingToken.
@@ -415,6 +458,79 @@ export class BgosApi {
       `integrations/assistants/${assistantId}/status`,
       body,
     );
+  }
+
+  /** Create or replace the assistant's open self-report mission. */
+  async createMission(
+    assistantId: number,
+    body: CreateMissionBody,
+  ): Promise<MissionMutationResponse> {
+    const r = await this.http.post(
+      `integrations/assistants/${assistantId}/missions`,
+      body,
+    );
+    return r.data;
+  }
+
+  /** Resolve the assistant's currently open mission, if any. */
+  async getActiveMission(assistantId: number): Promise<{
+    mission: MissionDto | null;
+  }> {
+    const r = await this.http.get(
+      `integrations/assistants/${assistantId}/missions/active`,
+    );
+    return r.data;
+  }
+
+  /** Mark one binary mini-goal complete. */
+  async tickMiniGoal(
+    assistantId: number,
+    missionId: number,
+    body: TickMissionBody,
+  ): Promise<MissionMutationResponse> {
+    const r = await this.http.patch(
+      `integrations/assistants/${assistantId}/missions/${missionId}/tick`,
+      body,
+    );
+    return r.data;
+  }
+
+  /** Record countable progress and an optional worked feed entry. */
+  async updateMissionProgress(
+    assistantId: number,
+    missionId: number,
+    body: ProgressMissionBody,
+  ): Promise<MissionMutationResponse> {
+    const r = await this.http.patch(
+      `integrations/assistants/${assistantId}/missions/${missionId}/progress`,
+      body,
+    );
+    return r.data;
+  }
+
+  /** Complete the assistant's open mission. */
+  async completeMission(
+    assistantId: number,
+    missionId: number,
+    body: CompleteMissionBody = {},
+  ): Promise<MissionMutationResponse> {
+    const r = await this.http.patch(
+      `integrations/assistants/${assistantId}/missions/${missionId}/complete`,
+      body,
+    );
+    return r.data;
+  }
+
+  /** Abandon the assistant's open mission. */
+  async abandonMission(
+    assistantId: number,
+    missionId: number,
+  ): Promise<MissionMutationResponse> {
+    const r = await this.http.patch(
+      `integrations/assistants/${assistantId}/missions/${missionId}/abandon`,
+      {},
+    );
+    return r.data;
   }
 
   /**
