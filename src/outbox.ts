@@ -22,6 +22,7 @@ import {
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
+import type { MissionOp } from "./mission-markers.js";
 import type { OutboundMessagePayload } from "./types.js";
 
 export interface OutboxEntry {
@@ -29,6 +30,8 @@ export interface OutboxEntry {
   ts: number;
   payload: OutboundMessagePayload;
   replyVia?: "messages" | "send-message";
+  /** Side effects stripped from the reply and deferred until delivery. */
+  mission?: { assistantId: number; ops: MissionOp[] };
 }
 
 const MAX_ENTRIES = 200;
