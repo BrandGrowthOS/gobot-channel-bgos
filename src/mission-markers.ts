@@ -11,6 +11,9 @@ export const MISSION_MARKER_CLOSE = "[[/BGOS_MISSION]]";
 const MISSION_BLOCK_RE =
   /\[\[BGOS_MISSION\]\]([\s\S]*?)\[\[\/BGOS_MISSION\]\]/g;
 
+export const MAX_MISSION_OPS_PER_REPLY = 16;
+export const MAX_MISSION_BLOCK_BODY = 8192;
+
 const TITLE_MAX = 200;
 const MINI_GOAL_NAME_MAX = 120;
 const DONE_WHEN_MAX = 200;
@@ -82,7 +85,15 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function truncateString(value: unknown, max: number): string | undefined {
-  return typeof value === "string" ? value.slice(0, max) : undefined;
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  let truncated = trimmed.slice(0, max);
+  const lastCodeUnit = truncated.charCodeAt(truncated.length - 1);
+  if (lastCodeUnit >= 0xd800 && lastCodeUnit <= 0xdbff) {
+    truncated = truncated.slice(0, -1);
+  }
+  return truncated || undefined;
 }
 
 function numericValue(value: unknown): number | undefined {
@@ -96,9 +107,9 @@ function numericValue(value: unknown): number | undefined {
 
 function positiveInteger(value: unknown): number | undefined {
   const numeric = numericValue(value);
-  if (numeric === undefined) return undefined;
-  const integer = Math.trunc(numeric);
-  return integer > 0 ? integer : undefined;
+  return numeric !== undefined && Number.isInteger(numeric) && numeric >= 1
+    ? numeric
+    : undefined;
 }
 
 function integerAtLeast(value: unknown, minimum: number): number | undefined {
@@ -189,6 +200,12 @@ export function parseMissionMarkers(text: string): ParsedMissionMarkers {
 
   const ops: MissionOp[] = [];
   const cleanText = text.replace(MISSION_BLOCK_RE, (_block, body: string) => {
+    if (
+      ops.length >= MAX_MISSION_OPS_PER_REPLY ||
+      body.length > MAX_MISSION_BLOCK_BODY
+    ) {
+      return "";
+    }
     try {
       const op = parseMissionOp(JSON.parse(body));
       if (op) ops.push(op);
@@ -214,6 +231,15 @@ function missionIdFrom(value: unknown): number | undefined {
   return typeof id === "number" && Number.isInteger(id) && id > 0
     ? id
     : undefined;
+}
+
+function isTerminalMission(value: unknown): boolean {
+  if (!isRecord(value)) return false;
+  return (
+    value.status === "completed" ||
+    value.status === "abandoned" ||
+    value.status === "failed"
+  );
 }
 
 async function resolveMissionId(
@@ -285,10 +311,20 @@ async function runMissionOps(
           attemptedMissionId = await resolveMissionId(api, assistantId, state);
           if (attemptedMissionId === undefined) break;
           patchAttempted = true;
-          await api.tickMiniGoal(assistantId, attemptedMissionId, {
-            goalId: op.goalId,
-            ...(op.evidence !== undefined ? { evidence: op.evidence } : {}),
-          });
+          const response = await api.tickMiniGoal(
+            assistantId,
+            attemptedMissionId,
+            {
+              goalId: op.goalId,
+              ...(op.evidence !== undefined ? { evidence: op.evidence } : {}),
+            },
+          );
+          if (
+            isTerminalMission(response.mission) &&
+            state.missionId === attemptedMissionId
+          ) {
+            delete state.missionId;
+          }
           break;
         }
         case "progress": {
@@ -323,12 +359,13 @@ async function runMissionOps(
         }
       }
     } catch (error) {
+      const status = responseStatus(error);
       if (op.op === "create") {
         delete state.missionId;
         blockedByFailedCreate = true;
       } else if (
         patchAttempted &&
-        responseStatus(error) === 404 &&
+        (status === 404 || status === 409 || status === 410) &&
         attemptedMissionId !== undefined &&
         state.missionId === attemptedMissionId
       ) {

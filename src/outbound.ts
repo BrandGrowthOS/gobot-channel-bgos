@@ -175,6 +175,36 @@ export class BgosOutbound {
     }
   }
 
+  private deliverMissionAware(
+    payload: OutboundMessagePayload,
+    replyVia?: "messages" | "send-message",
+  ): Promise<{ id: number }> {
+    if (!payload.text.includes(MISSION_MARKER_OPEN)) {
+      return this.deliver(payload, replyVia);
+    }
+
+    const parsed = parseMissionMarkers(payload.text);
+    payload.text = parsed.cleanText;
+    if (
+      parsed.ops.length > 0 &&
+      parsed.cleanText.trim() === "" &&
+      payload.options === undefined &&
+      payload.approvalMeta === undefined &&
+      payload.files === undefined
+    ) {
+      this.queueMissionOps(payload.assistantId, parsed.ops);
+      return Promise.resolve({ id: 0 });
+    }
+
+    return this.deliver(
+      payload,
+      replyVia,
+      parsed.ops.length > 0
+        ? { assistantId: payload.assistantId, ops: parsed.ops }
+        : undefined,
+    );
+  }
+
   /**
    * Replay any spooled outbound payloads (contract C3). Called by the adapter
    * on WS reconnect and every 60s while non-empty. Entries older than 24h are
@@ -251,19 +281,7 @@ export class BgosOutbound {
       ...(fromAgent ? { fromAgent } : {}),
       ...(params.replyToId !== undefined && { replyToId: params.replyToId }),
     };
-    if (!params.text.includes(MISSION_MARKER_OPEN)) {
-      return this.deliver(payload, params.replyVia);
-    }
-
-    const parsed = parseMissionMarkers(params.text);
-    payload.text = parsed.cleanText;
-    return this.deliver(
-      payload,
-      params.replyVia,
-      parsed.ops.length > 0
-        ? { assistantId: params.assistantId, ops: parsed.ops }
-        : undefined,
-    );
+    return this.deliverMissionAware(payload, params.replyVia);
   }
 
   /**
@@ -305,7 +323,7 @@ export class BgosOutbound {
       ...(fromAgent ? { fromAgent } : {}),
       ...(params.options ? { options: params.options } : {}),
     };
-    return this.api.postMessage(payload);
+    return this.deliverMissionAware(payload);
   }
 
   sendButtons(params: {
@@ -336,7 +354,7 @@ export class BgosOutbound {
       messageType: "standard",
       ...(params.replyToId !== undefined && { replyToId: params.replyToId }),
     };
-    return this.deliver(payload, params.replyVia);
+    return this.deliverMissionAware(payload, params.replyVia);
   }
 
   // -------------------------------------------------------------------
@@ -393,7 +411,7 @@ export class BgosOutbound {
       approvalMeta: params.meta,
       ...(params.replyToId !== undefined && { replyToId: params.replyToId }),
     };
-    return this.deliver(payload, params.replyVia);
+    return this.deliverMissionAware(payload, params.replyVia);
   }
 
   // -------------------------------------------------------------------
@@ -441,7 +459,7 @@ export class BgosOutbound {
       messageType: "ask_user_input" as OutboundMessagePayload["messageType"],
       options: params.options,
     };
-    return this.api.postMessage(payload);
+    return this.deliverMissionAware(payload);
   }
 
   // -------------------------------------------------------------------
@@ -474,7 +492,7 @@ export class BgosOutbound {
       files: [fileRef],
       ...(params.replyToId !== undefined && { replyToId: params.replyToId }),
     };
-    return this.deliver(payload, params.replyVia);
+    return this.deliverMissionAware(payload, params.replyVia);
   }
 
   /** Image — enforces image/* MIME if provided; otherwise lets MIME
@@ -536,7 +554,7 @@ export class BgosOutbound {
       text: `⚠ Agent error: ${params.reason}`,
       messageType: "agent_error",
     };
-    return this.api.postMessage(payload);
+    return this.deliverMissionAware(payload);
   }
 
   /**
