@@ -19,6 +19,17 @@ describe("agent-hints", () => {
     expect(BGOS_AGENT_HINTS).toContain("Slash commands");
   });
 
+  it("carries the Agent Boards marker grammar (offline fallback for the served canon)", () => {
+    expect(BGOS_AGENT_HINTS).toContain("[[BGOS_BOARDS]]");
+    expect(BGOS_AGENT_HINTS).toContain("[BGOS boards result]");
+    expect(BGOS_AGENT_HINTS).toContain("reqId");
+    // The pre-boards awareness line would be a lie now that the round trip
+    // is wired; it must never (re)appear in the fallback.
+    expect(BGOS_AGENT_HINTS).not.toContain(
+      "cannot call the board tools on this channel",
+    );
+  });
+
   it("starts with a separator the agent can find before injection", () => {
     expect(BGOS_AGENT_HINTS).toContain(
       "BGOS Channel — Agent Capabilities",

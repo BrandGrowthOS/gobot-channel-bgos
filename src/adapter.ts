@@ -26,6 +26,7 @@ import { BgosApi } from "./bgos-api.js";
 import { BgosWs } from "./bgos-ws.js";
 import { BgosOutbound } from "./outbound.js";
 import { ApprovalHandler } from "./approval-handler.js";
+import { BoardsOrchestrator } from "./boards-orchestrator.js";
 import { CommandsSync } from "./commands-sync.js";
 import { ToolProgressOrchestrator } from "./tool-progress.js";
 import { HeartbeatController } from "./heartbeat.js";
@@ -46,7 +47,7 @@ import {
 import { loadConfigFromEnv, loadConfigFromPluginCfg } from "./config.js";
 import { pendingUnknownStats } from "./pending-unknown-store.js";
 import { BGOS_AGENT_HINTS } from "./agent-hints.js";
-import { pickAgentHints } from "./capabilities.js";
+import { appendAgentHints, pickAgentHints } from "./capabilities.js";
 import {
   AutoUpdateController,
   decideDrainBeforeUpdate,
@@ -136,6 +137,11 @@ export class BGOSAdapter {
   readonly approvals: ApprovalHandler;
   readonly commandsSync: CommandsSync;
   readonly toolProgress: ToolProgressOrchestrator;
+  /** Agent Boards round trip ([[BGOS_BOARDS]] marker): strips the blocks
+   *  from agent replies, executes the board calls, and dispatches the
+   *  results back into the agent as one synthetic system turn. Public so
+   *  the fork can flush() on shutdown paths of its own. */
+  readonly boards: BoardsOrchestrator;
 
   private readonly cfg: PluginConfig;
   private readonly ws: BgosWs;
@@ -196,6 +202,39 @@ export class BGOSAdapter {
     this.approvals = new ApprovalHandler(this.outbound);
     this.commandsSync = new CommandsSync(this.api);
     this.toolProgress = new ToolProgressOrchestrator(this.api);
+    // Boards result turns re-enter the agent through the fork dispatch
+    // (the voice-lane mechanism); the context resolves lazily so the
+    // orchestrator works no matter when the fork calls setDispatch().
+    this.boards = new BoardsOrchestrator({
+      api: this.api,
+      getTurnContext: (assistantId, chatId) => {
+        const dispatch = this.dispatch;
+        const route = this.getRouteForAssistant(assistantId);
+        if (!dispatch || !route) return null;
+        return {
+          dispatch,
+          agentRoute: route,
+          userId: this.userId,
+          // Same per-dispatch hint injection as the inbound handler: the
+          // served capability canon when fetched, the bundled fallback
+          // otherwise.
+          systemPrompt: appendAgentHints(
+            this.getSystemPrompt(route),
+            this.cachedAgentHints,
+          ),
+          replyHandle: buildReplyHandle(
+            {
+              outbound: this.outbound,
+              toolProgress: this.toolProgress,
+              boards: this.boards,
+            },
+            { assistantId, chatId },
+          ),
+        };
+      },
+      // eslint-disable-next-line no-console
+      log: (msg) => console.warn("[gobot-channel-bgos] " + msg),
+    });
     this.heartbeat = new HeartbeatController({
       version: getPackageVersion(),
       postHeartbeat: (body) => this.api.postHeartbeat(body),
@@ -261,7 +300,11 @@ export class BGOSAdapter {
    */
   makeReplyHandle(assistantId: number, chatId: number): ReplyHandle {
     return buildReplyHandle(
-      { outbound: this.outbound, toolProgress: this.toolProgress },
+      {
+        outbound: this.outbound,
+        toolProgress: this.toolProgress,
+        boards: this.boards,
+      },
       { assistantId, chatId },
     );
   }
@@ -302,6 +345,7 @@ export class BGOSAdapter {
       getSystemPrompt: (route) => this.getSystemPrompt(route),
       getAgentHints: () => this.cachedAgentHints,
       toolProgress: this.toolProgress,
+      boards: this.boards,
       onInbound: () => this.heartbeat.recordInbound(),
       onUnknownAssistant: () => this.refreshScopeRateLimited(),
     });
@@ -437,6 +481,15 @@ export class BGOSAdapter {
     this.approvals.shutdown();
     this.ws.disconnect();
     this.toolProgress.dispose();
+    try {
+      // Drain in-flight boards executor tasks so a shutdown never abandons
+      // a half-answered board round trip. Deliberate divergence from
+      // Hermes, which CANCELS its tasks on disconnect: draining completes
+      // the round trip and is bounded by the api client's 30s timeout.
+      await this.boards.flush();
+    } catch {
+      /* swallow on shutdown, best effort */
+    }
     try {
       await this.commandsSync.flushAll();
     } catch {
@@ -697,6 +750,11 @@ export class BGOSAdapter {
   // -------------------------------------------------------------------
 
   private async routeInboundClick(click: InboundClickPayload): Promise<void> {
+    // A button tap is real user activity: it re-arms the boards loop guard
+    // exactly like a typed message (Hermes parity, review decision
+    // 2026-08-03). Approval taps count too; any tap is a human at the
+    // keyboard.
+    this.boards.resetLoopGuard(click.chatId);
     // Approval precedence: an approval-consumed click is NOT also forwarded.
     const consumed = this.approvals.handleCallbackResult({
       messageId: click.messageId,

@@ -590,4 +590,65 @@ export class BgosApi {
     );
     return r.data;
   }
+
+  // -------------------------------------------------------------------
+  // Agent Boards (the [[BGOS_BOARDS]] round trip's REST lane)
+  // -------------------------------------------------------------------
+
+  /**
+   * One call on the agent-family boards routes.
+   *
+   * `path` is RELATIVE to the boards root ("" for the collection, or
+   * "/<board>/rows/query" and friends); this method owns the prefix
+   * `integrations/assistants/:assistantId/boards` so the marker layer's
+   * RestPlan never re-derives it. Pairing auth like every other
+   * integration route; the PairingScopedAssistant guard on the backend
+   * proves the assistant belongs to this pairing.
+   *
+   * Returns `{status, body}` for EVERY answer, 2xx and 4xx/5xx alike
+   * (`validateStatus` accepts all), instead of throwing like the Hermes
+   * `boards_call`. Deliberate divergence: this instance's 401 interceptor
+   * maps rejections to PairingRevokedError, which would destroy the
+   * verbatim 401 denial body, and the boards denial bodies ({error,
+   * message}) are a leak-proof contract the orchestrator passes to the
+   * agent VERBATIM. Nothing here may unwrap, reword, or enrich them.
+   */
+  async boardsCall(input: {
+    assistantId: number;
+    method: string;
+    path: string;
+    json?: Record<string, unknown> | null;
+    params?: Record<string, string> | null;
+  }): Promise<{ status: number; body: unknown }> {
+    const r = await this.http.request({
+      method: input.method,
+      url: `integrations/assistants/${input.assistantId}/boards${input.path}`,
+      ...(input.json != null ? { data: input.json } : {}),
+      ...(input.params != null ? { params: input.params } : {}),
+      validateStatus: () => true,
+    });
+    return { status: r.status, body: r.data };
+  }
+
+  /**
+   * PUT raw bytes to an absolute (presigned S3) URL. No BGOS auth headers:
+   * the signature in the URL is the credential. Used by the boards attach
+   * flow for files above the inline threshold. Throws on a non-2xx answer.
+   * Same trust model as `publishMediaPath`'s presigned PUT (the URL comes
+   * from the authenticated backend response).
+   */
+  async putBytes(
+    url: string,
+    data: Buffer,
+    contentType: string,
+  ): Promise<void> {
+    const r = await axios.put(url, data, {
+      headers: { "Content-Type": contentType },
+      timeout: 60_000,
+      validateStatus: () => true,
+    });
+    if (r.status >= 400) {
+      throw new Error(`presigned PUT failed with status ${r.status}`);
+    }
+  }
 }
