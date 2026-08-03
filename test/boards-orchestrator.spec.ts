@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync, writeFileSync, truncateSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { BGOSAdapter } from "../src/adapter.js";
 import { BgosApi } from "../src/bgos-api.js";
@@ -584,6 +584,96 @@ describe("ReplyHandle boards interception (Gobot)", () => {
     expect(last.text).toContain("reqId=fresh op=list ok");
   });
 
+  it("composes with the mission marker lane: prose + boards + mission in one reply", async () => {
+    // The boards intercept runs BEFORE the outbound's mission stripping;
+    // the delimiters are distinct and both lanes must fire off one reply
+    // while the user sees only the prose.
+    const dispatched: DispatchArgs[] = [];
+    const { deps, boards } = makeDeps(dispatched);
+    server.stage("POST", "/api/v1/messages", 201, { id: 901 });
+    server.stage("GET", BOARDS_ROOT, 200, { markdown: "L" });
+    server.stage(
+      "POST",
+      `/api/v1/integrations/assistants/${ASSISTANT_ID}/missions`,
+      201,
+      { ok: true, mission: { id: 11 } },
+    );
+
+    const handle = buildReplyHandle(
+      { outbound: deps.outbound, boards },
+      { assistantId: ASSISTANT_ID, chatId: CHAT_ID },
+    );
+    const res = await handle.sendText(
+      "Working on it.\n" +
+        block({ op: "list", reqId: "mix" }) +
+        "\n" +
+        '[[BGOS_MISSION]]{"op":"create","title":"Board sweep"}[[/BGOS_MISSION]]',
+    );
+    expect(res.id).toBe(901);
+    await boards.flush();
+    // The mission queue is fire-and-forget; wait for its POST to land.
+    await vi.waitFor(() => {
+      expect(
+        server.requests.some((r) => r.url.includes("/missions")),
+      ).toBe(true);
+    });
+
+    const post = server.requests.find(
+      (r) => r.method === "POST" && r.url.startsWith("/api/v1/messages"),
+    );
+    expect(post).toBeDefined();
+    // The mission lane preserves surrounding bytes (its documented
+    // behavior), so pin on marker absence rather than exact whitespace.
+    const visible = String((post!.body as Record<string, unknown>).text);
+    expect(visible).toContain("Working on it.");
+    expect(visible).not.toContain("BGOS_BOARDS");
+    expect(visible).not.toContain("BGOS_MISSION");
+    expect(dispatched.some((d) => d.text.includes("reqId=mix op=list ok"))).toBe(
+      true,
+    );
+  });
+
+  it("composes with the mission marker lane: markers-only reply posts no bubble", async () => {
+    // boards block + mission block and NO prose: boards strips its block
+    // (leaving the mission block, so no {id: -1} short-circuit), then the
+    // outbound's mission lane strips the rest and skips the empty bubble
+    // ({id: 0}). Both lanes execute; the user sees nothing.
+    const dispatched: DispatchArgs[] = [];
+    const { deps, boards } = makeDeps(dispatched);
+    server.stage("GET", BOARDS_ROOT, 200, { markdown: "L" });
+    server.stage(
+      "POST",
+      `/api/v1/integrations/assistants/${ASSISTANT_ID}/missions`,
+      201,
+      { ok: true, mission: { id: 12 } },
+    );
+
+    const handle = buildReplyHandle(
+      { outbound: deps.outbound, boards },
+      { assistantId: ASSISTANT_ID, chatId: CHAT_ID },
+    );
+    const res = await handle.sendText(
+      block({ op: "list", reqId: "silent" }) +
+        "\n" +
+        '[[BGOS_MISSION]]{"op":"create","title":"Quiet sweep"}[[/BGOS_MISSION]]',
+    );
+    expect(res.id).toBe(0);
+    await boards.flush();
+    await vi.waitFor(() => {
+      expect(
+        server.requests.some((r) => r.url.includes("/missions")),
+      ).toBe(true);
+    });
+
+    const messagePosts = server.requests.filter(
+      (r) => r.method === "POST" && r.url.startsWith("/api/v1/messages"),
+    );
+    expect(messagePosts).toHaveLength(0);
+    expect(
+      dispatched.some((d) => d.text.includes("reqId=silent op=list ok")),
+    ).toBe(true);
+  });
+
   it("a button click resets the loop guard (adapter routeInboundClick)", async () => {
     // Canonical repo delta: inbound clicks route through the adapter's
     // routeInboundClick (approval precedence + onButtonClick forward),
@@ -630,5 +720,23 @@ describe("ReplyHandle boards interception (Gobot)", () => {
     await adapter.boards.flush();
     const last = dispatched[dispatched.length - 1]!;
     expect(last.text).toContain("reqId=clicked op=list ok");
+  });
+
+  it("stop() finishes even when a boards task never settles (bounded drain)", async () => {
+    // stop() is also the self-update shutdown hook; a boards result turn
+    // is a full agent turn and may chain, so the drain must race a
+    // deadline instead of waiting forever.
+    const adapter = new BGOSAdapter({ baseUrl, pairingToken: TOKEN });
+    (adapter as unknown as { started: boolean }).started = true;
+    (adapter as unknown as { boardsStopDrainMs: number }).boardsStopDrainMs = 50;
+    (
+      adapter.boards as unknown as { pending: Set<Promise<void>> }
+    ).pending.add(new Promise<void>(() => {}));
+
+    const outcome = await Promise.race([
+      adapter.stop().then(() => "stopped" as const),
+      new Promise<"hung">((resolve) => setTimeout(() => resolve("hung"), 2000)),
+    ]);
+    expect(outcome).toBe("stopped");
   });
 });

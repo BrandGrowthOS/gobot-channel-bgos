@@ -183,6 +183,10 @@ export class BoardsOrchestrator {
     requests: BoardsRequest[],
     errors: BoardsParseError[],
   ): Promise<void> {
+    // Concurrent batches for one chat can read the same count and both
+    // write count + 1 (an undercount by one). Accepted: Hermes has the
+    // same shape, the guard still trips one round later, and a real
+    // inbound resets it anyway.
     const count = this.consecutiveResults.get(chatId) ?? 0;
     if (count >= BOARDS_LOOP_GUARD_LIMIT) {
       if (count > BOARDS_LOOP_GUARD_LIMIT) {
@@ -321,9 +325,30 @@ export class BoardsOrchestrator {
     const filePath = String(args.path);
     const board = encodeURIComponent(String(args.board));
     const row = encodeURIComponent(String(args.row));
+    // SECURITY: allowlist check FIRST, same choke-point order as
+    // publishMediaPath. Throws on traversal, out-of-root paths, sensitive
+    // locations, and escaping symlinks; every stat/read below uses the
+    // resolved real path so size and bytes cannot diverge.
+    let safePath: string;
+    try {
+      safePath = resolveAllowedMediaPath(filePath);
+    } catch (err) {
+      if (!(err instanceof MediaPathError)) throw err;
+      // Distinguish "no such file" (agent typo, answer file_not_found for
+      // Hermes parity) from a real allowlist rejection.
+      try {
+        statSync(filePath);
+      } catch {
+        return fail(
+          0,
+          localError("file_not_found", `no readable file at ${filePath}`),
+        );
+      }
+      return fail(0, localError("path_not_allowed", err.message));
+    }
     let size: number;
     try {
-      const st = statSync(filePath);
+      const st = statSync(safePath);
       if (!st.isFile()) throw new Error("not a file");
       size = st.size;
     } catch {
@@ -337,18 +362,6 @@ export class BoardsOrchestrator {
         0,
         localError("file_too_large", "attachments are capped at 25 MB"),
       );
-    }
-    // SECURITY: allowlist check BEFORE reading any bytes. Throws on
-    // traversal, out-of-root paths, sensitive locations, and escaping
-    // symlinks; the resolved real path is what we read from.
-    let safePath: string;
-    try {
-      safePath = resolveAllowedMediaPath(filePath);
-    } catch (err) {
-      if (err instanceof MediaPathError) {
-        return fail(0, localError("path_not_allowed", err.message));
-      }
-      throw err;
     }
     const data = readFileSync(safePath);
     const name = String(args.name || basename(filePath));

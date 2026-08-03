@@ -160,6 +160,8 @@ export class BGOSAdapter {
   private spoolTimer: NodeJS.Timeout | null = null;
   private started = false;
   private networkStarted = false;
+  /** Deadline for the stop() boards drain (test seam; see stop()). */
+  private boardsStopDrainMs = 60_000;
   private updateDraining = false;
   private activeMessageCount = 0;
   private readonly autoUpdate: AutoUpdateController;
@@ -205,6 +207,12 @@ export class BGOSAdapter {
     // Boards result turns re-enter the agent through the fork dispatch
     // (the voice-lane mechanism); the context resolves lazily so the
     // orchestrator works no matter when the fork calls setDispatch().
+    // KNOWN GAP (a2a): this reply handle carries no replyVia/replyToId, so
+    // a boards call issued from a PEER side-thread turn answers back into
+    // the chat via /messages, not /send-message; a boards-only peer reply
+    // posts nothing and the initiator's wait_for_reply times out. Agents
+    // are steered to answer peers with normal text first; fixing this
+    // properly means threading the a2a route into BoardsTurnContext.
     this.boards = new BoardsOrchestrator({
       api: this.api,
       getTurnContext: (assistantId, chatId) => {
@@ -484,9 +492,18 @@ export class BGOSAdapter {
     try {
       // Drain in-flight boards executor tasks so a shutdown never abandons
       // a half-answered board round trip. Deliberate divergence from
-      // Hermes, which CANCELS its tasks on disconnect: draining completes
-      // the round trip and is bounded by the api client's 30s timeout.
-      await this.boards.flush();
+      // Hermes, which CANCELS its tasks on disconnect. The drain is NOT
+      // naturally short: a result turn is a full agent brain turn and its
+      // continuation may chain further blocks (up to the loop guard), and
+      // stop() is also the self-update shutdown hook, so the drain races
+      // a hard deadline instead of waiting forever.
+      await Promise.race([
+        this.boards.flush(),
+        new Promise<void>((resolve) => {
+          const t = setTimeout(resolve, this.boardsStopDrainMs);
+          t.unref?.();
+        }),
+      ]);
     } catch {
       /* swallow on shutdown, best effort */
     }
