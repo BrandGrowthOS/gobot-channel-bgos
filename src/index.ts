@@ -126,6 +126,25 @@ export {
   type InboundHandlerDeps,
   type ReplyHandle,
 } from "./inbound-handler.js";
+export {
+  BOARDS_LOOP_GUARD_LIMIT,
+  BOARDS_MAX_BLOCKS,
+  BOARDS_OPS,
+  BOARDS_RESULT_HEADER,
+  BOARDS_RESULT_PREAMBLE,
+  buildResultTurn,
+  parseBoardsBlocks,
+  planRequest,
+  type BoardsCallResult,
+  type BoardsParseError,
+  type BoardsRequest,
+  type RestPlan,
+} from "./boards-marker.js";
+export {
+  BoardsOrchestrator,
+  type BoardsOrchestratorDeps,
+  type BoardsTurnContext,
+} from "./boards-orchestrator.js";
 export { loadLastId, saveLastId } from "./last-id-store.js";
 export { ApprovalHandler, type ApprovalDecision } from "./approval-handler.js";
 export { CommandsSync } from "./commands-sync.js";

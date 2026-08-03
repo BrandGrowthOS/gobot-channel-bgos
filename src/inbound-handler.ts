@@ -37,6 +37,7 @@ import {
 } from "./pending-unknown-store.js";
 import { ProcessedIdsCache } from "./processed-ids.js";
 import type { BgosOutbound } from "./outbound.js";
+import type { BoardsOrchestrator } from "./boards-orchestrator.js";
 import type { ToolProgressOrchestrator } from "./tool-progress.js";
 import type {
   ApprovalMeta,
@@ -158,6 +159,15 @@ export interface DispatchArgs {
   /** Turn state on the peer side-thread (`expecting_reply` | `more_coming`
    *  | `final`) when `peerConversationId` is set. */
   turnState?: string;
+  /**
+   * True when this turn is a SYNTHETIC system turn authored by the adapter
+   * itself, not the human user (today: the `[BGOS boards result]` turn the
+   * boards orchestrator dispatches to answer the agent's own
+   * `[[BGOS_BOARDS]]` requests). The turn text ALSO opens with an
+   * in-content provenance header for meta-blind consumers, so a fork that
+   * ignores this flag still behaves correctly. Optional and additive.
+   */
+  system?: boolean;
 }
 
 export type DispatchFn = (args: DispatchArgs) => Promise<void>;
@@ -182,6 +192,13 @@ export interface InboundHandlerDeps {
    *  through this. Optional for back-compat; older host code that
    *  doesn't call these methods continues to work, just without cards. */
   toolProgress?: ToolProgressOrchestrator;
+  /** Agent Boards orchestrator (the [[BGOS_BOARDS]] marker round trip),
+   *  adapter-provided. `sendText` runs every agent reply through its
+   *  interceptor, and the inbound handler resets its per-chat loop guard
+   *  (a typed message is real user activity; the adapter's
+   *  routeInboundClick does the same for button taps). Optional for
+   *  back-compat; without it, marker blocks pass through as plain text. */
+  boards?: BoardsOrchestrator;
   /** Called (best-effort) when a message is about to dispatch, driving the
    *  heartbeat `lastInboundAt` timestamp. Optional. */
   onInbound?(): void;
@@ -201,7 +218,11 @@ export interface InboundHandlerDeps {
  * `makeReplyHandle` leaves them undefined (a plain reply into a chat).
  */
 export function buildReplyHandle(
-  deps: { outbound: BgosOutbound; toolProgress?: ToolProgressOrchestrator },
+  deps: {
+    outbound: BgosOutbound;
+    toolProgress?: ToolProgressOrchestrator;
+    boards?: BoardsOrchestrator;
+  },
   target: {
     assistantId: number;
     chatId: number;
@@ -212,8 +233,33 @@ export function buildReplyHandle(
   const { assistantId, chatId, replyVia, replyToId } = target;
   return {
     origin: "bgos",
-    sendText: (text) =>
-      deps.outbound.sendText({ assistantId, chatId, text, replyVia, replyToId }),
+    // Agent Boards intercept ([[BGOS_BOARDS]] JSON blocks): the blocks are
+    // stripped here and executed in a background task (mirrors the Hermes
+    // send() intercept). A boards-only reply posts NO visible bubble and
+    // resolves {id: -1} so the user never sees marker syntax or an empty
+    // message. Runs BEFORE the outbound's mission-marker stripping; the
+    // two marker lanes have distinct delimiters and compose.
+    sendText: (text) => {
+      let visible = text;
+      if (deps.boards) {
+        const { cleanedText, hadBlocks } = deps.boards.interceptOutbound(
+          assistantId,
+          chatId,
+          text,
+        );
+        if (hadBlocks && cleanedText === "") {
+          return Promise.resolve({ id: -1 });
+        }
+        visible = cleanedText;
+      }
+      return deps.outbound.sendText({
+        assistantId,
+        chatId,
+        text: visible,
+        replyVia,
+        replyToId,
+      });
+    },
     sendButtons: (text, options) =>
       deps.outbound.sendButtons({
         assistantId,
@@ -351,6 +397,12 @@ export function createInboundHandler(
     saveLastId(event.messageId);
     deps.onInbound?.();
 
+    // A real inbound message re-arms the boards loop guard: chained board
+    // result turns are capped per stretch of silence, not per session.
+    // The synthetic boards result turn never passes through this handler
+    // (it is a direct dispatch call), so it cannot reset its own guard.
+    deps.boards?.resetLoopGuard(event.chatId);
+
     // Translate BGOS attachments to local file paths. Failures are
     // surfaced as a single agent_error and the message is still
     // dispatched without attachments — better degraded behavior than
@@ -399,7 +451,11 @@ export function createInboundHandler(
     // Build the BGOS-scoped ReplyHandle via the shared factory (identical to
     // the surface the adapter's makeReplyHandle exposes for HITL resume).
     const replyHandle: ReplyHandle = buildReplyHandle(
-      { outbound: deps.outbound, toolProgress: deps.toolProgress },
+      {
+        outbound: deps.outbound,
+        toolProgress: deps.toolProgress,
+        boards: deps.boards,
+      },
       {
         assistantId: event.assistantId,
         chatId: event.chatId,
