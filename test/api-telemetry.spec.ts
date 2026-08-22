@@ -1,5 +1,6 @@
 /**
- * BgosApi.postHeartbeat + setStatus (contracts C1 + C4).
+ * BgosApi.postHeartbeat + setStatus (contracts C1 + C4) and the update_rpc
+ * ack/progress routes (one-click update, wire contract v1).
  */
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
@@ -58,5 +59,50 @@ describe("BgosApi telemetry endpoints", () => {
     server.stage("PATCH", "/api/v1/integrations/assistants/5/status", 200, {});
     await makeApi(baseUrl).setStatus(5, { statusText: "" });
     expect(server.requests.at(-1)!.body).toMatchObject({ statusText: "" });
+  });
+
+  it("postHeartbeat carries the one-click update fields when present", async () => {
+    server.stage("POST", "/api/v1/integrations/heartbeat", 204, null);
+    await makeApi(baseUrl).postHeartbeat({
+      daemonVersion: "0.17.0",
+      latestKnownVersion: "0.18.0",
+      updateReadiness: {
+        supervised: "systemd",
+        autoUpdateEnabled: true,
+        rollbackLatched: false,
+        pendingRestartVersion: null,
+      },
+    });
+    expect(server.requests.at(-1)!.body).toMatchObject({
+      latestKnownVersion: "0.18.0",
+      updateReadiness: { supervised: "systemd" },
+    });
+  });
+
+  it("postUpdateRpcAck POSTs the encoded rpc ack route", async () => {
+    server.stage("POST", "/api/v1/integrations/update-rpc/rpc%201/ack", 204, null);
+    await makeApi(baseUrl).postUpdateRpcAck("rpc 1");
+    const req = server.requests.at(-1)!;
+    expect(req.method).toBe("POST");
+    expect(req.url).toBe("/api/v1/integrations/update-rpc/rpc%201/ack");
+  });
+
+  it("postUpdateRpcProgress POSTs the stage body", async () => {
+    server.stage(
+      "POST",
+      "/api/v1/integrations/update-rpc/r1/progress",
+      204,
+      null,
+    );
+    await makeApi(baseUrl).postUpdateRpcProgress("r1", {
+      stage: "restarting",
+      targetVersion: "0.17.0",
+    });
+    const req = server.requests.at(-1)!;
+    expect(req.url).toBe("/api/v1/integrations/update-rpc/r1/progress");
+    expect(req.body).toMatchObject({
+      stage: "restarting",
+      targetVersion: "0.17.0",
+    });
   });
 });
