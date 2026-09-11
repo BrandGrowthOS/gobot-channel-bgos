@@ -177,6 +177,7 @@ const BGOS_AGENT_HINTS_BODY = [
   "The card stays in sync as tools fire, and finalizes when your text",
   "reply lands via `sendText`. No additional contract on your end.",
   "",
+  "Call the owner: use replyHandle.callOwner(reason, {context, openingMessage}); the handle supplies the chat and assistant identity. GPT-Live only: context (4000 characters) adds private background; openingMessage (400) suggests the first sentence after answer. HOAI always injects the last 12 chat messages. ElevenLabs settings/startup are unchanged. Omit the options for the existing simple call.",
   "## Voice calls (in-app realtime)",
   "The user can voice-call you in the BGOS app; a realtime voice model is",
   "your mouth and escalates to you (the brain) mid-call. Two turn shapes:",
