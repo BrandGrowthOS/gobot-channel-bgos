@@ -212,3 +212,7 @@ The package is also mirrored inside the BGOS monorepo at `gobot-channel-bgos/`; 
 ## License
 
 MIT.
+
+### OpenAI native call context
+
+Use `replyHandle.callOwner?.(reason, { context, openingMessage })` to ring the owner as the current chat agent. A `needs_setup` result includes guidance to relay to the owner. With the updated HOAI app/backend and GPT-Live selected, optional `context` (4000 characters) adds private background and `openingMessage` (400 characters) suggests the first sentence after answer. HOAI always includes the last 12 usable authorized chat messages, or all available if fewer. Long text is bounded to the voice budget. Keep `reason` short and public. ElevenLabs settings and call behavior stay unchanged.

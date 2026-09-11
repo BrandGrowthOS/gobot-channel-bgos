@@ -1,3 +1,4 @@
+import type { OutboundCallResult } from "./bgos-api.js";
 import type { BgosApi } from "./bgos-api.js";
 import { publishMediaPath } from "./attachment-bridge.js";
 import { sanitizeFromAgent } from "./agent-identity.js";
@@ -72,6 +73,28 @@ export class BgosOutbound {
   private sleepFn: (ms: number) => Promise<void> = (ms) =>
     new Promise((r) => setTimeout(r, ms));
 
+  callOwner(params: {
+    assistantId: number;
+    chatId?: number;
+    reason?: string;
+    context?: string;
+    openingMessage?: string;
+  }): Promise<OutboundCallResult> {
+    const reason =
+      params.reason !== undefined
+        ? params.reason.trim().slice(0, 200)
+        : undefined;
+    return this.api.triggerOutboundCall({
+      assistantId: params.assistantId,
+      ...(params.context !== undefined && { context: params.context }),
+      ...(params.openingMessage !== undefined && {
+        openingMessage: params.openingMessage,
+      }),
+      ...(params.chatId !== undefined && { chatId: params.chatId }),
+      ...(reason !== undefined && { reason }),
+    });
+  }
+
   constructor(api: BgosApi) {
     this.api = api;
   }
@@ -114,16 +137,18 @@ export class BgosOutbound {
       this.missionStates.set(assistantId, state);
     }
 
-    void dispatchMissionOps(this.api, assistantId, ops, state).catch((error) => {
-      const message = error instanceof Error ? error.message : String(error);
-      try {
-        console.warn(
-          `[gobot-channel-bgos] mission queue failed for assistant ${assistantId}: ${message}`,
-        );
-      } catch {
-        // Logging must not create an unhandled rejection.
-      }
-    });
+    void dispatchMissionOps(this.api, assistantId, ops, state).catch(
+      (error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        try {
+          console.warn(
+            `[gobot-channel-bgos] mission queue failed for assistant ${assistantId}: ${message}`,
+          );
+        } catch {
+          // Logging must not create an unhandled rejection.
+        }
+      },
+    );
   }
 
   /**
@@ -510,9 +535,7 @@ export class BgosOutbound {
     replyVia?: "messages" | "send-message";
   }): Promise<{ id: number }> {
     if (params.mimeType && !params.mimeType.startsWith("image/")) {
-      throw new Error(
-        `sendImage: mimeType ${params.mimeType} is not image/*`,
-      );
+      throw new Error(`sendImage: mimeType ${params.mimeType} is not image/*`);
     }
     return this.sendFile(params);
   }
@@ -531,9 +554,7 @@ export class BgosOutbound {
     replyVia?: "messages" | "send-message";
   }): Promise<{ id: number }> {
     if (params.mimeType && !params.mimeType.startsWith("video/")) {
-      throw new Error(
-        `sendVideo: mimeType ${params.mimeType} is not video/*`,
-      );
+      throw new Error(`sendVideo: mimeType ${params.mimeType} is not video/*`);
     }
     return this.sendFile(params);
   }

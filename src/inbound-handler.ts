@@ -1,3 +1,4 @@
+import type { OutboundCallResult } from "./bgos-api.js";
 /**
  * Translate a BGOS WS `inbound_message` into a `dispatch()` call against
  * Gobot's existing per-agent handler.
@@ -70,19 +71,14 @@ export interface ReplyHandle {
     options?: MessageOption[],
     modal?: boolean,
   ) => Promise<{ id: number }>;
-  sendFile: (
-    filePath: string,
-    caption?: string,
-  ) => Promise<{ id: number }>;
-  sendImage: (
-    filePath: string,
-    caption?: string,
-  ) => Promise<{ id: number }>;
-  sendVideo: (
-    filePath: string,
-    caption?: string,
-  ) => Promise<{ id: number }>;
+  sendFile: (filePath: string, caption?: string) => Promise<{ id: number }>;
+  sendImage: (filePath: string, caption?: string) => Promise<{ id: number }>;
+  sendVideo: (filePath: string, caption?: string) => Promise<{ id: number }>;
   sendTyping: () => Promise<void>;
+  callOwner?: (
+    reason?: string,
+    options?: { context?: string; openingMessage?: string },
+  ) => Promise<OutboundCallResult>;
   /** Publish a local file path to BGOS as a `files[]` entry; useful when
    *  the agent emits structured tool output rather than a `MEDIA:` line.
    *  The `filePath` is validated against the `GOBOT_MEDIA_ROOT` allowlist
@@ -233,6 +229,16 @@ export function buildReplyHandle(
   const { assistantId, chatId, replyVia, replyToId } = target;
   return {
     origin: "bgos",
+    callOwner: (reason, options) =>
+      deps.outbound.callOwner({
+        assistantId,
+        chatId,
+        reason,
+        ...(options?.context !== undefined && { context: options.context }),
+        ...(options?.openingMessage !== undefined && {
+          openingMessage: options.openingMessage,
+        }),
+      }),
     // Agent Boards intercept ([[BGOS_BOARDS]] JSON blocks): the blocks are
     // stripped here and executed in a background task (mirrors the Hermes
     // send() intercept). A boards-only reply posts NO visible bubble and
@@ -284,7 +290,13 @@ export function buildReplyHandle(
         replyToId,
       }),
     sendAskUserInput: (prompt, options, modal) =>
-      deps.outbound.sendAskUserInput({ assistantId, chatId, prompt, options, modal }),
+      deps.outbound.sendAskUserInput({
+        assistantId,
+        chatId,
+        prompt,
+        options,
+        modal,
+      }),
     sendFile: (filePath, caption) =>
       deps.outbound.sendFile({
         assistantId,
@@ -317,7 +329,12 @@ export function buildReplyHandle(
       publishMediaPath(deps.outbound.api, filePath, opts),
     sendToolStart: async (toolName, args) => {
       if (!deps.toolProgress) return;
-      await deps.toolProgress.sendToolStart({ assistantId, chatId, toolName, args });
+      await deps.toolProgress.sendToolStart({
+        assistantId,
+        chatId,
+        toolName,
+        args,
+      });
     },
     finalizeTurn: async () => {
       if (!deps.toolProgress) return;
