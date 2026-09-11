@@ -1,4 +1,5 @@
 import { callContextFields } from "./call-context.js";
+import { getPackageVersion } from "./version.js";
 import axios, { type AxiosInstance } from "axios";
 
 import {
@@ -316,7 +317,7 @@ export class BgosApi {
     // (memory DoS). axios rejects past maxContentLength and the caller keeps
     // the bundled fallback.
     const r = await this.http.get("integrations/capabilities", {
-      params: { channel },
+      params: { channel, daemonVersion: getPackageVersion() },
       maxContentLength: 1024 * 1024,
       maxBodyLength: 1024 * 1024,
     });

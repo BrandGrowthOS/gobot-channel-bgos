@@ -137,6 +137,7 @@ describe("BgosApi.getCapabilities", () => {
     expect(req.method).toBe("GET");
     expect(req.url).toContain("/api/v1/integrations/capabilities");
     expect(req.url).toContain("channel=gobot");
+    expect(new URL(req.url, baseUrl).searchParams.get("daemonVersion")).toMatch(/^\d+\.\d+\.\d+$/);
     expect(req.headers["x-bgos-pairing"]).toBeTruthy();
   });
 
