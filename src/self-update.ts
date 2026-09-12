@@ -397,6 +397,171 @@ export const runCommand: CommandRunner = (command, args, cwd) => {
   }
 };
 
+/**
+ * Install the daemon package at an EXACT version into a checkout, over
+ * `bun install <pkg>@<version> --no-save`, preserving the tracked dependency
+ * files byte-for-byte so an install can never dirty the checkout (the
+ * dirty-tree brake the fast-forward update relies on). Verifies the version
+ * that actually landed in node_modules. Module-level so the on-demand
+ * update_rpc path (update-rpc.ts) shares the exact code path the periodic
+ * AutoUpdateController uses.
+ */
+export interface ExactPluginInstallOptions {
+  checkoutRoot: string;
+  version: string;
+  runner?: CommandRunner;
+  bunPath?: string;
+  installedPluginVersionReader?: (checkoutRoot: string) => string | null;
+}
+
+export function installExactPluginVersion(
+  options: ExactPluginInstallOptions,
+): CommandResult {
+  const runner = options.runner ?? runCommand;
+  const bunPath = options.bunPath ?? "bun";
+  const readInstalled =
+    options.installedPluginVersionReader ?? readInstalledPluginVersion;
+  const { checkoutRoot, version } = options;
+  if (!parseExactStableNpmVersion(version)) {
+    return {
+      status: null,
+      stdout: "",
+      stderr: "",
+      error: `unsafe daemon package version: ${version}`,
+    };
+  }
+  const tracked = listTrackedDependencyFiles(runner, checkoutRoot);
+  if (!tracked.files) return tracked.failure;
+  const installed = runBunPreservingTrackedFiles(
+    runner,
+    bunPath,
+    checkoutRoot,
+    ["install", `${PLUGIN_PACKAGE_NAME}@${version}`, "--no-save"],
+    tracked.files,
+  );
+  if (installed.status !== 0) return installed;
+  const actual = readInstalled(checkoutRoot);
+  if (actual !== version) {
+    return {
+      status: null,
+      stdout: installed.stdout,
+      stderr: installed.stderr,
+      error: `installed daemon version is ${actual ?? "missing"}, expected ${version}`,
+    };
+  }
+  return installed;
+}
+
+function installDependenciesAtRoot(
+  runner: CommandRunner,
+  bunPath: string,
+  checkoutRoot: string,
+): CommandResult {
+  const tracked = listTrackedDependencyFiles(runner, checkoutRoot);
+  if (!tracked.files) return tracked.failure;
+  const hasTrackedLockfile = tracked.files.some((name) =>
+    (LOCKFILES as readonly string[]).includes(name),
+  );
+  return runBunPreservingTrackedFiles(
+    runner,
+    bunPath,
+    checkoutRoot,
+    hasTrackedLockfile ? ["install", "--frozen-lockfile"] : ["install"],
+    tracked.files,
+  );
+}
+
+function listTrackedDependencyFiles(
+  runner: CommandRunner,
+  checkoutRoot: string,
+):
+  | { files: string[]; failure?: never }
+  | { files?: never; failure: CommandResult } {
+  const listed = runner("git", ["ls-files", "--", ...DEPENDENCY_FILES], checkoutRoot);
+  if (listed.status !== 0) {
+    return {
+      failure: {
+        status: listed.status,
+        stdout: listed.stdout,
+        stderr: listed.stderr,
+        error: listed.error ?? "tracked dependency files could not be listed",
+      },
+    };
+  }
+  const allowed = new Set<string>(DEPENDENCY_FILES);
+  const files = listed.stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => allowed.has(line));
+  if (!files.includes("package.json")) {
+    return {
+      failure: {
+        status: null,
+        stdout: "",
+        stderr: "",
+        error: "tracked package.json could not be verified",
+      },
+    };
+  }
+  return { files };
+}
+
+function runBunPreservingTrackedFiles(
+  runner: CommandRunner,
+  bunPath: string,
+  checkoutRoot: string,
+  args: readonly string[],
+  trackedFiles: readonly string[],
+): CommandResult {
+  let snapshots: Array<{
+    path: string;
+    contents: Buffer;
+    mode: number;
+  }>;
+  try {
+    snapshots = trackedFiles.map((name) => {
+      const path = join(checkoutRoot, name);
+      return {
+        path,
+        contents: readFileSync(path),
+        mode: statSync(path).mode & 0o777,
+      };
+    });
+  } catch (error) {
+    return {
+      status: null,
+      stdout: "",
+      stderr: "",
+      error: `tracked dependency snapshot failed: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+
+  const result = runner(bunPath, args, checkoutRoot);
+  try {
+    for (const snapshot of snapshots) {
+      try {
+        if (readFileSync(snapshot.path).equals(snapshot.contents)) continue;
+      } catch {
+        // Restore a missing or unreadable tracked file below.
+      }
+      const temporary = `${snapshot.path}.${process.pid}.restore.tmp`;
+      writeFileSync(temporary, snapshot.contents, { mode: snapshot.mode });
+      renameSync(temporary, snapshot.path);
+      if (!readFileSync(snapshot.path).equals(snapshot.contents)) {
+        throw new Error(`${snapshot.path} did not verify after restore`);
+      }
+    }
+  } catch (error) {
+    return {
+      status: null,
+      stdout: result.stdout,
+      stderr: result.stderr,
+      error: `tracked dependency restore failed: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+  return result;
+}
+
 interface CheckoutInfo {
   root: string;
   commit: string;
@@ -1117,6 +1282,13 @@ export class AutoUpdateController {
     this.timer.unref?.();
   }
 
+  /** Share the periodic updater's lock with an app-requested install. */
+  tryBeginManualUpdate(): (() => void) | null {
+    if (this.checking || this.stopped) return null;
+    this.checking = true;
+    return () => { this.checking = false; };
+  }
+
   private async checkAndApply(): Promise<AutoUpdateStartResult> {
     if (this.checking || this.stopped) return "running";
     this.checking = true;
@@ -1419,17 +1591,10 @@ export class AutoUpdateController {
   }
 
   private installDependencies(checkoutRoot: string): CommandResult {
-    const tracked = this.trackedDependencyFiles(checkoutRoot);
-    if (!tracked.files) return tracked.failure;
-    const hasTrackedLockfile = tracked.files.some((name) =>
-      (LOCKFILES as readonly string[]).includes(name),
-    );
-    return this.runBunPreservingTrackedFiles(
+    return installDependenciesAtRoot(
+      this.runner,
+      this.deps.bunPath ?? "bun",
       checkoutRoot,
-      hasTrackedLockfile
-        ? ["install", "--frozen-lockfile"]
-        : ["install"],
-      tracked.files,
     );
   }
 
@@ -1437,125 +1602,12 @@ export class AutoUpdateController {
     checkoutRoot: string,
     version: string,
   ): CommandResult {
-    if (!parseExactStableNpmVersion(version)) {
-      return {
-        status: null,
-        stdout: "",
-        stderr: "",
-        error: `unsafe daemon package version: ${version}`,
-      };
-    }
-    const tracked = this.trackedDependencyFiles(checkoutRoot);
-    if (!tracked.files) return tracked.failure;
-    const installed = this.runBunPreservingTrackedFiles(
+    return installExactPluginVersion({
       checkoutRoot,
-      ["install", `${PLUGIN_PACKAGE_NAME}@${version}`, "--no-save"],
-      tracked.files,
-    );
-    if (installed.status !== 0) return installed;
-    const actual = this.installedPluginVersionReader(checkoutRoot);
-    if (actual !== version) {
-      return {
-        status: null,
-        stdout: installed.stdout,
-        stderr: installed.stderr,
-        error: `installed daemon version is ${actual ?? "missing"}, expected ${version}`,
-      };
-    }
-    return installed;
-  }
-
-  private trackedDependencyFiles(checkoutRoot: string):
-    | { files: string[]; failure?: never }
-    | { files?: never; failure: CommandResult } {
-    const listed = this.runner(
-      "git",
-      ["ls-files", "--", ...DEPENDENCY_FILES],
-      checkoutRoot,
-    );
-    if (listed.status !== 0) {
-      return {
-        failure: {
-          status: listed.status,
-          stdout: listed.stdout,
-          stderr: listed.stderr,
-          error: listed.error ?? "tracked dependency files could not be listed",
-        },
-      };
-    }
-    const allowed = new Set<string>(DEPENDENCY_FILES);
-    const files = listed.stdout
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter((line) => allowed.has(line));
-    if (!files.includes("package.json")) {
-      return {
-        failure: {
-          status: null,
-          stdout: "",
-          stderr: "",
-          error: "tracked package.json could not be verified",
-        },
-      };
-    }
-    return { files };
-  }
-
-  private runBunPreservingTrackedFiles(
-    checkoutRoot: string,
-    args: readonly string[],
-    trackedFiles: readonly string[],
-  ): CommandResult {
-    let snapshots: Array<{
-      path: string;
-      contents: Buffer;
-      mode: number;
-    }>;
-    try {
-      snapshots = trackedFiles.map((name) => {
-        const path = join(checkoutRoot, name);
-        return {
-          path,
-          contents: readFileSync(path),
-          mode: statSync(path).mode & 0o777,
-        };
-      });
-    } catch (error) {
-      return {
-        status: null,
-        stdout: "",
-        stderr: "",
-        error: `tracked dependency snapshot failed: ${error instanceof Error ? error.message : String(error)}`,
-      };
-    }
-
-    const result = this.runner(
-      this.deps.bunPath ?? "bun",
-      args,
-      checkoutRoot,
-    );
-    try {
-      for (const snapshot of snapshots) {
-        try {
-          if (readFileSync(snapshot.path).equals(snapshot.contents)) continue;
-        } catch {
-          // Restore a missing or unreadable tracked file below.
-        }
-        const temporary = `${snapshot.path}.${process.pid}.restore.tmp`;
-        writeFileSync(temporary, snapshot.contents, { mode: snapshot.mode });
-        renameSync(temporary, snapshot.path);
-        if (!readFileSync(snapshot.path).equals(snapshot.contents)) {
-          throw new Error(`${snapshot.path} did not verify after restore`);
-        }
-      }
-    } catch (error) {
-      return {
-        status: null,
-        stdout: result.stdout,
-        stderr: result.stderr,
-        error: `tracked dependency restore failed: ${error instanceof Error ? error.message : String(error)}`,
-      };
-    }
-    return result;
+      version,
+      runner: this.runner,
+      ...(this.deps.bunPath !== undefined ? { bunPath: this.deps.bunPath } : {}),
+      installedPluginVersionReader: this.installedPluginVersionReader,
+    });
   }
 }

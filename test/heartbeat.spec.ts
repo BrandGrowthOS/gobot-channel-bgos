@@ -121,6 +121,54 @@ describe("HeartbeatController", () => {
     }
   });
 
+  it("rides the update telemetry snapshot on every network post", () => {
+    const posts: HeartbeatDto[] = [];
+    const hb = new HeartbeatController({
+      version: "0.17.0",
+      postHeartbeat: async (b) => void posts.push(b),
+      getUpdateTelemetry: () => ({
+        latestKnownVersion: "0.18.0",
+        updateReadiness: {
+          supervised: "launchd",
+          autoUpdateEnabled: true,
+          rollbackLatched: false,
+          pendingRestartVersion: null,
+        },
+      }),
+    });
+    hb.start();
+    try {
+      expect(posts).toHaveLength(1);
+      expect(posts[0].latestKnownVersion).toBe("0.18.0");
+      expect(posts[0].updateReadiness).toEqual({
+        supervised: "launchd",
+        autoUpdateEnabled: true,
+        rollbackLatched: false,
+        pendingRestartVersion: null,
+      });
+      // postNow() posts one immediate out-of-cadence heartbeat.
+      hb.postNow();
+      expect(posts).toHaveLength(2);
+    } finally {
+      hb.stop();
+    }
+  });
+
+  it("omits the update fields when no telemetry supplier is wired", () => {
+    const posts: HeartbeatDto[] = [];
+    const hb = new HeartbeatController({
+      version: "0.17.0",
+      postHeartbeat: async (b) => void posts.push(b),
+    });
+    hb.start();
+    try {
+      expect(posts[0]).not.toHaveProperty("latestKnownVersion");
+      expect(posts[0]).not.toHaveProperty("updateReadiness");
+    } finally {
+      hb.stop();
+    }
+  });
+
   it("snapshot records ws + inbound/outbound timestamps", () => {
     const hb = new HeartbeatController({
       version: "0.11.0",

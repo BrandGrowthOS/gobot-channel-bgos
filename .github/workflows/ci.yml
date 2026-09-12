@@ -1,0 +1,28 @@
+name: Plugin compatibility
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Full regression suite
+        if: runner.os == 'Linux'
+        run: npm test -- --maxWorkers=2 --minWorkers=1
+      - name: Update and call compatibility
+        if: runner.os != 'Linux'
+        run: npm test -- test/update-rpc.spec.ts test/update-telemetry.spec.ts test/update-host-compatibility.spec.ts test/call-context.spec.ts --maxWorkers=2 --minWorkers=1

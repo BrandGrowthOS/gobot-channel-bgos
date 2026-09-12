@@ -57,6 +57,8 @@ import {
   VoiceRpcHandler,
   type VoiceConfig,
 } from "./voice-rpc.js";
+import { UpdateRpcHandler } from "./update-rpc.js";
+import { UpdateTelemetrySource } from "./update-telemetry.js";
 
 import {
   PairingRevokedError,
@@ -150,6 +152,8 @@ export class BGOSAdapter {
   private readonly assistantNames = new Map<number, string>();
   private readonly voiceConfig: VoiceConfig;
   private voiceRpc: VoiceRpcHandler | null = null;
+  private readonly updateTelemetry: UpdateTelemetrySource;
+  private updateRpc: UpdateRpcHandler | null = null;
   private userId = "";
   private dispatch: DispatchFn | null = null;
   private catalog: CatalogAgent[];
@@ -243,9 +247,15 @@ export class BGOSAdapter {
       // eslint-disable-next-line no-console
       log: (msg) => console.warn("[gobot-channel-bgos] " + msg),
     });
+    // One-click update telemetry (wire contract v1, section 1): rides every
+    // network heartbeat as latestKnownVersion + updateReadiness.
+    this.updateTelemetry = new UpdateTelemetrySource({
+      runningVersion: getPackageVersion(),
+    });
     this.heartbeat = new HeartbeatController({
       version: getPackageVersion(),
       postHeartbeat: (body) => this.api.postHeartbeat(body),
+      getUpdateTelemetry: () => this.updateTelemetry.snapshot(),
     });
     this.autoUpdate = new AutoUpdateController({
       runningDaemonVersion: getPackageVersion(),
@@ -439,6 +449,29 @@ export class BGOSAdapter {
       this.trackMessageProcessing(
         () => this.voiceRpc?.handle(frame) ?? Promise.resolve(),
       );
+    });
+
+    // One-click update control plane (wire contract v1, section 3).
+    // Deliberately NOT wrapped in trackMessageProcessing: the update drain
+    // waits on activeMessageCount, so counting the update itself as active
+    // work would deadlock the drain.
+    this.updateRpc = new UpdateRpcHandler({
+      acquireUpdate: () => this.autoUpdate.tryBeginManualUpdate(),
+      api: this.api,
+      runningVersion: getPackageVersion(),
+      drain: () => this.drainForUpdate(),
+      resume: () => this.resumeAfterUpdateFailure(),
+      shutdown: () => this.stop(),
+      restart: () => requestGracefulHostRestart(),
+      // Push pendingRestartVersion to the backend right away after a
+      // staged (unsupervised) install.
+      onStaged: () => this.heartbeat.postNow(),
+      ...(process.execPath.endsWith("bun") ? { bunPath: process.execPath } : {}),
+      // eslint-disable-next-line no-console
+      log: (msg) => console.log("[gobot-channel-bgos] " + msg),
+    });
+    this.ws.on("update_rpc", (frame) => {
+      void this.updateRpc?.handle(frame);
     });
 
     // 2. Connect WS + start heartbeat.

@@ -30,6 +30,7 @@ export {
   decideDrainBeforeUpdate,
   decideVersionUpdate,
   formatGitUpdateDecision,
+  installExactPluginVersion,
   parseAutoUpdateFlag,
   readInstalledPluginVersion,
   readLatestRegistryVersion,
@@ -53,6 +54,7 @@ export {
   type CommandResult,
   type CommandRunner,
   type DrainDecision,
+  type ExactPluginInstallOptions,
   type GitCheckDecision,
   type GitUpdateCheck,
   type GitUpdateOptions,
@@ -192,6 +194,30 @@ export {
   type VoiceRpcResultBody,
   type VoiceRpcTiming,
 } from "./voice-rpc.js";
+export {
+  normalizeUpdateRpc,
+  UpdateRpcHandler,
+  RESTART_DELAY_MS,
+  RESTART_HARD_EXIT_MS,
+  type UpdateProgressStage,
+  type UpdateRpcApi,
+  type UpdateRpcDeps,
+  type UpdateRpcFrame,
+  type UpdateRpcOp,
+  type UpdateRpcProgressBody,
+} from "./update-rpc.js";
+export {
+  readRollbackLatched,
+  resolveForkRoot,
+  resolveSupervised,
+  UpdateTelemetrySource,
+  LATEST_CHECK_INTERVAL_MS,
+  SUPERVISED_KINDS,
+  type SupervisedKind,
+  type UpdateReadiness,
+  type UpdateTelemetry,
+  type UpdateTelemetrySourceDeps,
+} from "./update-telemetry.js";
 export {
   loadConfigFromEnv,
   loadConfigFromPluginCfg,

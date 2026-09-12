@@ -14,6 +14,7 @@ import {
   type PluginConfig,
 } from "./types.js";
 import type { VoiceRpcResultBody } from "./voice-rpc.js";
+import type { UpdateRpcProgressBody } from "./update-rpc.js";
 import type { HeartbeatDto } from "./heartbeat.js";
 
 const CONDITIONAL_GET_CACHE_LIMIT = 50;
@@ -666,6 +667,35 @@ export class BgosApi {
   ): Promise<unknown> {
     const r = await this.http.post(
       `integrations/voice-tasks/${encodeURIComponent(taskId)}/result`,
+      body,
+    );
+    return r.data;
+  }
+
+  // -------------------------------------------------------------------
+  // One-click update control plane (update_rpc, see update-rpc.ts)
+  // -------------------------------------------------------------------
+
+  /** ACK an update_rpc frame: cancels the backend's 1.5 s retry-emit
+   *  before its 10 s 'unreachable' timeout. Best-effort; callers must
+   *  treat a failure as non-fatal (the handler re-acks on re-emits). */
+  async postUpdateRpcAck(rpcId: string): Promise<unknown> {
+    const r = await this.http.post(
+      `integrations/update-rpc/${encodeURIComponent(rpcId)}/ack`,
+      {},
+    );
+    return r.data;
+  }
+
+  /** Report an update_rpc stage (wire contract v1, section 3). 'staged'
+   *  and 'error' are daemon-terminal; 'restarting' arms the backend's
+   *  heartbeat-based completion detection. */
+  async postUpdateRpcProgress(
+    rpcId: string,
+    body: UpdateRpcProgressBody,
+  ): Promise<unknown> {
+    const r = await this.http.post(
+      `integrations/update-rpc/${encodeURIComponent(rpcId)}/progress`,
       body,
     );
     return r.data;

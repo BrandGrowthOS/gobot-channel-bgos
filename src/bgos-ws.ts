@@ -4,6 +4,7 @@ import { EventEmitter } from "node:events";
 import type { BgosApi } from "./bgos-api.js";
 import { loadLastId, saveLastId } from "./last-id-store.js";
 import { normalizeVoiceRpc, type VoiceRpcFrame } from "./voice-rpc.js";
+import { normalizeUpdateRpc, type UpdateRpcFrame } from "./update-rpc.js";
 import {
   PairingRevokedError,
   type AssistantBoundPayload,
@@ -27,6 +28,7 @@ type EventMap = {
   pairing_revoked: [PairingRevokedPayload];
   callback_result: [CallbackResultPayload];
   voice_rpc: [VoiceRpcFrame];
+  update_rpc: [UpdateRpcFrame];
   error: [Error];
   /** Socket (re)connected / disconnected, drives heartbeat wsConnected. */
   connect: [];
@@ -178,6 +180,13 @@ export class BgosWs {
     socket.on("voice_rpc", (p: unknown) => {
       const frame = normalizeVoiceRpc(p);
       if (frame) this.emitter.emit("voice_rpc", frame);
+    });
+    // One-click update control plane (wire contract v1). Frames are
+    // op-whitelisted like voice_rpc; a malformed frame is dropped safely
+    // and the backend's own ack timeout surfaces it as 'unreachable'.
+    socket.on("update_rpc", (p: unknown) => {
+      const frame = normalizeUpdateRpc(p);
+      if (frame) this.emitter.emit("update_rpc", frame);
     });
 
     socket.on("connect_error", (err: Error) => {

@@ -16,6 +16,7 @@ import { mkdirSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 import { resolveGobotStateHome } from "./state-home.js";
+import type { UpdateReadiness, UpdateTelemetry } from "./update-telemetry.js";
 
 export interface HeartbeatLastError {
   code: string;
@@ -23,12 +24,17 @@ export interface HeartbeatLastError {
   at: string;
 }
 
-/** Wire shape POSTed to the backend heartbeat endpoint. */
+/** Wire shape POSTed to the backend heartbeat endpoint. The one-click
+ *  update fields (wire contract v1, section 1) are OPTIONAL: an older
+ *  backend ignores them, and an invalid semver is ignored field-wise
+ *  server-side (never a 400). */
 export interface HeartbeatDto {
   daemonVersion?: string;
   uptimeS?: number;
   wsConnected?: boolean;
   lastError?: HeartbeatLastError | null;
+  latestKnownVersion?: string | null;
+  updateReadiness?: UpdateReadiness;
 }
 
 /** Local heartbeat file shape (contract C1). */
@@ -48,6 +54,10 @@ export interface HeartbeatDeps {
   version: string;
   /** Best-effort POST to the backend heartbeat endpoint. */
   postHeartbeat: (body: HeartbeatDto) => Promise<void>;
+  /** Optional one-click update telemetry snapshot, pulled per network post
+   *  (wire contract v1, section 1). Sync + never-throwing by contract of
+   *  UpdateTelemetrySource.snapshot(). */
+  getUpdateTelemetry?: () => UpdateTelemetry;
   /** Injectable clock for tests. */
   now?: () => number;
 }
@@ -178,6 +188,14 @@ export class HeartbeatController {
     return this.lastError?.code ?? null;
   }
 
+  /** Post one immediate network heartbeat outside the cadence, e.g. right
+   *  after an update is staged so pendingRestartVersion reaches the backend
+   *  without waiting a full interval. Best-effort like every network post. */
+  postNow(): void {
+    if (!this.started) return;
+    void this.postNetwork();
+  }
+
   snapshotFile(): HeartbeatFileState {
     return {
       ts: new Date(this.now()).toISOString(),
@@ -218,11 +236,18 @@ export class HeartbeatController {
       Math.floor((this.now() - this.startedAtMs) / 1000),
     );
     try {
+      const telemetry = this.deps.getUpdateTelemetry?.();
       await this.deps.postHeartbeat({
         daemonVersion: this.deps.version,
         uptimeS,
         wsConnected: this.wsConnected,
         lastError: this.lastError,
+        ...(telemetry
+          ? {
+              latestKnownVersion: telemetry.latestKnownVersion,
+              updateReadiness: telemetry.updateReadiness,
+            }
+          : {}),
       });
     } catch {
       /* best-effort: a heartbeat failure must never break the daemon */

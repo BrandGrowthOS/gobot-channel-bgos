@@ -62,7 +62,8 @@ The adapter resolves config in order: explicit constructor arg → env var → `
 | `BGOS_VOICE_VOICE` | `marin` | Realtime voice name. |
 | `BGOS_VOICE_PERSONA` | _(empty)_ | Extra persona text baked into the voice session instructions. |
 | `GOBOT_BGOS_HEARTBEAT_INTERVAL` | `60` (seconds) | Cadence for the daemon heartbeat that reports `daemon_version` + last error to the backend (surfaced in the BGOS Integrations card). `0` disables the network heartbeat; a local `$GOBOT_HOME/bgos_heartbeat.json` is always written for the watchdog. |
-| `BGOS_AUTO_UPDATE` | `on` | Same-major automatic updates are ON by default (unset or empty counts as on). Exact value `off` is the hard kill switch; any other value fails closed to disabled. |
+| `BGOS_AUTO_UPDATE` | `on` | Same-major automatic updates are ON by default (unset or empty counts as on). Exact value `off` is the hard kill switch (it also refuses one-click `update_rpc` requests with `updates_disabled`); any other value fails closed to disabled. |
+| `BGOS_SUPERVISED` | _(unset)_ | The host DECLARES its own supervisor for one-click updates: one of `systemd` \| `launchd` \| `launcher` \| `supervise-npm` \| `pm2`. Anything else counts as unsupervised. Unset, a boot under the package-owned daemon wrapper still counts as `launcher`. Without a verified supervisor the daemon never exits for an update: it installs to disk, reports `staged`, and waits for a host restart. |
 | `GOBOT_BGOS_BACKFILL_STORM_LIMIT` | `25` | If a single REST backfill returns more than this many messages, the cursor fast-forwards and dispatch is skipped (prevents a history-replay storm after a long outage). `0` disables the guard. |
 | `GOBOT_BGOS_CHAT_ID` / `GOBOT_BGOS_CHAT_ID_<assistantId>` | _(auto)_ | **Rarely needed.** Proactive messages (check-ins, briefings) self-resolve their delivery chat via the backend, so you do not normally set this. Set it only to pin a specific chat. |
 
@@ -108,6 +109,14 @@ Rollback state is stored at `$GOBOT_HOME/bgos_auto_update.json`, next to the hea
 Legacy installs that applied the public hook as a local commit can be divergent from their tracked upstream. The updater reports `not-fast-forward` and leaves them unchanged. Move custom work onto the private fork or reconcile that history manually before opting in. The updater never resets or forces a legacy checkout.
 
 The pre-import guarantee applies to the package-owned wrapper installed by recommended setup. A manual `bun run src/bot.ts` launch does not have the parent wrapper, so rerun setup after upgrading an existing host.
+
+## One-click update from the BGOS app (`update_rpc`)
+
+Since v0.17.1 the daemon also serves the BGOS one-click update control plane (wire contract v1, `docs/handoff/one-click-plugin-update/wire-contract.md` in `BrandGrowthOS/BGOS`):
+
+- **Heartbeat telemetry.** Every network heartbeat now carries `latestKnownVersion` (the newest `gobot-channel-bgos` on the npm registry, checked at most daily, `null` on any failure) and `updateReadiness` (`supervised`, `autoUpdateEnabled`, `rollbackLatched`, `pendingRestartVersion`). The backend renders these into the Integrations card's update state.
+- **`update_rpc {rpcId, op:'update_now'}`** arrives over the pairing WS room when the user taps Update. The frame carries no version, url, or script by design; the daemon resolves the target from the npm registry itself and refuses cross-major jumps. It acks, drains in-flight work, installs the exact latest version with the same tracked-file-preserving `bun install … --no-save` path the periodic updater uses, then either requests a supervised restart (progress `restarting`, SIGTERM to the Gobot process) or, without a verified supervisor, reports `staged` and resumes: the new version sits in `node_modules` and `pendingRestartVersion` rides the heartbeat until the host restarts. Because this package runs IN-PROCESS inside the Gobot host, a restart is a whole-host restart.
+- **Fail closed.** `BGOS_AUTO_UPDATE=off` answers `updates_disabled`; a tripped rollback latch answers `rollback_latched`; a host whose working directory (or `GOBOT_INSTALL_DIR`) is not inside a fork checkout that lists `gobot-channel-bgos` answers `fork_root_not_found`; the existing dirty-tree, constraint, and rollback brakes of the periodic updater stay authoritative.
 
 ## Prerequisites
 
@@ -216,3 +225,5 @@ MIT.
 ### OpenAI native call context
 
 Use `replyHandle.callOwner?.(reason, { context, openingMessage })` to ring the owner as the current chat agent. A `needs_setup` result includes guidance to relay to the owner. With the updated HOAI app/backend and GPT-Live selected, optional `context` (4000 characters) adds private background and `openingMessage` (400 characters) suggests the first sentence after answer. HOAI always includes the last 12 usable authorized chat messages, or all available if fewer. Long text is bounded to the voice budget. Keep `reason` short and public. ElevenLabs settings and call behavior stay unchanged.
+
+The 0.17.1 release also serializes app requests with the periodic updater, checks the host's declared dependency range before installation, verifies the installed version, and restores message intake after installation errors. It preserves the 0.17 host range and the recent custom call context and opening sentence support. An incompatible host must be upgraded before its plugin can move beyond that range.
