@@ -28,7 +28,7 @@ import {
   PLUGIN_PACKAGE_NAME,
   WRAPPED_BOOT_COMMIT_ENV,
 } from "./self-update.js";
-import { parseExactStableNpmVersion } from "./update-version-policy.js";
+import { parseExactStableNpmVersion, parseForkPluginConstraint, candidateSatisfiesForkPluginConstraint } from "./update-version-policy.js";
 
 /** Contract enum for updateReadiness.supervised (besides 'none'). */
 export const SUPERVISED_KINDS = [
@@ -65,6 +65,18 @@ export interface UpdateReadiness {
   autoUpdateEnabled: boolean;
   rollbackLatched: boolean;
   pendingRestartVersion: string | null;
+}
+
+/** The in-process host's dependency range is stricter than same-major. */
+export function forkAcceptsPluginVersion(root: string, version: string): boolean {
+  try {
+    const manifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
+    const spec = manifest.dependencies?.[PLUGIN_PACKAGE_NAME] ?? manifest.optionalDependencies?.[PLUGIN_PACKAGE_NAME];
+    const constraint = typeof spec === "string" ? parseForkPluginConstraint(spec) : null;
+    return constraint !== null && candidateSatisfiesForkPluginConstraint(version, constraint);
+  } catch {
+    return false;
+  }
 }
 
 export interface UpdateTelemetry {

@@ -112,7 +112,7 @@ The pre-import guarantee applies to the package-owned wrapper installed by recom
 
 ## One-click update from the BGOS app (`update_rpc`)
 
-Since v0.17.0 the daemon also serves the BGOS one-click update control plane (wire contract v1, `docs/handoff/one-click-plugin-update/wire-contract.md` in `BrandGrowthOS/BGOS`):
+Since v0.17.1 the daemon also serves the BGOS one-click update control plane (wire contract v1, `docs/handoff/one-click-plugin-update/wire-contract.md` in `BrandGrowthOS/BGOS`):
 
 - **Heartbeat telemetry.** Every network heartbeat now carries `latestKnownVersion` (the newest `gobot-channel-bgos` on the npm registry, checked at most daily, `null` on any failure) and `updateReadiness` (`supervised`, `autoUpdateEnabled`, `rollbackLatched`, `pendingRestartVersion`). The backend renders these into the Integrations card's update state.
 - **`update_rpc {rpcId, op:'update_now'}`** arrives over the pairing WS room when the user taps Update. The frame carries no version, url, or script by design; the daemon resolves the target from the npm registry itself and refuses cross-major jumps. It acks, drains in-flight work, installs the exact latest version with the same tracked-file-preserving `bun install … --no-save` path the periodic updater uses, then either requests a supervised restart (progress `restarting`, SIGTERM to the Gobot process) or, without a verified supervisor, reports `staged` and resumes: the new version sits in `node_modules` and `pendingRestartVersion` rides the heartbeat until the host restarts. Because this package runs IN-PROCESS inside the Gobot host, a restart is a whole-host restart.
@@ -221,3 +221,9 @@ The package is also mirrored inside the BGOS monorepo at `gobot-channel-bgos/`; 
 ## License
 
 MIT.
+
+### OpenAI native call context
+
+Use `replyHandle.callOwner?.(reason, { context, openingMessage })` to ring the owner as the current chat agent. A `needs_setup` result includes guidance to relay to the owner. With the updated HOAI app/backend and GPT-Live selected, optional `context` (4000 characters) adds private background and `openingMessage` (400 characters) suggests the first sentence after answer. HOAI always includes the last 12 usable authorized chat messages, or all available if fewer. Long text is bounded to the voice budget. Keep `reason` short and public. ElevenLabs settings and call behavior stay unchanged.
+
+The 0.17.1 release also serializes app requests with the periodic updater, checks the host's declared dependency range before installation, verifies the installed version, and restores message intake after installation errors. It preserves the 0.17 host range and the recent custom call context and opening sentence support. An incompatible host must be upgraded before its plugin can move beyond that range.

@@ -456,6 +456,7 @@ export class BGOSAdapter {
     // waits on activeMessageCount, so counting the update itself as active
     // work would deadlock the drain.
     this.updateRpc = new UpdateRpcHandler({
+      acquireUpdate: () => this.autoUpdate.tryBeginManualUpdate(),
       api: this.api,
       runningVersion: getPackageVersion(),
       drain: () => this.drainForUpdate(),

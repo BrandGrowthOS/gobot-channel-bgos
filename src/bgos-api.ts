@@ -1,3 +1,5 @@
+import { callContextFields } from "./call-context.js";
+import { getPackageVersion } from "./version.js";
 import axios, { type AxiosInstance } from "axios";
 
 import {
@@ -74,12 +76,95 @@ export interface CompleteMissionBody {
  * (WS client, outbound adapter) can short-circuit and let the setup
  * wizard prompt for re-pair.
  */
+export const OUTBOUND_CALL_SETUP_CODES = [
+  "voice_not_configured",
+  "no_voice_agent_id",
+  "openai_key_missing",
+  "runtime_offline",
+] as const;
+
+export type OutboundCallSetupCode = (typeof OUTBOUND_CALL_SETUP_CODES)[number];
+
+/**
+ * Result of an outbound "call my owner" request (see
+ * {@link BgosApi.triggerOutboundCall} / `BgosOutbound.callOwner`).
+ *
+ *  - `ringing`      the call was placed; the owner's BGOS app is ringing.
+ *  - `needs_setup`  voice isn't configured for this owner/assistant; the
+ *                   call was NOT placed. Surface `guidance` to the user so
+ *                   they can enable voice, this is the graceful no-voice path.
+ */
+export type OutboundCallResult =
+  | { status: "ringing"; callId: string; expiresAt: string }
+  | {
+      status: "needs_setup";
+      code: string;
+      message: string;
+      guidance: string;
+    };
+
+/**
+ * Narrow an axios error to a structured voice-setup failure. Returns a
+ * `needs_setup` result ONLY when the response body carries a recognized
+ * setup `code` (see {@link OUTBOUND_CALL_SETUP_CODES}) AND a string
+ * `guidance`; otherwise `null` so the caller rethrows the original error.
+ */
+function asOutboundCallSetupError(err: unknown): OutboundCallResult | null {
+  const data = (err as { response?: { data?: unknown } })?.response?.data;
+  if (!data || typeof data !== "object") return null;
+  const { code, message, guidance } = data as {
+    code?: unknown;
+    message?: unknown;
+    guidance?: unknown;
+  };
+  if (
+    typeof code === "string" &&
+    (OUTBOUND_CALL_SETUP_CODES as readonly string[]).includes(code) &&
+    typeof guidance === "string"
+  ) {
+    return {
+      status: "needs_setup",
+      code,
+      message: typeof message === "string" ? message : "",
+      guidance,
+    };
+  }
+  return null;
+}
+
 export class BgosApi {
   private readonly http: AxiosInstance;
   private readonly conditionalGetCache = new Map<
     string,
     ConditionalGetCacheEntry
   >();
+
+  async triggerOutboundCall(input: {
+    assistantId: number;
+    chatId?: number;
+    reason?: string;
+    context?: string;
+    openingMessage?: string;
+  }): Promise<OutboundCallResult> {
+    try {
+      const r = await this.http.post("voice/outbound-call", {
+        assistantId: input.assistantId,
+        ...callContextFields(input),
+        ...(input.chatId !== undefined && { chatId: input.chatId }),
+        ...(input.reason !== undefined && { reason: input.reason }),
+      });
+      const data = (r.data ?? {}) as { callId: string; expiresAt: string };
+      return {
+        status: "ringing",
+        callId: data.callId,
+        expiresAt: data.expiresAt,
+      };
+    } catch (err) {
+      const setup = asOutboundCallSetupError(err);
+      if (setup) return setup;
+      throw err;
+    }
+  }
 
   constructor(cfg: PluginConfig) {
     this.http = axios.create({
@@ -233,7 +318,7 @@ export class BgosApi {
     // (memory DoS). axios rejects past maxContentLength and the caller keeps
     // the bundled fallback.
     const r = await this.http.get("integrations/capabilities", {
-      params: { channel },
+      params: { channel, daemonVersion: getPackageVersion() },
       maxContentLength: 1024 * 1024,
       maxBodyLength: 1024 * 1024,
     });
@@ -280,10 +365,9 @@ export class BgosApi {
     assistantId: number,
     commands: CommandManifestEntry[],
   ): Promise<void> {
-    await this.http.put(
-      `integrations/assistants/${assistantId}/commands`,
-      { commands },
-    );
+    await this.http.put(`integrations/assistants/${assistantId}/commands`, {
+      commands,
+    });
   }
 
   /** REST backfill after a WS reconnect. */
@@ -343,9 +427,7 @@ export class BgosApi {
   }
 
   /** Agent reply — assistant message with optional inline buttons/approval. */
-  async postMessage(
-    payload: OutboundMessagePayload,
-  ): Promise<{ id: number }> {
+  async postMessage(payload: OutboundMessagePayload): Promise<{ id: number }> {
     const r = await this.http.post("messages", payload);
     return r.data;
   }
@@ -364,9 +446,7 @@ export class BgosApi {
    * created message nested under `message` (HTTP 200) rather than a bare
    * `{ id }` (HTTP 201), so unwrap both shapes.
    */
-  async sendMessage(
-    payload: OutboundMessagePayload,
-  ): Promise<{ id: number }> {
+  async sendMessage(payload: OutboundMessagePayload): Promise<{ id: number }> {
     const r = await this.http.post("send-message", payload);
     const data = (r.data ?? {}) as {
       id?: number;

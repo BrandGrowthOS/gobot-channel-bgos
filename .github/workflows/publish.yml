@@ -46,6 +46,10 @@ jobs:
         if: steps.check.outputs.publish == 'true'
         run: npm run build
 
+      - name: Test before publishing
+        if: steps.check.outputs.publish == 'true'
+        run: npm test -- --maxWorkers=2 --minWorkers=1
+
       - name: Publish
         if: steps.check.outputs.publish == 'true'
         run: npm publish --access public

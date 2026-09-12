@@ -60,6 +60,19 @@ describe("auto-update flag gate", () => {
     expect(parseAutoUpdateFlag(" on ")).toBe("invalid");
   });
 
+  it("shares the periodic updater lock with a manual install and releases it", () => {
+    const controller = new AutoUpdateController({ env: {} });
+    const release = controller.tryBeginManualUpdate();
+    expect(release).not.toBeNull();
+    expect(controller.tryBeginManualUpdate()).toBeNull();
+    release?.();
+    const next = controller.tryBeginManualUpdate();
+    expect(next).not.toBeNull();
+    next?.();
+    controller.stop();
+    expect(controller.tryBeginManualUpdate()).toBeNull();
+  });
+
   it("does no IO, command, check, or timer work with an invalid flag value", async () => {
     const dir = tempDir();
     const statePath = join(dir, "bgos_auto_update.json");

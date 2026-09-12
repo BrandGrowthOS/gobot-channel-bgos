@@ -1282,6 +1282,13 @@ export class AutoUpdateController {
     this.timer.unref?.();
   }
 
+  /** Share the periodic updater's lock with an app-requested install. */
+  tryBeginManualUpdate(): (() => void) | null {
+    if (this.checking || this.stopped) return null;
+    this.checking = true;
+    return () => { this.checking = false; };
+  }
+
   private async checkAndApply(): Promise<AutoUpdateStartResult> {
     if (this.checking || this.stopped) return "running";
     this.checking = true;

@@ -55,6 +55,7 @@ function makeHandler(overrides: Partial<UpdateRpcDeps> = {}): {
     registryVersionReader: async () => "0.16.1",
     forkRootResolver: () => "/fork",
     installPlugin: () => OK,
+    isVersionCompatible: () => true,
     installedPluginVersionReader: () => "0.16.1",
     latchReader: () => false,
     supervisedResolver: () => "none",
@@ -88,6 +89,47 @@ describe("normalizeUpdateRpc", () => {
 });
 
 describe("UpdateRpcHandler decision table", () => {
+  it("refuses an update outside the current host dependency range", async () => {
+    const { handler, recorded, drain } = makeHandler({ isVersionCompatible: () => false });
+    await handler.handle({ rpcId: "incompatible-host", op: "update_now" });
+    expect(recorded.progresses.at(-1)?.body.message).toBe("fork_update_required");
+    expect(drain).not.toHaveBeenCalled();
+  });
+  it.each(["drain", "install", "read"])("resumes intake after a thrown %s failure", async (phase) => {
+    const fail = () => { throw new Error("unexpected IO failure"); };
+    const overrides: Partial<UpdateRpcDeps> = phase === "drain" ? { drain: async () => fail() }
+      : phase === "install" ? { installPlugin: fail } : { installedPluginVersionReader: fail };
+    const release = vi.fn();
+    const { handler, recorded, resume, restart } = makeHandler({ ...overrides, acquireUpdate: () => release });
+    await handler.handle({ rpcId: "throws", op: "update_now" });
+    expect(resume).toHaveBeenCalledOnce();
+    expect(restart).not.toHaveBeenCalled();
+    expect(recorded.progresses.at(-1)?.body.message).toBe("update_failed");
+    expect(release).toHaveBeenCalledOnce();
+  });
+
+  it("does not compete with the periodic updater", async () => {
+    const { handler, recorded, drain, resume } = makeHandler({ acquireUpdate: () => null });
+    await handler.handle({ rpcId: "busy", op: "update_now" });
+    expect(recorded.progresses.at(-1)?.body.message).toBe("update_in_flight");
+    expect(drain).not.toHaveBeenCalled();
+    expect(resume).not.toHaveBeenCalled();
+  });
+
+  it("does not report a different installed version as success", async () => {
+    const { handler, recorded, resume, restart } = makeHandler({ installedPluginVersionReader: () => "0.16.0" });
+    await handler.handle({ rpcId: "wrong-version", op: "update_now" });
+    expect(recorded.progresses.at(-1)?.body.message).toBe("install_version_mismatch");
+    expect(resume).toHaveBeenCalledOnce();
+    expect(restart).not.toHaveBeenCalled();
+  });
+
+  it("arms the supervised fallback even if shutdown hangs", async () => {
+    const { handler, hardExit } = makeHandler({ supervisedResolver: () => "systemd", shutdown: () => new Promise(() => {}) });
+    await handler.handle({ rpcId: "hung-stop", op: "update_now" });
+    await vi.waitFor(() => expect(hardExit).toHaveBeenCalledWith(0));
+  });
+
   it("kill switch off -> ack then error updates_disabled, nothing drained", async () => {
     const { handler, recorded, drain } = makeHandler({
       env: { BGOS_AUTO_UPDATE: "off" },
@@ -143,14 +185,14 @@ describe("UpdateRpcHandler decision table", () => {
     expect(drain).not.toHaveBeenCalled();
   });
 
-  it("registry failure -> no_update_available (fail closed, no crash)", async () => {
+  it("registry failure -> version_check_failed (fail closed, no crash)", async () => {
     const { handler, recorded } = makeHandler({
       registryVersionReader: async () => {
         throw new Error("registry down");
       },
     });
     await handler.handle({ rpcId: "r1", op: "update_now" });
-    expect(recorded.progresses[0]!.body.message).toBe("no_update_available");
+    expect(recorded.progresses[0]!.body.message).toBe("version_check_failed");
   });
 
   it("install failure -> draining, installing, error install_failed + resume", async () => {

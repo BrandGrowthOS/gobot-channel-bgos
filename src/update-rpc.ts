@@ -43,6 +43,7 @@ import {
 import { parseExactStableNpmVersion } from "./update-version-policy.js";
 import {
   readRollbackLatched,
+  forkAcceptsPluginVersion,
   resolveForkRoot,
   resolveSupervised,
   type SupervisedKind,
@@ -99,6 +100,8 @@ export const RESTART_DELAY_MS = 250;
 export const RESTART_HARD_EXIT_MS = 15_000;
 
 export interface UpdateRpcDeps {
+  /** Same lock as the periodic updater, held through install and drain. */
+  acquireUpdate?: () => (() => void) | null;
   api: UpdateRpcApi;
   /** The RUNNING daemon version (getPackageVersion()). */
   runningVersion: string;
@@ -117,6 +120,7 @@ export interface UpdateRpcDeps {
   registryVersionReader?: () => Promise<string>;
   forkRootResolver?: () => string | null;
   installPlugin?: (checkoutRoot: string, version: string) => CommandResult;
+  isVersionCompatible?: (checkoutRoot: string, version: string) => boolean;
   installedPluginVersionReader?: (checkoutRoot: string) => string | null;
   latchReader?: () => boolean;
   supervisedResolver?: () => SupervisedKind;
@@ -203,9 +207,19 @@ export class UpdateRpcHandler {
         return;
       }
       this.updateRunning = true;
+      const release = this.deps.acquireUpdate ? this.deps.acquireUpdate() : () => {};
       try {
+        if (!release) {
+          await this.postError(frame.rpcId, "update_in_flight");
+          return;
+        }
         await this.runUpdate(frame.rpcId);
+      } catch (err) {
+        this.log(`update_rpc failed (rpc=${frame.rpcId}): ${err instanceof Error ? err.message : String(err)}`);
+        await this.resumeQuietly();
+        await this.postError(frame.rpcId, "update_failed");
       } finally {
+        release?.();
         this.updateRunning = false;
       }
     } finally {
@@ -242,7 +256,7 @@ export class UpdateRpcHandler {
           err instanceof Error ? err.message : String(err)
         }`,
       );
-      await this.postError(rpcId, "no_update_available");
+      await this.postError(rpcId, "version_check_failed");
       return;
     }
     if (
@@ -250,6 +264,11 @@ export class UpdateRpcHandler {
       decideVersionUpdate(this.deps.runningVersion, latest) !== "update"
     ) {
       await this.postError(rpcId, "no_update_available");
+      return;
+    }
+
+    if (!(this.deps.isVersionCompatible ?? forkAcceptsPluginVersion)(forkRoot, latest)) {
+      await this.postError(rpcId, "fork_update_required", latest);
       return;
     }
 
@@ -291,6 +310,11 @@ export class UpdateRpcHandler {
       await this.postError(rpcId, "contract_major_mismatch", latest);
       return;
     }
+    if (onDisk !== latest) {
+      await this.resumeQuietly();
+      await this.postError(rpcId, "install_version_mismatch", latest);
+      return;
+    }
 
     if (this.supervisedResolver() !== "none") {
       // The progress POST must RESOLVE before the exit path arms, so the
@@ -326,6 +350,10 @@ export class UpdateRpcHandler {
   private scheduleSupervisedRestart(): void {
     const timer = setTimeout(() => {
       void (async () => {
+        // Arm before awaiting shutdown: a hung drain must not prevent the
+        // verified supervisor from receiving an exit at all.
+        const fallback = setTimeout(() => this.hardExit(0), this.hardExitDelayMs);
+        (fallback as { unref?: () => void }).unref?.();
         try {
           await this.deps.shutdown();
         } catch (err) {
@@ -346,11 +374,6 @@ export class UpdateRpcHandler {
         }
         // Belt for a host that ignores SIGTERM: supervision was verified,
         // so a hard exit is always relaunched.
-        const fallback = setTimeout(
-          () => this.hardExit(0),
-          this.hardExitDelayMs,
-        );
-        (fallback as { unref?: () => void }).unref?.();
       })();
     }, this.restartDelayMs);
     (timer as { unref?: () => void }).unref?.();
