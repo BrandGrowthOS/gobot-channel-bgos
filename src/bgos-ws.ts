@@ -291,8 +291,8 @@ export class BgosWs {
       // leaves it unconsumed until identity heals.
       const knownSet = new Set(known);
       const cursorOf = agentCursorReader();
-      // An agent not known (yet) is the handler's to decide, but one with a
-      // cursor of its own already consumed what is at or below it.
+      // An agent not known (yet) is the handler's to decide, unless it has a
+      // cursor of its own: then what is at or below it is already consumed.
       const hasCursor = new Set(agentCursorIds());
       const fresh = normalized.filter((m) =>
         knownSet.has(m.assistantId) || hasCursor.has(m.assistantId)
@@ -312,7 +312,7 @@ export class BgosWs {
         // The inbound handler dedupes (processed-ids) + persists the agent's cursor.
         this.emitter.emit("inbound_message", m);
       }
-      this.advanceIdle(known, normalized, messages.length);
+      this.advanceIdle(known, normalized, fresh, messages.length);
       this.emitter.emit("backfill_ok");
     } catch (err) {
       const e = err instanceof Error ? err : new Error(String(err));
@@ -335,6 +335,7 @@ export class BgosWs {
   private advanceIdle(
     known: number[],
     polled: InboundMessagePayload[],
+    fresh: InboundMessagePayload[],
     rawRowCount: number,
   ): void {
     if (polled.length === 0 || known.length === 0) return;
@@ -344,6 +345,10 @@ export class BgosWs {
     let lowestUnknown = Infinity;
     for (const m of polled) {
       if (m.messageId > last) last = m.messageId;
+    }
+    // Only an unknown agent's row that was kept (not already consumed by that
+    // agent, see the filter above) is a hole the carry must stay below.
+    for (const m of fresh) {
       if (!knownSet.has(m.assistantId) && m.messageId < lowestUnknown) {
         lowestUnknown = m.messageId;
       }

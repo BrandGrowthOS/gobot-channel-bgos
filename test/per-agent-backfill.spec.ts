@@ -326,4 +326,19 @@ describe("BgosWs.triggerBackfill, per-agent cursors", () => {
 
     expect(emitted).toHaveLength(0);
   });
+
+  it("a consumed row of an unknown agent does not pin an idle known agent", async () => {
+    pollSince([1, 2, 3]);
+    saveAgentCursor(1, 100);
+    saveAgentCursor(2, 100);
+    saveAgentCursor(3, 150); // agent 3 consumed 150, then was unexposed
+    server.stage("GET", INBOUND, 200, {
+      messages: [row(150, 3), row(300, 1), row(400, 1)],
+    });
+    const { ws } = makeWs(baseUrl, [1, 2]); // 3 not known; agent 2 is idle
+
+    await ws.triggerBackfill();
+
+    expect(loadAgentCursor(2)).toBe(400);
+  });
 });
