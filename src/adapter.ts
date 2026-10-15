@@ -205,6 +205,7 @@ export class BGOSAdapter {
     this.api = new BgosApi(this.cfg);
     this.ws = new BgosWs(this.cfg, this.api);
     this.ws.setKnownAssistants(() => [...this.assistantToRoute.keys()]);
+    this.ws.setIdentityReady(() => this.identityReady);
     this.outbound = new BgosOutbound(this.api);
     this.approvals = new ApprovalHandler(this.outbound);
     this.commandsSync = new CommandsSync(this.api);

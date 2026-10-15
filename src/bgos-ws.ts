@@ -83,6 +83,8 @@ export class BgosWs {
   /** The agents this gateway serves (bound assistant ids); the adapter wires
    *  its route map in. Each has its own poll cursor. */
   private knownAssistantIds: () => number[] = () => [];
+  /** True once the adapter has loaded identity (its route map is real). */
+  private identityReady: () => boolean = () => true;
   /** The agents the previous poll served, to spot one that is back. */
   private previousKnown: Set<number> | null = null;
 
@@ -105,6 +107,11 @@ export class BgosWs {
   ): this {
     this.emitter.off(event, listener as (...args: unknown[]) => void);
     return this;
+  }
+
+  /** Tell the poll whether the known agents are loaded yet. */
+  setIdentityReady(fn: () => boolean): void {
+    this.identityReady = fn;
   }
 
   /** Tell the poll which agents this gateway serves. */
@@ -240,9 +247,10 @@ export class BgosWs {
   private async runBackfill(initial: boolean): Promise<void> {
     try {
       const known = this.knownAssistantIds();
-      // An empty known set (identity not loaded yet) says nothing about who is
-      // away: it must neither rebase anyone nor become the baseline.
-      if (known.length > 0) {
+      // Who is away is only knowable once identity has loaded: a poll before
+      // that sees an empty route map, which must neither rebase anyone nor
+      // become the baseline. An empty set AFTER it is real (nothing exposed).
+      if (this.identityReady()) {
         if (this.previousKnown !== null) {
           const prev = this.previousKnown;
           rebaseReexposedAgents(known.filter((id) => !prev.has(id)));
