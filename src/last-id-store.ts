@@ -190,7 +190,10 @@ export function pollSince(knownAssistantIds: readonly number[]): number {
       changed = true;
     }
   }
-  if (file.migrating !== undefined) {
+  // Only a poll that serves agents hands the migrated value over: one with none
+  // known (identity not loaded, or nothing exposed) keeps it for the agents
+  // that come, or a live message could move the head past it first.
+  if (file.migrating !== undefined && knownAssistantIds.length > 0) {
     delete file.migrating;
     changed = true;
   }

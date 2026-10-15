@@ -102,6 +102,14 @@ describe("last-id-store", () => {
     expect(loadAgentCursor(2)).toBe(480);
   });
 
+  it("MIGRATION: a poll with no known agents keeps the old cursor for the agents that come", () => {
+    writeFileSync(join(tempHome, "bgos_last_id"), "3000", "utf8");
+    expect(pollSince([])).toBe(3000); // identity not loaded yet
+    saveAgentCursor(1, 3500); // a live message moves the head past it
+    expect(loadAgentCursor(2)).toBe(3000);
+    expect(pollSince([1, 2])).toBe(3000);
+  });
+
   it("an agent exposed after the first poll starts at the head, not at a stale value", () => {
     writeFileSync(join(tempHome, "bgos_last_id"), "480", "utf8");
     expect(pollSince([1])).toBe(480);
