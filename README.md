@@ -231,4 +231,6 @@ Use `replyHandle.callOwner?.(reason, { context, openingMessage })` to ring the o
 
 The poll cursor is kept per agent (per assistant id), not per gateway. The backend serves a message addressed to several agents as one poll row per agent, all with the same message id, so one shared cursor (and an id-only dedupe) let the first agent's row hide the others'. Now the poll starts from the lowest cursor of the agents this gateway serves, each row is kept only past its own agent's cursor, dedupe is per (agent, message), and an agent with nothing in a poll is carried up to what the poll covered (never past a row for an agent not exposed yet) so it never pins the window. The cursors live in `$GOBOT_HOME/bgos_last_ids.json`; the old `bgos_last_id` is migrated once on first start. Inbound messages have no separate acknowledgement call: the persisted cursor is the acknowledgement.
 
+### 0.17.1
+
 The 0.17.1 release also serializes app requests with the periodic updater, checks the host's declared dependency range before installation, verifies the installed version, and restores message intake after installation errors. It preserves the 0.17 host range and the recent custom call context and opening sentence support. An incompatible host must be upgraded before its plugin can move beyond that range.
