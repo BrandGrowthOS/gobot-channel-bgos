@@ -186,7 +186,7 @@ No fork changes are required; the adapter wires everything through the already-r
 
 **Reset everything:**
 ```bash
-rm -rf ~/.gobot/secrets ~/.gobot/bgos_last_id
+rm -rf ~/.gobot/secrets ~/.gobot/bgos_last_id ~/.gobot/bgos_last_ids.json
 gobot-pair-bgos <NEW-CODE>
 # restart Gobot
 ```

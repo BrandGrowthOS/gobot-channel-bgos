@@ -256,4 +256,23 @@ describe("BgosWs.triggerBackfill, per-agent cursors", () => {
     expect(sinceOf(server, 2)).toBe(3500);
     expect(emitted.map((m) => `${m.assistantId}:${m.messageId}`)).toEqual(["1:4000"]);
   });
+
+  it("a poll before identity is loaded (no agents known) does not rebase anyone later", async () => {
+    pollSince([1, 2]);
+    saveAgentCursor(1, 100);
+    saveAgentCursor(2, 100);
+    saveAgentCursor(1, 900); // head moves on; agent 2 still has rows below it
+    const known: number[] = [];
+    const { ws, emitted } = makeWs(baseUrl, known);
+
+    server.stage("GET", INBOUND, 200, { messages: [] });
+    await ws.triggerBackfill(); // identity not loaded: nothing known
+
+    known.push(1, 2); // identity loaded
+    server.stage("GET", INBOUND, 200, { messages: [row(500, 2)] });
+    await ws.triggerBackfill({ initial: true });
+
+    expect(sinceOf(server, 1)).toBe(100);
+    expect(emitted.map((m) => `${m.assistantId}:${m.messageId}`)).toEqual(["2:500"]);
+  });
 });

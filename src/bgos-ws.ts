@@ -240,11 +240,15 @@ export class BgosWs {
   private async runBackfill(initial: boolean): Promise<void> {
     try {
       const known = this.knownAssistantIds();
-      if (this.previousKnown !== null) {
-        const prev = this.previousKnown;
-        rebaseReexposedAgents(known.filter((id) => !prev.has(id)));
+      // An empty known set (identity not loaded yet) says nothing about who is
+      // away: it must neither rebase anyone nor become the baseline.
+      if (known.length > 0) {
+        if (this.previousKnown !== null) {
+          const prev = this.previousKnown;
+          rebaseReexposedAgents(known.filter((id) => !prev.has(id)));
+        }
+        this.previousKnown = new Set(known);
       }
-      this.previousKnown = new Set(known);
       const since = pollSince(known);
       if (initial && isColdStart()) {
         await this.coldStartSeed();
