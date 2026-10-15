@@ -180,7 +180,7 @@ No fork changes are required; the adapter wires everything through the already-r
 **Replies are duplicated after every restart:**
 - The persisted cursors at `$GOBOT_HOME/bgos_last_ids.json` failed to update. Each agent's entry MUST advance with every message that agent processed; if they stay at 0, every restart replays history.
 - Reset manually: write `{"version":1,"head":<max-message-id>,"agents":{}}` to `~/.gobot/bgos_last_ids.json`. Or `rm` it to start fresh (will replay everything once, unless an old `bgos_last_id` is still there: it is read once as the starting value).
-- Upgrading from 0.17: the old single `bgos_last_id` is migrated on first start. Every agent known at the first poll starts from its value, so nothing is replayed and nothing is skipped; an agent exposed later starts at the newest consumed id. The old file is left in place and no longer written; a downgrade would resume from that frozen value, and the backfill storm guard fast-forwards past anything beyond its limit.
+- Upgrading from 0.17.1 or older: the old single `bgos_last_id` is migrated on first start. Every agent known at the first poll starts from its value, so nothing is replayed and nothing is skipped; an agent exposed later starts at the newest consumed id. The old file is left in place and no longer written; a downgrade would resume from that frozen value, and the backfill storm guard fast-forwards past anything beyond its limit.
 
 **Logs:** the fork pipes adapter output through Gobot's logger. On a default Mac install, look in `~/.gobot/logs/`.
 
@@ -227,7 +227,7 @@ MIT.
 
 Use `replyHandle.callOwner?.(reason, { context, openingMessage })` to ring the owner as the current chat agent. A `needs_setup` result includes guidance to relay to the owner. With the updated HOAI app/backend and GPT-Live selected, optional `context` (4000 characters) adds private background and `openingMessage` (400 characters) suggests the first sentence after answer. HOAI always includes the last 12 usable authorized chat messages, or all available if fewer. Long text is bounded to the voice budget. Keep `reason` short and public. ElevenLabs settings and call behavior stay unchanged.
 
-### Per-agent poll cursors (0.18.0)
+### Per-agent poll cursors (0.17.2)
 
 The poll cursor is kept per agent (per assistant id), not per gateway. The backend serves a message addressed to several agents as one poll row per agent, all with the same message id, so one shared cursor (and an id-only dedupe) let the first agent's row hide the others'. Now the poll starts from the lowest cursor of the agents this gateway serves, each row is kept only past its own agent's cursor, dedupe is per (agent, message), and an agent with nothing in a poll is carried up to what the poll covered (never past a row for an agent not exposed yet) so it never pins the window. The cursors live in `$GOBOT_HOME/bgos_last_ids.json`; the old `bgos_last_id` is migrated once on first start. Inbound messages have no separate acknowledgement call: the persisted cursor is the acknowledgement.
 
