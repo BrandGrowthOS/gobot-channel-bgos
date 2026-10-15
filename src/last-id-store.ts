@@ -205,6 +205,34 @@ export function pollSince(knownAssistantIds: readonly number[]): number {
 }
 
 /**
+ * Agents that were absent from the known set and are back (removed from the
+ * pairing, then exposed again while this gateway ran) rejoin at the head like
+ * an agent seen for the first time: what arrived for them while away is history
+ * they were not part of, not a backlog to replay or a storm to trip over. Never
+ * moves a cursor down, and stays below the agent's own pending-unknown row.
+ */
+export function rebaseReexposedAgents(assistantIds: readonly number[]): void {
+  if (assistantIds.length === 0) return;
+  try {
+    const file = loadCursors();
+    let changed = false;
+    for (const aid of assistantIds) {
+      const own = file.agents[String(aid)];
+      if (own === undefined) continue;
+      const hole = lowestPendingUnknown(aid);
+      const target = hole !== null ? Math.min(file.head, Math.max(0, hole - 1)) : file.head;
+      if (target > own) {
+        file.agents[String(aid)] = target;
+        changed = true;
+      }
+    }
+    if (changed) writeCursors(file);
+  } catch {
+    /* swallow: see module docstring */
+  }
+}
+
+/**
  * Atomically persist ONE agent's cursor.
  *
  * Skips:

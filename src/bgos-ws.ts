@@ -7,6 +7,7 @@ import {
   agentCursorReader,
   isColdStart,
   pollSince,
+  rebaseReexposedAgents,
   seedAllCursors,
 } from "./last-id-store.js";
 import { normalizeVoiceRpc, type VoiceRpcFrame } from "./voice-rpc.js";
@@ -82,6 +83,8 @@ export class BgosWs {
   /** The agents this gateway serves (bound assistant ids); the adapter wires
    *  its route map in. Each has its own poll cursor. */
   private knownAssistantIds: () => number[] = () => [];
+  /** The agents the previous poll served, to spot one that is back. */
+  private previousKnown: Set<number> | null = null;
 
   constructor(
     private cfg: PluginConfig,
@@ -237,6 +240,11 @@ export class BgosWs {
   private async runBackfill(initial: boolean): Promise<void> {
     try {
       const known = this.knownAssistantIds();
+      if (this.previousKnown !== null) {
+        const prev = this.previousKnown;
+        rebaseReexposedAgents(known.filter((id) => !prev.has(id)));
+      }
+      this.previousKnown = new Set(known);
       const since = pollSince(known);
       if (initial && isColdStart()) {
         await this.coldStartSeed();

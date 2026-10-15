@@ -231,4 +231,29 @@ describe("BgosWs.triggerBackfill, per-agent cursors", () => {
     expect(sinceOf(server)).toBe(90000);
     expect(emitted.map((m) => `${m.assistantId}:${m.messageId}`)).toEqual(["1:90100"]);
   });
+
+  it("an agent removed and exposed again rejoins at the head: no backlog replay, no storm over others", async () => {
+    pollSince([1, 2]);
+    saveAgentCursor(1, 100);
+    saveAgentCursor(2, 100);
+    const known = [1, 2];
+    const { ws, emitted } = makeWs(baseUrl, known);
+    server.stage("GET", INBOUND, 200, { messages: [] });
+    await ws.triggerBackfill();
+
+    // Agent 2 is away while agent 1 moves on to 3500.
+    known.splice(known.indexOf(2), 1);
+    saveAgentCursor(1, 3500);
+    server.stage("GET", INBOUND, 200, { messages: [] });
+    await ws.triggerBackfill();
+
+    // Agent 2 is back; 30 messages arrived for it while away, plus a new one for agent 1.
+    known.push(2);
+    const away = Array.from({ length: 30 }, (_, i) => row(3100 + i, 2));
+    server.stage("GET", INBOUND, 200, { messages: [...away, row(4000, 1)] });
+    await ws.triggerBackfill();
+
+    expect(sinceOf(server, 2)).toBe(3500);
+    expect(emitted.map((m) => `${m.assistantId}:${m.messageId}`)).toEqual(["1:4000"]);
+  });
 });
