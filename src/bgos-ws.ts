@@ -279,6 +279,11 @@ export class BgosWs {
         this.emitter.emit("backfill_ok");
         return;
       }
+      // Cursors as they were when this fetch was asked for: an agent pinned or a
+      // cursor moved while the request is in flight must not change how the rows
+      // of its response are judged (the dedupe covers a row served twice).
+      const cursorOf = agentCursorReader();
+      const hasCursor = new Set(agentCursorIds());
       const { messages } = await this.api.inboundSince(since);
       const normalized: InboundMessagePayload[] = [];
       for (const raw of messages) {
@@ -290,10 +295,8 @@ export class BgosWs {
       // lowest one). A row for an agent not known yet goes to the handler, which
       // leaves it unconsumed until identity heals.
       const knownSet = new Set(known);
-      const cursorOf = agentCursorReader();
       // An agent not known (yet) is the handler's to decide, unless it has a
       // cursor of its own: then what is at or below it is already consumed.
-      const hasCursor = new Set(agentCursorIds());
       const fresh = normalized.filter((m) =>
         knownSet.has(m.assistantId) || hasCursor.has(m.assistantId)
           ? m.messageId > cursorOf(m.assistantId)

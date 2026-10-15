@@ -354,4 +354,22 @@ describe("BgosWs.triggerBackfill, per-agent cursors", () => {
 
     expect(loadAgentCursor(2)).toBeLessThanOrEqual(249);
   });
+
+  it("an agent pinned while the fetch is in flight does not lose its row", async () => {
+    pollSince([1]);
+    saveAgentCursor(1, 100);
+    const known = [1];
+    // The fetch answers with a row for agent 2 (id 150) and, while it is in
+    // flight, agent 2 is bound and pinned at the head.
+    server.stage("GET", INBOUND, 200, { messages: [row(150, 2)] }, undefined, 80);
+    const { ws, emitted } = makeWs(baseUrl, known);
+    const run = ws.triggerBackfill();
+    await new Promise((r) => setTimeout(r, 10));
+    saveAgentCursor(1, 200); // a sibling consumes a later id: head is 200
+    known.push(2);
+    pollSince([1, 2]); // agent 2 pinned at the head (200) mid-flight
+    await run;
+
+    expect(emitted.map((m) => `${m.assistantId}:${m.messageId}`)).toEqual(["2:150"]);
+  });
 });
