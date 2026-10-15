@@ -4,7 +4,8 @@ import { EventEmitter } from "node:events";
 import type { BgosApi } from "./bgos-api.js";
 import {
   advanceIdleAgents,
-  loadAgentCursor,
+  agentCursorReader,
+  isColdStart,
   pollSince,
   seedAllCursors,
 } from "./last-id-store.js";
@@ -237,7 +238,7 @@ export class BgosWs {
     try {
       const known = this.knownAssistantIds();
       const since = pollSince(known);
-      if (initial && since === 0) {
+      if (initial && isColdStart()) {
         await this.coldStartSeed();
         this.emitter.emit("backfill_ok");
         return;
@@ -253,10 +254,9 @@ export class BgosWs {
       // lowest one). A row for an agent not known yet goes to the handler, which
       // leaves it unconsumed until identity heals.
       const knownSet = new Set(known);
+      const cursorOf = agentCursorReader();
       const fresh = normalized.filter(
-        (m) =>
-          !knownSet.has(m.assistantId) ||
-          m.messageId > loadAgentCursor(m.assistantId),
+        (m) => !knownSet.has(m.assistantId) || m.messageId > cursorOf(m.assistantId),
       );
       const stormLimit = resolveStormLimit();
       if (stormLimit > 0 && fresh.length > stormLimit) {
@@ -271,7 +271,7 @@ export class BgosWs {
         // The inbound handler dedupes (processed-ids) + persists the agent's cursor.
         this.emitter.emit("inbound_message", m);
       }
-      this.advanceIdle(known, normalized);
+      this.advanceIdle(known, normalized, messages.length);
       this.emitter.emit("backfill_ok");
     } catch (err) {
       const e = err instanceof Error ? err : new Error(String(err));
@@ -286,20 +286,32 @@ export class BgosWs {
    * (rows come ASC by id; a full page may have cut the rows of its LAST id, so
    * then the watermark stops one below it). Without this an idle agent would pin
    * the next poll's lowest cursor and the page would never reach new messages.
+   *
+   * It never passes a row for an agent not known yet: that row is still
+   * unconsumed (the handler records it as pending once identity refresh gives
+   * up), and the agent must start below it when it is exposed.
    */
   private advanceIdle(
     known: number[],
     polled: InboundMessagePayload[],
+    rawRowCount: number,
   ): void {
     if (polled.length === 0 || known.length === 0) return;
+    const knownSet = new Set(known);
     const withRows = new Set(polled.map((m) => m.assistantId));
     let last = 0;
-    for (const m of polled) if (m.messageId > last) last = m.messageId;
+    let lowestUnknown = Infinity;
+    for (const m of polled) {
+      if (m.messageId > last) last = m.messageId;
+      if (!knownSet.has(m.assistantId) && m.messageId < lowestUnknown) {
+        lowestUnknown = m.messageId;
+      }
+    }
     // The backend answers at most BACKEND_PAGE_SIZE rows per poll.
-    const watermark = polled.length < BACKEND_PAGE_SIZE ? last : last - 1;
+    let watermark = rawRowCount < BACKEND_PAGE_SIZE ? last : last - 1;
+    watermark = Math.min(watermark, lowestUnknown - 1);
     advanceIdleAgents(
       known.filter((id) => !withRows.has(id)),
-      known,
       watermark,
     );
   }

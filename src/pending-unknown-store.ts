@@ -138,9 +138,15 @@ export function clearPendingUnknown(id: number, assistantId?: number): void {
 }
 
 /** Lowest still-pending unknown id, or null when the set is empty. Used by
- *  saveLastId to clamp the disk cursor. */
-export function lowestPendingUnknown(): number | null {
-  const entries = loadPendingUnknown();
+ *  saveLastId to clamp the disk cursor. With an `assistantId`, only that
+ *  agent's entries (and legacy entries without an agent) count. */
+export function lowestPendingUnknown(assistantId?: number): number | null {
+  const entries = loadPendingUnknown().filter(
+    (e) =>
+      assistantId === undefined ||
+      e.assistantId === undefined ||
+      e.assistantId === assistantId,
+  );
   if (entries.length === 0) return null;
   let lowest = entries[0].id;
   for (const e of entries) if (e.id < lowest) lowest = e.id;

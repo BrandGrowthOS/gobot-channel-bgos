@@ -359,8 +359,8 @@ export function createInboundHandler(
   // Dedupe cache shared by the live WS path AND the backfill/poll path (both
   // flow through this handler). Gated AFTER the route resolves so an unknown-
   // assistant message stays UNCONSUMED and the poll re-fetches it until
-  // identity heals (contract C3). 500-entry FIFO, ported from openclaw.
-  const processedIds = new ProcessedIdsCache(500);
+  // identity heals (contract C3). 1000-entry FIFO (per agent and message), ported from openclaw.
+  const processedIds = new ProcessedIdsCache(1000);
   // Rate-limit the unknown-assistant warning to 1/min per assistant id.
   const unknownWarnedAt = new Map<number, number>();
 

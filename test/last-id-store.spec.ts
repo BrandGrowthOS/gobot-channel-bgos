@@ -5,6 +5,7 @@ import { join } from "node:path";
 
 import {
   advanceIdleAgents,
+  isColdStart,
   loadAgentCursor,
   loadLastId,
   pollSince,
@@ -40,6 +41,7 @@ describe("last-id-store", () => {
   });
 
   it("each agent keeps its own cursor", () => {
+    pollSince([1, 2]); // both known from the start
     saveAgentCursor(1, 500);
     saveAgentCursor(2, 300);
     expect(loadAgentCursor(1)).toBe(500);
@@ -71,15 +73,15 @@ describe("last-id-store", () => {
     expect(loadAgentCursor(1)).toBe(480);
     expect(loadAgentCursor(2)).toBe(480);
     expect(pollSince([1, 2])).toBe(480); // not replayed: polls past 480
-    // ...and the migration was persisted once, so it is a single event.
-    expect(JSON.parse(readFileSync(cursorsFile(), "utf8"))).toMatchObject({
+    // ...and each agent now has its own entry; the migration is one event.
+    expect(JSON.parse(readFileSync(cursorsFile(), "utf8"))).toEqual({
       version: 1,
-      floor: 480,
-      agents: {},
+      head: 480,
+      agents: { "1": 480, "2": 480 },
     });
 
-    // Agent 1 moves on; agent 2 (not yet served) keeps the migrated value, so
-    // its next message (> 480) is still fetched.
+    // Agent 1 moves on; agent 2 keeps the migrated value, so its next message
+    // (> 480) is still fetched.
     saveAgentCursor(1, 520);
     expect(loadAgentCursor(1)).toBe(520);
     expect(loadAgentCursor(2)).toBe(480);
@@ -90,10 +92,33 @@ describe("last-id-store", () => {
     expect(loadAgentCursor(2)).toBe(480);
   });
 
-  it("an agent exposed after the migration starts at the floor, not at 0", () => {
+  it("MIGRATION: a live message that lands before the first poll cannot move another agent's start", () => {
     writeFileSync(join(tempHome, "bgos_last_id"), "480", "utf8");
-    saveAgentCursor(1, 520);
-    expect(loadAgentCursor(99)).toBe(480);
+
+    saveAgentCursor(1, 520); // agent 1's live message, before any poll
+
+    expect(loadAgentCursor(2)).toBe(480);
+    expect(pollSince([1, 2])).toBe(480);
+    expect(loadAgentCursor(2)).toBe(480);
+  });
+
+  it("an agent exposed after the first poll starts at the head, not at a stale value", () => {
+    writeFileSync(join(tempHome, "bgos_last_id"), "480", "utf8");
+    expect(pollSince([1])).toBe(480);
+    saveAgentCursor(1, 90000);
+    // Agent 7 is exposed much later: its old rows are history, as they were
+    // for the single cursor.
+    expect(loadAgentCursor(7)).toBe(90000);
+    expect(pollSince([1, 7])).toBe(90000);
+  });
+
+  it("an agent exposed after its message arrived still gets that message (pending-unknown hole)", () => {
+    saveAgentCursor(1, 400);
+    recordPendingUnknown(450, 9); // agent 9's row, left unconsumed
+    saveAgentCursor(1, 600);
+    // Agent 1 is held below the hole, and agent 9 starts below it too.
+    expect(loadAgentCursor(9)).toBe(449);
+    expect(pollSince([1, 9])).toBe(449);
   });
 
   it("the cursor file replaces a corrupt one by migrating again, never throws", () => {
@@ -102,20 +127,30 @@ describe("last-id-store", () => {
     expect(loadAgentCursor(1)).toBe(77);
   });
 
-  it("seedAllCursors moves the floor and every given agent (storm guard, cold start)", () => {
+  it("isColdStart is true only before anything was ever consumed", () => {
+    expect(isColdStart()).toBe(true);
+    saveAgentCursor(1, 5);
+    expect(isColdStart()).toBe(false);
+  });
+
+  it("isColdStart is false right after a migration", () => {
+    writeFileSync(join(tempHome, "bgos_last_id"), "480", "utf8");
+    expect(isColdStart()).toBe(false);
+  });
+
+  it("seedAllCursors moves the head and every given agent (storm guard, cold start)", () => {
     seedAllCursors([1, 2], 900);
     expect(loadAgentCursor(1)).toBe(900);
     expect(loadAgentCursor(2)).toBe(900);
-    expect(loadAgentCursor(3)).toBe(900); // a later agent starts at the new floor
+    expect(loadAgentCursor(3)).toBe(900); // a later agent starts at the new head
   });
 
-  it("advanceIdleAgents moves only the idle agents and lifts the floor to the lowest known cursor", () => {
-    writeFileSync(join(tempHome, "bgos_last_id"), "100", "utf8");
+  it("advanceIdleAgents moves only the agents it is given", () => {
     saveAgentCursor(1, 400); // busy agent
-    advanceIdleAgents([2], [1, 2], 400); // agent 2 had no row up to 400
+    saveAgentCursor(2, 100);
+    advanceIdleAgents([2], 400); // agent 2 had no row up to 400
     expect(loadAgentCursor(2)).toBe(400);
     expect(pollSince([1, 2])).toBe(400);
-    expect(loadAgentCursor(3)).toBe(400); // floor lifted
   });
 
   it("the pending-unknown clamp holds every agent's cursor below the hole", () => {
@@ -126,7 +161,7 @@ describe("last-id-store", () => {
     expect(pollSince([1])).toBe(499);
   });
 
-  it("deprecated loadLastId / saveLastId act on the gateway-wide floor", () => {
+  it("deprecated loadLastId / saveLastId act on the gateway-wide head", () => {
     expect(loadLastId()).toBe(0);
     saveLastId(42);
     expect(loadLastId()).toBe(42);

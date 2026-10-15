@@ -19,16 +19,19 @@
  * File location: `$GOBOT_HOME/bgos_last_ids.json` (default
  * `~/.gobot/bgos_last_ids.json`).
  *
- * Format: `{"version":1,"floor":<n>,"agents":{"<assistantId>":<n>}}`.
+ * Format: `{"version":1,"head":<n>,"agents":{"<assistantId>":<n>},"migrating":<n>?}`.
  *   - `agents` holds each agent's own cursor.
- *   - `floor` is where an agent with no entry starts (a newly exposed agent).
- *     It never moves past the lowest cursor of the agents currently known.
+ *   - `head` is the highest id any agent has consumed or been carried past. An
+ *     agent exposed LATER starts there (its older rows are history it was not
+ *     part of), exactly as the single cursor used to place it.
+ *   - `migrating` exists only between the migration and the first poll.
  *
  * MIGRATION: before per-agent cursors the file was `$GOBOT_HOME/bgos_last_id`,
- * a single integer. When `bgos_last_ids.json` does not exist yet, `floor` is
- * seeded from that old value, so every agent starts exactly where the single
- * cursor was: nothing replays and nothing is skipped. The old file is left in
- * place and is no longer written.
+ * a single integer. When `bgos_last_ids.json` does not exist yet, every agent
+ * known at the first poll gets that old value as its own cursor (`migrating`
+ * holds it until then, so a live message that lands first cannot move it), so
+ * every agent starts exactly where the single cursor was: nothing replays and
+ * nothing is skipped. The old file is left in place and is no longer written.
  *
  * Writes are atomic (write-to-tempfile + rename) so a crash mid-write can't
  * leave a half-written file.
@@ -45,8 +48,10 @@ import { lowestPendingUnknown } from "./pending-unknown-store.js";
 
 interface CursorFile {
   version: 1;
-  floor: number;
+  head: number;
   agents: Record<string, number>;
+  /** The migrated single cursor, until the first poll hands it to each agent. */
+  migrating?: number;
 }
 
 function stateRoot(): string {
@@ -107,7 +112,7 @@ function loadCursors(): CursorFile {
   if (
     parsed &&
     typeof parsed === "object" &&
-    isCursor((parsed as CursorFile).floor)
+    isCursor((parsed as CursorFile).head)
   ) {
     const agents: Record<string, number> = {};
     const raw = (parsed as CursorFile).agents;
@@ -116,32 +121,83 @@ function loadCursors(): CursorFile {
         if (Number.isInteger(Number(k)) && isCursor(v)) agents[k] = v;
       }
     }
-    return { version: 1, floor: (parsed as CursorFile).floor, agents };
+    const migrating = (parsed as CursorFile).migrating;
+    return {
+      version: 1,
+      head: (parsed as CursorFile).head,
+      agents,
+      ...(isCursor(migrating) ? { migrating } : {}),
+    };
   }
-  const migrated: CursorFile = { version: 1, floor: readLegacyCursor(), agents: {} };
-  if (migrated.floor > 0) writeCursors(migrated);
+  const legacy = readLegacyCursor();
+  const migrated: CursorFile = {
+    version: 1,
+    head: legacy,
+    agents: {},
+    ...(legacy > 0 ? { migrating: legacy } : {}),
+  };
+  if (legacy > 0) writeCursors(migrated);
   return migrated;
 }
 
-/** One agent's cursor: its own entry, else the floor. */
+/**
+ * One agent's cursor: its own entry, else where an agent not seen before
+ * starts: the migrated value until the first poll, afterwards the head, and
+ * never past a message of its own still pending as unknown (so an agent that
+ * is exposed after its message arrived still gets it).
+ */
+function effective(file: CursorFile, assistantId: number): number {
+  const own = file.agents[String(assistantId)];
+  if (own !== undefined) return own;
+  const base = file.migrating ?? file.head;
+  const hole = lowestPendingUnknown(assistantId);
+  return hole !== null ? Math.min(base, Math.max(0, hole - 1)) : base;
+}
+
+/** One agent's cursor. */
 export function loadAgentCursor(assistantId: number): number {
+  return effective(loadCursors(), assistantId);
+}
+
+/** A snapshot reader: read the file once, answer for many rows. */
+export function agentCursorReader(): (assistantId: number) => number {
   const file = loadCursors();
-  return file.agents[String(assistantId)] ?? file.floor;
+  return (assistantId) => effective(file, assistantId);
+}
+
+/** True before any message has ever been consumed or skipped on this install. */
+export function isColdStart(): boolean {
+  const file = loadCursors();
+  return file.head === 0 && file.migrating === undefined;
 }
 
 /**
  * The id to poll `since_message_id` from: the LOWEST cursor of the given agents
  * (the poll returns every agent's rows, and each row is then kept or dropped by
  * its own agent's cursor), never above the lowest still-pending unknown id.
- * With no agents known yet, the floor.
+ * With no agents known yet, the head.
+ *
+ * Also gives every known agent that has no entry its own (the migrated value on
+ * the first poll after an upgrade, the head for an agent exposed later), so
+ * from then on it is just a cursor like the others.
  */
 export function pollSince(knownAssistantIds: readonly number[]): number {
   const file = loadCursors();
-  let since = file.floor;
+  let changed = false;
+  for (const aid of knownAssistantIds) {
+    if (file.agents[String(aid)] === undefined) {
+      file.agents[String(aid)] = effective(file, aid);
+      changed = true;
+    }
+  }
+  if (file.migrating !== undefined) {
+    delete file.migrating;
+    changed = true;
+  }
+  if (changed) writeCursors(file);
+  let since = file.head;
   if (knownAssistantIds.length > 0) {
-    since = Math.min(
-      ...knownAssistantIds.map((id) => file.agents[String(id)] ?? file.floor),
-    );
+    since = Math.min(...knownAssistantIds.map((id) => effective(file, id)));
   }
   const lowest = lowestPendingUnknown();
   if (lowest !== null && lowest - 1 < since) since = Math.max(0, lowest - 1);
@@ -164,7 +220,7 @@ export function pollSince(knownAssistantIds: readonly number[]): number {
  * below the hole so the inbound window stays re-fetchable until the route heals
  * and the pending id is consumed + cleared.
  *
- * Errors are caught + ignored — see module docstring.
+ * Errors are caught + ignored: see module docstring.
  */
 export function saveAgentCursor(assistantId: number, id: number): void {
   if (!Number.isInteger(assistantId)) return;
@@ -172,9 +228,9 @@ export function saveAgentCursor(assistantId: number, id: number): void {
 }
 
 /**
- * Move several agents (and the floor) forward together: the storm guard and the
- * cold-start seed, which skip dispatch for a whole batch. `knownAssistantIds`
- * are the agents moved; agents added later start at the new floor.
+ * Move several agents (and the head) forward together: the storm guard and the
+ * cold-start seed, which skip dispatch for a whole batch. Agents exposed later
+ * start at the new head.
  */
 export function seedAllCursors(
   knownAssistantIds: readonly number[],
@@ -188,23 +244,20 @@ export function seedAllCursors(
  * is in that response), the agents that had NO row in it have nothing pending
  * at or below it: move them to the watermark. Without this an idle agent's
  * cursor would pin the poll window below everyone else's and the 200 row page
- * would stop reaching new messages. Also lifts the floor to the lowest known
- * cursor, so a newly exposed agent does not start from a stale value.
+ * would stop reaching new messages.
  */
 export function advanceIdleAgents(
   idleAssistantIds: readonly number[],
-  knownAssistantIds: readonly number[],
   watermark: number,
 ): void {
-  if (idleAssistantIds.length === 0 && knownAssistantIds.length === 0) return;
-  advance(idleAssistantIds, watermark, false, knownAssistantIds);
+  if (idleAssistantIds.length === 0) return;
+  advance(idleAssistantIds, watermark, false);
 }
 
 function advance(
   assistantIds: readonly number[],
   id: number,
-  raiseFloor: boolean,
-  knownForFloor?: readonly number[],
+  seed: boolean,
 ): void {
   if (!Number.isFinite(id) || !Number.isInteger(id) || id <= 0) return;
   try {
@@ -217,24 +270,18 @@ function advance(
     let changed = false;
     for (const aid of assistantIds) {
       const key = String(aid);
-      const current = file.agents[key] ?? file.floor;
-      if (advanceTo > current) {
+      if (advanceTo > effective(file, aid)) {
         file.agents[key] = advanceTo;
         changed = true;
       }
     }
-    if (raiseFloor && advanceTo > file.floor) {
-      file.floor = advanceTo;
+    if ((seed || assistantIds.length > 0) && advanceTo > file.head) {
+      file.head = advanceTo;
       changed = true;
     }
-    if (knownForFloor && knownForFloor.length > 0) {
-      const lowestKnown = Math.min(
-        ...knownForFloor.map((a) => file.agents[String(a)] ?? file.floor),
-      );
-      if (lowestKnown > file.floor) {
-        file.floor = lowestKnown;
-        changed = true;
-      }
+    if (seed && file.migrating !== undefined) {
+      delete file.migrating;
+      changed = true;
     }
     if (changed) writeCursors(file);
   } catch {
@@ -244,24 +291,21 @@ function advance(
 
 /**
  * @deprecated Gateway-wide view kept for fork code that read the single
- * cursor: the floor (where an agent with no cursor of its own starts). The
- * adapter itself polls from `pollSince` and saves per agent.
+ * cursor: the head. The adapter itself polls from `pollSince` and saves per
+ * agent.
  */
 export function loadLastId(): number {
-  return loadCursors().floor;
+  return loadCursors().head;
 }
 
 /**
- * @deprecated Raises the floor and every existing agent cursor to `id` (a
+ * @deprecated Raises the head and every existing agent cursor to `id` (a
  * gateway-wide seed). The adapter saves per agent with `saveAgentCursor`.
  */
 export function saveLastId(id: number): void {
   try {
     const file = loadCursors();
-    seedAllCursors(
-      Object.keys(file.agents).map(Number),
-      id,
-    );
+    seedAllCursors(Object.keys(file.agents).map(Number), id);
   } catch {
     /* swallow */
   }
