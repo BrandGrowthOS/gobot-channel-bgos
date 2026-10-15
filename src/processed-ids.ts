@@ -17,12 +17,12 @@
  * grow unbounded for long-running daemons.
  */
 export class ProcessedIdsCache {
-  private readonly seen: Set<number>;
+  private readonly seen: Set<number | string>;
   private readonly capacity: number;
 
   constructor(capacity: number) {
     this.capacity = Math.max(1, capacity | 0);
-    this.seen = new Set<number>();
+    this.seen = new Set<number | string>();
   }
 
   /**
@@ -34,16 +34,26 @@ export class ProcessedIdsCache {
    * order is strict insertion order, which is fine for our sliding-window
    * use case: we do not care about LRU semantics, only "did we see this
    * recently."
+   *
+   * `assistantId` scopes the id to ONE agent. The backend delivers a room or
+   * channel message addressed to several agents as one row per agent, all with
+   * the SAME message id, so an id alone would drop every agent after the first.
+   * Omit it for the legacy id-only behaviour.
    */
-  markIfFirstTime(messageId: number): boolean {
-    if (this.seen.has(messageId)) {
+  markIfFirstTime(messageId: number, assistantId?: number): boolean {
+    const key =
+      assistantId === undefined ? messageId : `${assistantId}:${messageId}`;
+    if (this.seen.has(key)) {
       return false;
     }
-    this.seen.add(messageId);
+    this.seen.add(key);
     if (this.seen.size > this.capacity) {
       // Set iteration is insertion order in JS: the first value is the
       // oldest entry. Drop it.
-      const oldest = this.seen.values().next().value as number | undefined;
+      const oldest = this.seen.values().next().value as
+        | number
+        | string
+        | undefined;
       if (oldest !== undefined) {
         this.seen.delete(oldest);
       }

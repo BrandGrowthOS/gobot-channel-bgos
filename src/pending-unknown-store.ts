@@ -35,6 +35,11 @@ import { dirname, join } from "node:path";
 export interface PendingUnknownEntry {
   /** BGOS inbound message id left unconsumed. */
   id: number;
+  /** The agent the row was addressed to. A channel message addressed to
+   *  several agents is one row per agent with the SAME id, so consuming it for
+   *  one agent must not clear the hole another agent still has. Absent on
+   *  entries written before per-agent cursors (they clear on any match). */
+  assistantId?: number;
   /** Epoch ms when first recorded. */
   at: number;
 }
@@ -68,9 +73,11 @@ export function loadPendingUnknown(): PendingUnknownEntry[] {
         (e as PendingUnknownEntry).id > 0 &&
         typeof (e as PendingUnknownEntry).at === "number"
       ) {
+        const aid = (e as PendingUnknownEntry).assistantId;
         out.push({
           id: (e as PendingUnknownEntry).id,
           at: (e as PendingUnknownEntry).at,
+          ...(Number.isInteger(aid) ? { assistantId: aid } : {}),
         });
       }
     }
@@ -98,11 +105,15 @@ function writePending(entries: PendingUnknownEntry[]): void {
  * same unconsumed id does not duplicate the entry). Bounded to MAX_PENDING by
  * dropping the oldest entries.
  */
-export function recordPendingUnknown(id: number): void {
+export function recordPendingUnknown(id: number, assistantId?: number): void {
   if (!Number.isInteger(id) || id <= 0) return;
   const entries = loadPendingUnknown();
-  if (entries.some((e) => e.id === id)) return;
-  entries.push({ id, at: Date.now() });
+  if (entries.some((e) => e.id === id && e.assistantId === assistantId)) return;
+  entries.push({
+    id,
+    at: Date.now(),
+    ...(assistantId !== undefined ? { assistantId } : {}),
+  });
   const bounded =
     entries.length > MAX_PENDING
       ? entries.slice(entries.length - MAX_PENDING)
@@ -110,11 +121,18 @@ export function recordPendingUnknown(id: number): void {
   writePending(bounded);
 }
 
-/** Remove an id from the pending set (it has now been consumed). No-op when
- *  the id is absent. Never throws. */
-export function clearPendingUnknown(id: number): void {
+/** Remove an id from the pending set (it has now been consumed). With an
+ *  `assistantId` only that agent's entry (and a legacy entry without one) is
+ *  removed. No-op when the id is absent. Never throws. */
+export function clearPendingUnknown(id: number, assistantId?: number): void {
   const entries = loadPendingUnknown();
-  const next = entries.filter((e) => e.id !== id);
+  const next = entries.filter(
+    (e) =>
+      e.id !== id ||
+      (assistantId !== undefined &&
+        e.assistantId !== undefined &&
+        e.assistantId !== assistantId),
+  );
   if (next.length === entries.length) return;
   writePending(next);
 }

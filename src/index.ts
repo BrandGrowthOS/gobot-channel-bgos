@@ -147,7 +147,12 @@ export {
   type BoardsOrchestratorDeps,
   type BoardsTurnContext,
 } from "./boards-orchestrator.js";
-export { loadLastId, saveLastId } from "./last-id-store.js";
+export {
+  loadAgentCursor,
+  saveAgentCursor,
+  loadLastId,
+  saveLastId,
+} from "./last-id-store.js";
 export { ApprovalHandler, type ApprovalDecision } from "./approval-handler.js";
 export { CommandsSync } from "./commands-sync.js";
 export { BgosApi } from "./bgos-api.js";

@@ -2,7 +2,12 @@ import { io, type Socket } from "socket.io-client";
 import { EventEmitter } from "node:events";
 
 import type { BgosApi } from "./bgos-api.js";
-import { loadLastId, saveLastId } from "./last-id-store.js";
+import {
+  advanceIdleAgents,
+  loadAgentCursor,
+  pollSince,
+  seedAllCursors,
+} from "./last-id-store.js";
 import { normalizeVoiceRpc, type VoiceRpcFrame } from "./voice-rpc.js";
 import { normalizeUpdateRpc, type UpdateRpcFrame } from "./update-rpc.js";
 import {
@@ -41,6 +46,9 @@ type EventMap = {
   backfill_storm: [number];
 };
 
+/** Rows the backend returns per inbound poll (its `LIMIT 200`). */
+const BACKEND_PAGE_SIZE = 200;
+
 /** Resolve the storm-guard limit. 0 disables. Default 25. */
 function resolveStormLimit(): number {
   const raw = process.env.GOBOT_BGOS_BACKFILL_STORM_LIMIT;
@@ -55,10 +63,11 @@ function resolveStormLimit(): number {
  * param; backend validates via bcrypt and joins the client to
  * pairing:<id> + every assistant:<id> the pairing owns.
  *
- * Cursor authority is the DISK cursor (bgos_last_id): triggerBackfill reads
- * loadLastId() at call time and the live WS path advances no cursor of its
- * own. Dedupe + saveLastId happen in the inbound handler after the route
- * resolves. Reconnect is handled at the Manager level (socket.io.on) because
+ * Cursor authority is the DISK cursors, one per agent (bgos_last_ids.json):
+ * triggerBackfill polls from the lowest cursor of the known agents at call time,
+ * keeps each returned row only if it is past ITS agent's cursor, and the live
+ * WS path advances no cursor of its own. Dedupe + the per-agent cursor save
+ * happen in the inbound handler after the route resolves. Reconnect is handled at the Manager level (socket.io.on) because
  * the Socket does not emit a `reconnect` reserved event in socket.io-client v4.
  */
 export class BgosWs {
@@ -69,6 +78,9 @@ export class BgosWs {
   private wsConnectedSince: string | null = null;
   private backfillInFlight: Promise<void> | null = null;
   private readonly typingThrottle = new Map<number, number>();
+  /** The agents this gateway serves (bound assistant ids); the adapter wires
+   *  its route map in. Each has its own poll cursor. */
+  private knownAssistantIds: () => number[] = () => [];
 
   constructor(
     private cfg: PluginConfig,
@@ -89,6 +101,11 @@ export class BgosWs {
   ): this {
     this.emitter.off(event, listener as (...args: unknown[]) => void);
     return this;
+  }
+
+  /** Tell the poll which agents this gateway serves. */
+  setKnownAssistants(fn: () => number[]): void {
+    this.knownAssistantIds = fn;
   }
 
   /** ISO timestamp of the current connection, or null when disconnected. */
@@ -198,10 +215,10 @@ export class BgosWs {
   }
 
   /**
-   * Backfill missed messages from the DISK cursor. Single-flight: concurrent
+   * Backfill missed messages from the DISK cursors (one per agent). Single-flight: concurrent
    * calls (poll tick racing a reconnect) coalesce onto the same promise.
    *
-   * `opts.initial` marks the boot backfill: when the disk cursor is 0 and the
+   * `opts.initial` marks the boot backfill: when every disk cursor is 0 and the
    * pairing already has history, page through it WITHOUT dispatching and seed
    * the cursor to the newest id (cold-start guard), so a fresh install does
    * not replay the entire history as new messages.
@@ -218,7 +235,8 @@ export class BgosWs {
 
   private async runBackfill(initial: boolean): Promise<void> {
     try {
-      const since = loadLastId();
+      const known = this.knownAssistantIds();
+      const since = pollSince(known);
       if (initial && since === 0) {
         await this.coldStartSeed();
         this.emitter.emit("backfill_ok");
@@ -230,19 +248,30 @@ export class BgosWs {
         const m = this.normalizeInbound(raw);
         if (m) normalized.push(m);
       }
+      // The poll returns every agent's rows past the LOWEST cursor. A known
+      // agent keeps only the rows past its own cursor (it may be ahead of the
+      // lowest one). A row for an agent not known yet goes to the handler, which
+      // leaves it unconsumed until identity heals.
+      const knownSet = new Set(known);
+      const fresh = normalized.filter(
+        (m) =>
+          !knownSet.has(m.assistantId) ||
+          m.messageId > loadAgentCursor(m.assistantId),
+      );
       const stormLimit = resolveStormLimit();
-      if (stormLimit > 0 && normalized.length > stormLimit) {
-        // Storm guard: fast-forward the cursor, skip dispatch, surface it.
+      if (stormLimit > 0 && fresh.length > stormLimit) {
+        // Storm guard: fast-forward the cursors, skip dispatch, surface it.
         let maxId = since;
-        for (const m of normalized) if (m.messageId > maxId) maxId = m.messageId;
-        saveLastId(maxId);
-        this.emitter.emit("backfill_storm", normalized.length);
+        for (const m of fresh) if (m.messageId > maxId) maxId = m.messageId;
+        seedAllCursors(known, maxId);
+        this.emitter.emit("backfill_storm", fresh.length);
         return;
       }
-      for (const m of normalized) {
-        // The inbound handler dedupes (processed-ids) + persists the cursor.
+      for (const m of fresh) {
+        // The inbound handler dedupes (processed-ids) + persists the agent's cursor.
         this.emitter.emit("inbound_message", m);
       }
+      this.advanceIdle(known, normalized);
       this.emitter.emit("backfill_ok");
     } catch (err) {
       const e = err instanceof Error ? err : new Error(String(err));
@@ -252,11 +281,36 @@ export class BgosWs {
   }
 
   /**
+   * Move the cursor of every known agent that had NO row in this poll up to what
+   * the poll covered. Every row at or below the watermark is in the response
+   * (rows come ASC by id; a full page may have cut the rows of its LAST id, so
+   * then the watermark stops one below it). Without this an idle agent would pin
+   * the next poll's lowest cursor and the page would never reach new messages.
+   */
+  private advanceIdle(
+    known: number[],
+    polled: InboundMessagePayload[],
+  ): void {
+    if (polled.length === 0 || known.length === 0) return;
+    const withRows = new Set(polled.map((m) => m.assistantId));
+    let last = 0;
+    for (const m of polled) if (m.messageId > last) last = m.messageId;
+    // The backend answers at most BACKEND_PAGE_SIZE rows per poll.
+    const watermark = polled.length < BACKEND_PAGE_SIZE ? last : last - 1;
+    advanceIdleAgents(
+      known.filter((id) => !withRows.has(id)),
+      known,
+      watermark,
+    );
+  }
+
+  /**
    * Cold-start seed: page the entire history WITHOUT dispatching, advancing
    * the disk cursor to the newest id. Bounded iterations to guarantee
    * termination even if the backend paginates oddly.
    */
   private async coldStartSeed(): Promise<void> {
+    const known = this.knownAssistantIds();
     let cursor = 0;
     for (let i = 0; i < 100; i++) {
       const { messages } = await this.api.inboundSince(cursor);
@@ -269,7 +323,7 @@ export class BgosWs {
         if (m.messageId > maxId) maxId = m.messageId;
       }
       if (count === 0 || maxId <= cursor) break;
-      saveLastId(maxId);
+      seedAllCursors(known, maxId);
       cursor = maxId;
       // Small terminal page: almost certainly the end of history.
       if (count < 2) break;

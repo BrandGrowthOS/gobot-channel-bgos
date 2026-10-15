@@ -14,7 +14,7 @@ import { join } from "node:path";
 import { BgosApi } from "../src/bgos-api.js";
 import { BgosOutbound } from "../src/outbound.js";
 import { createInboundHandler } from "../src/inbound-handler.js";
-import { loadLastId } from "../src/last-id-store.js";
+import { loadAgentCursor, pollSince } from "../src/last-id-store.js";
 import { loadPendingUnknown } from "../src/pending-unknown-store.js";
 import type { InboundMessagePayload } from "../src/types.js";
 
@@ -76,7 +76,7 @@ describe("pending-unknown durable clamp (silent-loss fix)", () => {
     expect(loadPendingUnknown().map((e) => e.id)).toContain(500);
     // Cursor CLAMPED just below the hole, NOT advanced to 501. Without the fix
     // it would be 501 and inboundSince(501) would never return 500 again.
-    expect(loadLastId()).toBe(499);
+    expect(loadAgentCursor(1)).toBe(499);
 
     // ---- simulate a restart: fresh handler (empty dedupe cache), route heals.
     routes.set(9, "general");
@@ -87,8 +87,8 @@ describe("pending-unknown durable clamp (silent-loss fix)", () => {
       getDispatch: () => dispatch2,
     });
 
-    // Backfill re-fetches inboundSince(loadLastId()) -> the window [500, 501].
-    const since = loadLastId();
+    // Backfill re-fetches inboundSince(pollSince(known)) -> the window [500, 501].
+    const since = pollSince([1]);
     const window = [
       inbound({ assistantId: 9, messageId: 500 }),
       inbound({ assistantId: 1, messageId: 501 }),
@@ -103,6 +103,7 @@ describe("pending-unknown durable clamp (silent-loss fix)", () => {
     );
     expect(dispatched500).toHaveLength(1); // delivered EXACTLY once after heal
     expect(loadPendingUnknown()).toHaveLength(0); // hole cleared
-    expect(loadLastId()).toBe(501); // cursor caught up past the healed hole
+    expect(loadAgentCursor(9)).toBe(500); // the healed agent consumed its message
+    expect(loadAgentCursor(1)).toBe(501); // cursor caught up past the healed hole
   });
 });
