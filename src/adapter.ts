@@ -45,6 +45,7 @@ import {
   type ReplyHandle,
 } from "./inbound-handler.js";
 import { loadConfigFromEnv, loadConfigFromPluginCfg } from "./config.js";
+import { pollSince } from "./last-id-store.js";
 import { pendingUnknownStats } from "./pending-unknown-store.js";
 import { BGOS_AGENT_HINTS } from "./agent-hints.js";
 import { appendAgentHints, pickAgentHints } from "./capabilities.js";
@@ -304,6 +305,11 @@ export class BGOSAdapter {
     this.catalog = agents;
   }
 
+  /** Give every known agent its own persisted cursor (see pollSince). */
+  private pinKnownCursors(): void {
+    pollSince([...this.assistantToRoute.keys()]);
+  }
+
   getRouteForAssistant(assistantId: number): string | null {
     return this.assistantToRoute.get(assistantId) ?? null;
   }
@@ -384,6 +390,9 @@ export class BGOSAdapter {
     });
     this.ws.on("assistant_bound", (p: AssistantBoundPayload) => {
       this.assistantToRoute.set(p.assistantId, p.agentRoute);
+      // Once identity is loaded, pin the new agent's own cursor now, not at the
+      // next poll: until it has one it follows the shared head.
+      if (this.identityReady) this.pinKnownCursors();
       void this.seedDefaultCommands(p.assistantId, "bind");
     });
     this.ws.on("assistant_unbound", (p: AssistantUnboundPayload) => {
@@ -679,6 +688,7 @@ export class BGOSAdapter {
           emptyManifestAssistantIds.push(a.assistant_id);
         }
       }
+      this.pinKnownCursors();
       if (this.pairingId !== null && this.catalog.length > 0) {
         await syncCatalog(this.api, this.pairingId, this.catalog);
       }
