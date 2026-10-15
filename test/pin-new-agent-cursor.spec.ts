@@ -42,4 +42,21 @@ describe("a newly known agent is pinned to its own cursor", () => {
     saveAgentCursor(1, 12); // a sibling's live message moves the head on
     expect(loadAgentCursor(2)).toBe(10); // pinned, not following the head
   });
+
+  it("does not pin on a cold start (a live message first must not strand the others at 0)", () => {
+    const adapter = new BGOSAdapter({
+      baseUrl: "http://127.0.0.1:1",
+      pairingToken: "pair_" + "x".repeat(30),
+    });
+    const routes = (adapter as unknown as { assistantToRoute: Map<number, string> })
+      .assistantToRoute;
+    routes.set(1, "a");
+    routes.set(2, "b");
+
+    (adapter as unknown as { pinKnownCursors: () => void }).pinKnownCursors();
+    saveAgentCursor(1, 50); // a live message for agent 1 lands before the backfill
+
+    expect(loadAgentCursor(2)).toBe(50); // follows the head, not stranded at 0
+    expect(pollSince([1, 2])).toBe(50); // so the poll does not replay history
+  });
 });

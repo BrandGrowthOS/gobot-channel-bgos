@@ -45,7 +45,7 @@ import {
   type ReplyHandle,
 } from "./inbound-handler.js";
 import { loadConfigFromEnv, loadConfigFromPluginCfg } from "./config.js";
-import { pollSince } from "./last-id-store.js";
+import { isColdStart, pollSince } from "./last-id-store.js";
 import { pendingUnknownStats } from "./pending-unknown-store.js";
 import { BGOS_AGENT_HINTS } from "./agent-hints.js";
 import { appendAgentHints, pickAgentHints } from "./capabilities.js";
@@ -307,6 +307,11 @@ export class BGOSAdapter {
 
   /** Give every known agent its own persisted cursor (see pollSince). */
   private pinKnownCursors(): void {
+    // On a cold start nothing has been consumed yet: an agent without an entry
+    // follows the head, and the cold-start seed then moves all agents together.
+    // Pinning at 0 here would make a live message that lands first look like
+    // progress, and replay history to the other agents.
+    if (isColdStart()) return;
     pollSince([...this.assistantToRoute.keys()]);
   }
 
