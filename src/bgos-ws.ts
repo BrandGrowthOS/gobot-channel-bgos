@@ -291,8 +291,13 @@ export class BgosWs {
       // leaves it unconsumed until identity heals.
       const knownSet = new Set(known);
       const cursorOf = agentCursorReader();
-      const fresh = normalized.filter(
-        (m) => !knownSet.has(m.assistantId) || m.messageId > cursorOf(m.assistantId),
+      // An agent not known (yet) is the handler's to decide, but one with a
+      // cursor of its own already consumed what is at or below it.
+      const hasCursor = new Set(agentCursorIds());
+      const fresh = normalized.filter((m) =>
+        knownSet.has(m.assistantId) || hasCursor.has(m.assistantId)
+          ? m.messageId > cursorOf(m.assistantId)
+          : true,
       );
       const stormLimit = resolveStormLimit();
       if (stormLimit > 0 && fresh.length > stormLimit) {

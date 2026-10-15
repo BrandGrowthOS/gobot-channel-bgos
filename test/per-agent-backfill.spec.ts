@@ -314,4 +314,16 @@ describe("BgosWs.triggerBackfill, per-agent cursors", () => {
 
     expect(loadAgentCursor(2)).toBe(300);
   });
+
+  it("a row an unknown agent already consumed is not delivered again", async () => {
+    pollSince([2, 4]);
+    saveAgentCursor(2, 12);
+    saveAgentCursor(4, 13); // agent 4 consumed 13, then was unexposed across a restart
+    server.stage("GET", INBOUND, 200, { messages: [row(13, 4)] });
+    const { ws, emitted } = makeWs(baseUrl, [2]); // agent 4 not known
+
+    await ws.triggerBackfill();
+
+    expect(emitted).toHaveLength(0);
+  });
 });
