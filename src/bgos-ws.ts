@@ -4,6 +4,7 @@ import { EventEmitter } from "node:events";
 import type { BgosApi } from "./bgos-api.js";
 import {
   advanceIdleAgents,
+  agentCursorIds,
   agentCursorReader,
   isColdStart,
   pollSince,
@@ -87,6 +88,8 @@ export class BgosWs {
   private identityReady: () => boolean = () => true;
   /** The agents the previous poll served, to spot one that is back. */
   private previousKnown: Set<number> | null = null;
+  /** Agents seen leaving the known set, until they come back. */
+  private readonly awayAgents = new Set<number>();
 
   constructor(
     private cfg: PluginConfig,
@@ -251,10 +254,23 @@ export class BgosWs {
       // that sees an empty route map, which must neither rebase anyone nor
       // become the baseline. An empty set AFTER it is real (nothing exposed).
       if (this.identityReady()) {
-        if (this.previousKnown !== null) {
-          const prev = this.previousKnown;
-          rebaseReexposedAgents(known.filter((id) => !prev.has(id)));
+        if (this.previousKnown === null) {
+          // First identity-ready poll of this process: an agent with a cursor
+          // from an earlier run that is not exposed now was away.
+          for (const id of agentCursorIds()) {
+            if (!known.includes(id)) this.awayAgents.add(id);
+          }
+        } else {
+          for (const id of this.previousKnown) {
+            if (!known.includes(id)) this.awayAgents.add(id);
+          }
         }
+        // Only an agent seen LEAVING and now back is rebased: one that is
+        // merely new to the set may hold a row at or below the head that it
+        // has not consumed yet.
+        const returning = known.filter((id) => this.awayAgents.has(id));
+        for (const id of returning) this.awayAgents.delete(id);
+        rebaseReexposedAgents(returning);
         this.previousKnown = new Set(known);
       }
       const since = pollSince(known);

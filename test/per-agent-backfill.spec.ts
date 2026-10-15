@@ -298,4 +298,20 @@ describe("BgosWs.triggerBackfill, per-agent cursors", () => {
     expect(sinceOf(server, 1)).toBe(5000);
     expect(emitted).toHaveLength(0);
   });
+
+  it("a newly exposed agent is not rebased past its own unconsumed row", async () => {
+    pollSince([1]);
+    const known = [1];
+    const { ws } = makeWs(baseUrl, known);
+    server.stage("GET", INBOUND, 200, { messages: [] });
+    await ws.triggerBackfill(); // baseline {1}
+
+    known.push(2); // agent 2 newly exposed, never away
+    saveAgentCursor(2, 300); // it consumed row 300; row 301 is still pending
+    saveAgentCursor(1, 301); // a sibling moved the head on
+    server.stage("GET", INBOUND, 200, { messages: [] });
+    await ws.triggerBackfill();
+
+    expect(loadAgentCursor(2)).toBe(300);
+  });
 });

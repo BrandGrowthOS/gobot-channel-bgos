@@ -165,6 +165,11 @@ export function agentCursorReader(): (assistantId: number) => number {
   return (assistantId) => effective(file, assistantId);
 }
 
+/** The agents that have a cursor of their own. */
+export function agentCursorIds(): number[] {
+  return Object.keys(loadCursors().agents).map(Number);
+}
+
 /** True before any message has ever been consumed or skipped on this install. */
 export function isColdStart(): boolean {
   const file = loadCursors();
