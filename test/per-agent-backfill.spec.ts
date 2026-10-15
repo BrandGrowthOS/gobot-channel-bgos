@@ -341,4 +341,17 @@ describe("BgosWs.triggerBackfill, per-agent cursors", () => {
 
     expect(loadAgentCursor(2)).toBe(400);
   });
+
+  it("an unknown agent's kept row above its own cursor still caps the idle carry", async () => {
+    pollSince([1, 2, 3]);
+    saveAgentCursor(1, 100);
+    saveAgentCursor(2, 100);
+    saveAgentCursor(3, 150);
+    server.stage("GET", INBOUND, 200, { messages: [row(250, 3), row(300, 1)] });
+    const { ws } = makeWs(baseUrl, [1, 2]); // 3 not known; its row 250 is unconsumed
+
+    await ws.triggerBackfill();
+
+    expect(loadAgentCursor(2)).toBeLessThanOrEqual(249);
+  });
 });
