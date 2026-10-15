@@ -12,7 +12,7 @@ import { join } from "node:path";
 import { BgosApi } from "../src/bgos-api.js";
 import { BgosOutbound } from "../src/outbound.js";
 import { createInboundHandler } from "../src/inbound-handler.js";
-import { loadLastId } from "../src/last-id-store.js";
+import { loadAgentCursor } from "../src/last-id-store.js";
 import type { InboundMessagePayload } from "../src/types.js";
 import { MockBgosServer } from "./mocks/mock-bgos-server.js";
 
@@ -68,7 +68,7 @@ describe("inbound handler: dedupe + unknown-route recovery", () => {
     await handler(inbound({ messageId: 500 })); // duplicate -> skipped
 
     expect(dispatch).toHaveBeenCalledTimes(1);
-    expect(loadLastId()).toBe(500);
+    expect(loadAgentCursor(1)).toBe(500);
   });
 
   it("leaves an unknown-assistant message UNCONSUMED (no dispatch, no cursor save)", async () => {
@@ -83,7 +83,7 @@ describe("inbound handler: dedupe + unknown-route recovery", () => {
 
     expect(dispatch).not.toHaveBeenCalled();
     // Cursor NOT advanced -> the poll will re-fetch it.
-    expect(loadLastId()).toBe(0);
+    expect(loadAgentCursor(1)).toBe(0);
   });
 
   it("recovers when onUnknownAssistant heals the route map, then dispatches", async () => {
@@ -103,7 +103,7 @@ describe("inbound handler: dedupe + unknown-route recovery", () => {
 
     expect(onUnknownAssistant).toHaveBeenCalledTimes(1);
     expect(dispatch).toHaveBeenCalledTimes(1);
-    expect(loadLastId()).toBe(321);
+    expect(loadAgentCursor(7)).toBe(321);
   });
 
   it("stays unconsumed when onUnknownAssistant cannot heal the route", async () => {
@@ -120,7 +120,7 @@ describe("inbound handler: dedupe + unknown-route recovery", () => {
 
     expect(onUnknownAssistant).toHaveBeenCalledTimes(1);
     expect(dispatch).not.toHaveBeenCalled();
-    expect(loadLastId()).toBe(0);
+    expect(loadAgentCursor(8)).toBe(0);
   });
 
   it("fires onInbound only for a consumed (dispatched) message", async () => {

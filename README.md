@@ -52,7 +52,7 @@ The adapter resolves config in order: explicit constructor arg → env var → `
 |---|---|---|
 | `BGOS_PAIRING_TOKEN` | _from secrets file_ | The token written by `gobot-pair-bgos`. |
 | `BGOS_BASE_URL` | `https://api.brandgrowthos.ai` | BGOS backend root. |
-| `GOBOT_HOME` | `~/.gobot` | Where the adapter persists state (`bgos_last_id` cursor + secrets dir). |
+| `GOBOT_HOME` | `~/.gobot` | Where the adapter persists state (`bgos_last_ids.json` per-agent cursors + secrets dir). |
 | `GOBOT_HOME_CHANNEL` | `both` | Destination for proactive (no-origin) messages: `telegram` \| `bgos` \| `both`. |
 | `GOBOT_POLL_INTERVAL` | `5` (seconds) | REST backfill interval. Set to `0` to disable polling once the server-side WS push gap is fixed. |
 | `GOBOT_MEDIA_ROOT` | `<cwd>/media` (else `<cwd>`) | **Security allowlist root for outbound files.** Every `sendFile`/`sendImage`/`sendVideo`/`uploadFile` path is realpath-resolved and must live under this root; traversal (`..`), escaping symlinks, and sensitive locations (`/etc`, `~/.ssh`, …) are rejected before any bytes are read. Set it to pin a narrow directory the agent is allowed to send from. |
@@ -64,7 +64,7 @@ The adapter resolves config in order: explicit constructor arg → env var → `
 | `GOBOT_BGOS_HEARTBEAT_INTERVAL` | `60` (seconds) | Cadence for the daemon heartbeat that reports `daemon_version` + last error to the backend (surfaced in the BGOS Integrations card). `0` disables the network heartbeat; a local `$GOBOT_HOME/bgos_heartbeat.json` is always written for the watchdog. |
 | `BGOS_AUTO_UPDATE` | `on` | Same-major automatic updates are ON by default (unset or empty counts as on). Exact value `off` is the hard kill switch (it also refuses one-click `update_rpc` requests with `updates_disabled`); any other value fails closed to disabled. |
 | `BGOS_SUPERVISED` | _(unset)_ | The host DECLARES its own supervisor for one-click updates: one of `systemd` \| `launchd` \| `launcher` \| `supervise-npm` \| `pm2`. Anything else counts as unsupervised. Unset, a boot under the package-owned daemon wrapper still counts as `launcher`. Without a verified supervisor the daemon never exits for an update: it installs to disk, reports `staged`, and waits for a host restart. |
-| `GOBOT_BGOS_BACKFILL_STORM_LIMIT` | `25` | If a single REST backfill returns more than this many messages, the cursor fast-forwards and dispatch is skipped (prevents a history-replay storm after a long outage). `0` disables the guard. |
+| `GOBOT_BGOS_BACKFILL_STORM_LIMIT` | `25` | If a single REST backfill returns more than this many messages, every agent's cursor fast-forwards and dispatch is skipped (prevents a history-replay storm after a long outage). `0` disables the guard. |
 | `GOBOT_BGOS_CHAT_ID` / `GOBOT_BGOS_CHAT_ID_<assistantId>` | _(auto)_ | **Rarely needed.** Proactive messages (check-ins, briefings) self-resolve their delivery chat via the backend, so you do not normally set this. Set it only to pin a specific chat. |
 
 ## Proactive delivery (check-ins, briefings): zero-config
@@ -88,7 +88,7 @@ The running daemon watches the secrets directory and re-authenticates the moment
 
 ## Reliability
 
-Inbound is deduplicated (a message is dispatched exactly once across the live WS push and the REST backfill), the cursor is durable, revocation surfaces as a visible error plus a recover-on-new-token state, and outbound sends retry the network-error class with a bounded on-disk spool. A `daemon_version` heartbeat keeps the Integrations card honest about what the host is running.
+Inbound is deduplicated (a message is dispatched exactly once across the live WS push and the REST backfill), each agent's cursor is durable (one per agent, so two agents on one gateway each get a message addressed to both), revocation surfaces as a visible error plus a recover-on-new-token state, and outbound sends retry the network-error class with a bounded on-disk spool. A `daemon_version` heartbeat keeps the Integrations card honest about what the host is running.
 
 ## Opt-in checkout updates
 
@@ -178,14 +178,15 @@ No fork changes are required; the adapter wires everything through the already-r
 - Re-pair via the BGOS Integrations card if the pairing was revoked; adapter logs `PAIRING_REVOKED` on 401.
 
 **Replies are duplicated after every restart:**
-- The persisted cursor at `$GOBOT_HOME/bgos_last_id` failed to update. This file MUST advance with every processed message; if it stays at 0, every restart replays history.
-- Reset cursor manually: `echo <max-message-id> > ~/.gobot/bgos_last_id`. Or `rm` it to start fresh (will replay everything once).
+- The persisted cursors at `$GOBOT_HOME/bgos_last_ids.json` failed to update. Each agent's entry MUST advance with every message that agent processed; if they stay at 0, every restart replays history.
+- Reset manually: write `{"version":1,"head":<max-message-id>,"agents":{}}` to `~/.gobot/bgos_last_ids.json`. Or `rm` it to start fresh (will replay everything once, unless an old `bgos_last_id` is still there: it is read once as the starting value).
+- Upgrading from 0.17.1 or older: the old single `bgos_last_id` is migrated on first start. Every agent known at the first poll starts from its value, so nothing is replayed and nothing is skipped; an agent exposed later starts at the newest consumed id. The old file is left in place and no longer written; a downgrade would resume from that frozen value, and the backfill storm guard fast-forwards past anything beyond its limit.
 
 **Logs:** the fork pipes adapter output through Gobot's logger. On a default Mac install, look in `~/.gobot/logs/`.
 
 **Reset everything:**
 ```bash
-rm -rf ~/.gobot/secrets ~/.gobot/bgos_last_id
+rm -rf ~/.gobot/secrets ~/.gobot/bgos_last_id ~/.gobot/bgos_last_ids.json
 gobot-pair-bgos <NEW-CODE>
 # restart Gobot
 ```
@@ -200,7 +201,7 @@ gobot-pair-bgos <NEW-CODE>
 | `attachment-bridge.ts` | BGOS files ⇄ local file paths (S3 + base64) |
 | `agent-hints.ts` | System-prompt addendum injected at dispatch |
 | `default-commands.ts` | 7 seeded slash commands |
-| `last-id-store.ts` | Persistent inbound cursor (CRITICAL, see source) |
+| `last-id-store.ts` | Persistent per-agent inbound cursors (CRITICAL, see source) |
 | `voice-rpc.ts` | In-app voice control plane: mint (OpenAI direct) / consult / dispatch |
 | `pair-cli.ts` | `gobot-pair-bgos` CLI |
 | `home-channel.ts` | Resolves `GOBOT_HOME_CHANNEL` for proactive messages |
@@ -225,5 +226,11 @@ MIT.
 ### OpenAI native call context
 
 Use `replyHandle.callOwner?.(reason, { context, openingMessage })` to ring the owner as the current chat agent. A `needs_setup` result includes guidance to relay to the owner. With the updated HOAI app/backend and GPT-Live selected, optional `context` (4000 characters) adds private background and `openingMessage` (400 characters) suggests the first sentence after answer. HOAI always includes the last 12 usable authorized chat messages, or all available if fewer. Long text is bounded to the voice budget. Keep `reason` short and public. ElevenLabs settings and call behavior stay unchanged.
+
+### Per-agent poll cursors (0.17.2)
+
+The poll cursor is kept per agent (per assistant id), not per gateway. The backend serves a message addressed to several agents as one poll row per agent, all with the same message id, so one shared cursor (and an id-only dedupe) let the first agent's row hide the others'. Now the poll starts from the lowest cursor of the agents this gateway serves, each row is kept only past its own agent's cursor, dedupe is per (agent, message), and an agent with nothing in a poll is carried up to what the poll covered (never past a row for an agent not exposed yet) so it never pins the window. The cursors live in `$GOBOT_HOME/bgos_last_ids.json`; the old `bgos_last_id` is migrated once on first start. Inbound messages have no separate acknowledgement call: the persisted cursor is the acknowledgement.
+
+### 0.17.1
 
 The 0.17.1 release also serializes app requests with the periodic updater, checks the host's declared dependency range before installation, verifies the installed version, and restores message intake after installation errors. It preserves the 0.17 host range and the recent custom call context and opening sentence support. An incompatible host must be upgraded before its plugin can move beyond that range.

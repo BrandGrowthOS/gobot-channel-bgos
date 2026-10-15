@@ -31,7 +31,7 @@ import {
 } from "./attachment-bridge.js";
 import { BGOS_AGENT_HINTS } from "./agent-hints.js";
 import { appendAgentHints } from "./capabilities.js";
-import { saveLastId } from "./last-id-store.js";
+import { saveAgentCursor } from "./last-id-store.js";
 import {
   clearPendingUnknown,
   recordPendingUnknown,
@@ -359,8 +359,8 @@ export function createInboundHandler(
   // Dedupe cache shared by the live WS path AND the backfill/poll path (both
   // flow through this handler). Gated AFTER the route resolves so an unknown-
   // assistant message stays UNCONSUMED and the poll re-fetches it until
-  // identity heals (contract C3). 500-entry FIFO, ported from openclaw.
-  const processedIds = new ProcessedIdsCache(500);
+  // identity heals (contract C3). 1000-entry FIFO (per agent and message), ported from openclaw.
+  const processedIds = new ProcessedIdsCache(1000);
   // Rate-limit the unknown-assistant warning to 1/min per assistant id.
   const unknownWarnedAt = new Map<number, number>();
 
@@ -379,12 +379,12 @@ export function createInboundHandler(
         route = deps.getRouteForAssistant(event.assistantId);
       }
       if (!route) {
-        // Leave the message UNCONSUMED: do NOT mark dedupe, do NOT saveLastId.
-        // Record it as pending-unknown so a sibling KNOWN message's saveLastId
-        // cannot advance the disk cursor past this hole (durable clamp). The 5s
+        // Leave the message UNCONSUMED: do NOT mark dedupe, do NOT save the agent cursor.
+        // Record it as pending-unknown so a sibling KNOWN message's cursor save
+        // cannot advance a disk cursor past this hole (durable clamp). The 5s
         // poll re-fetches it until refreshIdentity fills the map. Warn at most
         // 1/min per assistant so we don't spam the logs.
-        recordPendingUnknown(event.messageId);
+        recordPendingUnknown(event.messageId, event.assistantId);
         const now = Date.now();
         const last = unknownWarnedAt.get(event.assistantId) ?? 0;
         if (now - last >= 60_000) {
@@ -403,15 +403,17 @@ export function createInboundHandler(
     // Route resolved. Dedupe SYNCHRONOUSLY before the first await: a message
     // that already dispatched (via the other delivery path) is skipped here,
     // and only a first-seen message advances the disk cursor.
-    if (!processedIds.markIfFirstTime(event.messageId)) return;
+    // Keyed by (agent, message): a message addressed to several agents is one
+    // row per agent with the same id, and each agent must get its own.
+    if (!processedIds.markIfFirstTime(event.messageId, event.assistantId)) return;
     // This id is now consumed: clear any pending-unknown record for it BEFORE
     // saving the cursor so the clamp releases and the cursor can advance to it.
     // (A message that heals after being stranded flows through here once its
     // route resolves.) No-op when the id was never pending.
-    clearPendingUnknown(event.messageId);
-    // Persist the cursor BEFORE dispatch. A crash inside the agent handler
+    clearPendingUnknown(event.messageId, event.assistantId);
+    // Persist THIS AGENT'S cursor BEFORE dispatch. A crash inside the agent handler
     // should not cause an infinite replay on restart (matches Hermes).
-    saveLastId(event.messageId);
+    saveAgentCursor(event.assistantId, event.messageId);
     deps.onInbound?.();
 
     // A real inbound message re-arms the boards loop guard: chained board
