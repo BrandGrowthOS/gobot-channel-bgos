@@ -23,6 +23,8 @@ const SUMMARY_MAX = 500;
 const PROGRESS_LABEL_MAX = 40;
 const WAITING_WHO_MAX = 80;
 const WAITING_WHY_MAX = 200;
+// eslint-disable-next-line no-control-regex
+const WAITING_CONTROL = /[\u0000-\u001F\u007F\u2028\u2029]/; // the server's CONTROL
 
 export interface CreateMissionOp {
   op: "create";
@@ -212,9 +214,20 @@ function parseMissionOp(value: unknown): MissionOp | null {
       if (value.clear === true) return { op: "waiting", goalId, clear: true };
       const on = value.on;
       if (on !== "owner" && on !== "agent") return null;
-      const who = truncateString(value.who, WAITING_WHO_MAX);
-      const why = truncateString(value.why, WAITING_WHY_MAX);
-      if (who === undefined || why === undefined) return null;
+      // Refused, never shortened, exactly as the server's
+      // parseMissionGoalWaiting refuses: a mark the agent did not write is
+      // worse than none.
+      const who = typeof value.who === "string" ? value.who.trim() : "";
+      const why = typeof value.why === "string" ? value.why.trim() : "";
+      if (
+        !who ||
+        who.length > WAITING_WHO_MAX ||
+        WAITING_CONTROL.test(who) ||
+        !why ||
+        why.length > WAITING_WHY_MAX
+      ) {
+        return null;
+      }
       return { op: "waiting", goalId, on, who, why };
     }
     default:

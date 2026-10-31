@@ -60,14 +60,14 @@ describe("parse the waiting op", () => {
     ).toEqual([{ op: "waiting", goalId: 3, clear: true }]);
   });
 
-  it("caps who at 80 and why at 200, as the server does", () => {
+  it("keeps who at 80 and why at 200 exactly", () => {
     const [op] = parseMissionMarkers(
       block({
         op: "waiting",
         goalId: "4",
         on: "agent",
-        who: "w".repeat(120),
-        why: "y".repeat(400),
+        who: "w".repeat(80),
+        why: "y".repeat(200),
       }),
     ).ops;
     expect(op).toEqual({
@@ -84,6 +84,11 @@ describe("parse the waiting op", () => {
     ["an unknown on", { op: "waiting", goalId: 3, on: "board", who: "Kc", why: "x" }],
     ["no why", { op: "waiting", goalId: 3, on: "owner", who: "Kc" }],
     ["no who", { op: "waiting", goalId: 3, on: "owner", why: "x" }],
+    // Refused like the server (parseMissionGoalWaiting), never shortened
+    // into a mark the agent did not write (review of 3b1e7a2).
+    ["a who over 80", { op: "waiting", goalId: 3, on: "owner", who: "w".repeat(81), why: "x" }],
+    ["a why over 200", { op: "waiting", goalId: 3, on: "owner", who: "Kc", why: "y".repeat(201) }],
+    ["a control character in who", { op: "waiting", goalId: 3, on: "owner", who: "K\u0007c", why: "x" }],
   ])("drops a mark with %s, still stripping it", (_name, op) => {
     expect(parseMissionMarkers(`x${block(op)}y`)).toEqual({
       cleanText: "xy",

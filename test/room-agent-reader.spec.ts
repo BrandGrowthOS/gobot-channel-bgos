@@ -23,6 +23,7 @@ import { join } from "node:path";
 import { BgosApi } from "../src/bgos-api.js";
 import { BgosWs } from "../src/bgos-ws.js";
 import { BgosOutbound } from "../src/outbound.js";
+import { createAdapter, type ForkDispatchArgs } from "../src/create-adapter.js";
 import {
   ROOM_AGENT_PROVENANCE_LINE,
   createInboundHandler,
@@ -207,5 +208,37 @@ describe("room_agent rows (another agent's group message)", () => {
     expect(seen[0]!.text).toBe("hello");
     const req = server.requests.at(-1)!;
     expect((req.body as Record<string, unknown>).replyToId).toBeUndefined();
+  });
+
+  it("a host loaded through createAdapter gets the marker in meta (review of 3b1e7a2)", async () => {
+    const seen: ForkDispatchArgs[] = [];
+    const created = createAdapter(
+      { baseUrl, pairingToken: "pair_" + "x".repeat(30) },
+      { dispatch: async (a) => void seen.push(a) },
+    );
+    const dispatch = (created.raw as unknown as {
+      dispatch: (a: DispatchArgs) => Promise<void>;
+    }).dispatch;
+    const base = {
+      origin: "bgos" as const,
+      agentRoute: "general",
+      assistantId: 1,
+      chatId: 300,
+      messageId: 901,
+      userId: "owner_1",
+      text: "x",
+      attachments: [],
+      systemPrompt: "",
+      replyHandle: {} as DispatchArgs["replyHandle"],
+      messageType: "standard" as const,
+    };
+    await dispatch({ ...base, senderType: "room_agent", senderAssistantId: 42 });
+    await dispatch(base);
+    expect(seen[0]!.meta).toMatchObject({
+      senderType: "room_agent",
+      senderAssistantId: 42,
+    });
+    expect(seen[1]!.meta).not.toHaveProperty("senderType");
+    expect(seen[1]!.meta).not.toHaveProperty("senderAssistantId");
   });
 });
