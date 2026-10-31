@@ -134,10 +134,25 @@ export class ToolProgressOrchestrator {
         messageType: "tool_progress" as const,
         toolProgress: { state: "running" as const, tools: [entry] },
       };
-      const created =
-        replyVia === "send-message"
-          ? await this.api.sendMessage(cardPayload)
-          : await this.api.postMessage(cardPayload);
+      let created: { id: number };
+      if (replyVia === "send-message") {
+        // /send-message (MessageWrapperDto) has no toolProgress field: the
+        // card is created without it (sent, it is stripped, or refused 400
+        // under VALIDATION_STRICT) and filled by a PATCH at once.
+        const { toolProgress, ...withoutTools } = cardPayload;
+        created = await this.api.sendMessage(withoutTools);
+        // Tracked BEFORE the fill, so a failed PATCH never makes the next
+        // tool post a second card: the next PATCH fills this one.
+        this.cardByChat.set(chatId, {
+          cardId: created.id,
+          tools: [entry],
+          lastPatchAt: Date.now(),
+          pendingFlush: null,
+        });
+        await this.api.patchMessage(created.id, { toolProgress });
+        return;
+      }
+      created = await this.api.postMessage(cardPayload);
       this.cardByChat.set(chatId, {
         cardId: created.id,
         tools: [entry],

@@ -275,6 +275,7 @@ describe("room_agent rows (another agent's group message)", () => {
         ]);
       },
     });
+    server.stage("PATCH", "/api/v1/messages/21", 200, { id: 21 });
     await handler(agentRow());
     const posts = server.requests.filter((r) => r.method === "POST");
     expect(posts.map((r) => r.url.split("?")[0])).toEqual([
@@ -282,6 +283,15 @@ describe("room_agent rows (another agent's group message)", () => {
       "/api/v1/send-message",
     ]);
     expect(posts[0]!.body).toMatchObject({ messageType: "tool_progress" });
+    // /send-message (MessageWrapperDto) has no toolProgress field: it would
+    // be stripped, or a 400 under VALIDATION_STRICT. The card is created
+    // without it and filled by a PATCH at once (fourth review).
+    expect(posts[0]!.body).not.toHaveProperty("toolProgress");
+    const patch = server.requests.find((r) => r.method === "PATCH");
+    expect(patch?.url.split("?")[0]).toBe("/api/v1/messages/21");
+    expect(patch?.body).toMatchObject({
+      toolProgress: { state: "running", tools: [{ name: "Bash" }] },
+    });
     expect(posts[1]!.body).toMatchObject({ messageType: "ask_user_input" });
   });
 
