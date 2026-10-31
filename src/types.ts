@@ -78,6 +78,13 @@ export interface InboundMessagePayload {
   senderType?: string;
   /** The author agent of a `room_agent` row. */
   senderAssistantId?: number;
+  /**
+   * Which kind of chat the row came out of (`room` = a group, `channel`,
+   * ...): the push sends it as `groupContext.chatKind`, the poll as
+   * `chat_kind`. An agent turn in a room or a channel must go through
+   * /send-message: POST /messages refuses it.
+   */
+  chatKind?: string;
 }
 
 export interface CommandsUpdatedPayload {

@@ -182,7 +182,8 @@ export type DispatchFn = (args: DispatchArgs) => Promise<void>;
  * (group-context.ts: "<name>, an agent seated here and not a person, wrote
  * the message below."). When they are already in the text nothing is added.
  */
-const SERVER_AGENT_FRAMING = "an agent seated here and not a person";
+const SERVER_AGENT_FRAMING =
+  ", an agent seated here and not a person, wrote the message below.";
 
 /**
  * The line put in front of another agent's row when the server's framing is
@@ -507,11 +508,17 @@ export function createInboundHandler(
     // the outbound falls through to `/messages` exactly as before.
     if (event.peerConversationId !== undefined) a2aChats.add(event.chatId);
     const isPeerReply = a2aChats.has(event.chatId);
-    const replyVia: "send-message" | undefined = isPeerReply
-      ? "send-message"
-      : undefined;
+    // A group (room) or a channel refuses an agent turn on POST /messages
+    // and names /send-message, which stamps the agent and its seat: every
+    // reply there goes that way, a tag's answer included.
+    const inGroup =
+      fromRoomAgent ||
+      event.chatKind === "room" ||
+      event.chatKind === "channel";
+    const replyVia: "send-message" | undefined =
+      isPeerReply || inGroup ? "send-message" : undefined;
     // A tag from another agent is answered with reply_to_id set to its
-    // message (the served canon's rule), on the ordinary /messages lane.
+    // message (the served canon's rule).
     const replyToId: number | undefined =
       isPeerReply || fromRoomAgent ? event.messageId : undefined;
 

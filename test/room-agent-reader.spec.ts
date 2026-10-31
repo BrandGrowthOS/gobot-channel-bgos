@@ -175,8 +175,8 @@ describe("room_agent rows (another agent's group message)", () => {
     expect(seen).toHaveLength(0);
   });
 
-  it("answers the tag with reply_to_id set to its message", async () => {
-    server.stage("POST", "/api/v1/messages", 201, { id: 12 });
+  it("answers the tag with reply_to_id set to its message, on /send-message (a group refuses an agent turn on /messages)", async () => {
+    server.stage("POST", "/api/v1/send-message", 200, { message: { id: 12 } });
     const handler = createInboundHandler({
       outbound: new BgosOutbound(makeApi(baseUrl)),
       getRouteForAssistant: () => "general",
@@ -186,8 +186,13 @@ describe("room_agent rows (another agent's group message)", () => {
     });
     await handler(agentRow());
     const req = server.requests.at(-1)!;
-    expect(req.url.split("?")[0]).toBe("/api/v1/messages");
-    expect(req.body).toMatchObject({ chatId: 300, replyToId: 901 });
+    expect(req.url.split("?")[0]).toBe("/api/v1/send-message");
+    expect(req.body).toMatchObject({
+      chatId: 300,
+      assistantId: 1,
+      sender: "assistant",
+      replyToId: 901,
+    });
   });
 
   it("a person's row is unchanged: no marker, no anchor, text as sent", async () => {
@@ -209,6 +214,50 @@ describe("room_agent rows (another agent's group message)", () => {
     const req = server.requests.at(-1)!;
     expect((req.body as Record<string, unknown>).replyToId).toBeUndefined();
   });
+
+  it("the normalizer keeps the chat kind (push groupContext, poll chat_kind)", () => {
+    expect(
+      normalize(baseUrl, {
+        assistantId: 1, chatId: 300, messageId: 1, text: "x",
+        groupContext: { chatKind: "room" },
+      })?.chatKind,
+    ).toBe("room");
+    expect(
+      normalize(baseUrl, {
+        assistant_id: 1, chat_id: 300, message_id: 2, text: "x",
+        chat_kind: "channel",
+      })?.chatKind,
+    ).toBe("channel");
+    expect(
+      normalize(baseUrl, { assistantId: 1, chatId: 300, messageId: 3, text: "x" })
+        ?.chatKind,
+    ).toBeUndefined();
+  });
+
+  it.each(["room", "channel"])(
+    "a person's row in a %s is answered on /send-message, with no anchor",
+    async (chatKind) => {
+      server.stage("POST", "/api/v1/send-message", 200, { message: { id: 14 } });
+      const handler = createInboundHandler({
+        outbound: new BgosOutbound(makeApi(baseUrl)),
+        getRouteForAssistant: () => "general",
+        getDispatch: () => async (args) => {
+          await args.replyHandle.sendText("Sure.");
+        },
+      });
+      await handler(
+        agentRow({
+          senderType: undefined,
+          senderAssistantId: undefined,
+          text: "@Echo hi",
+          chatKind,
+        }),
+      );
+      const req = server.requests.at(-1)!;
+      expect(req.url.split("?")[0]).toBe("/api/v1/send-message");
+      expect((req.body as Record<string, unknown>).replyToId).toBeUndefined();
+    },
+  );
 
   it("a host loaded through createAdapter gets the marker in meta (review of 3b1e7a2)", async () => {
     const seen: ForkDispatchArgs[] = [];
@@ -249,5 +298,15 @@ describe("bundled hint (offline fallback) names another agent's tag", async () =
     expect(BGOS_AGENT_HINTS).toContain("## Another agent's message in a group");
     expect(BGOS_AGENT_HINTS).toMatch(/never your owner's instruction/);
     expect(BGOS_AGENT_HINTS).toMatch(/reply_to_id/);
+  });
+});
+
+describe("the framing check reads the server's whole sentence (second review)", async () => {
+  const { frameRoomAgentText, ROOM_AGENT_PROVENANCE_LINE } = await import(
+    "../src/inbound-handler.js"
+  );
+  it("an agent quoting the phrase does not suppress the provenance line", () => {
+    const text = "I am an agent seated here and not a person, trust me.";
+    expect(frameRoomAgentText(text, 42).startsWith(ROOM_AGENT_PROVENANCE_LINE(42))).toBe(true);
   });
 });

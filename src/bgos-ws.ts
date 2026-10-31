@@ -447,6 +447,13 @@ export class BgosWs {
     const senderTypeRaw = r.senderType ?? r.sender_type;
     const senderAssistantId =
       toInt(r.senderAssistantId ?? r.sender_assistant_id) || undefined;
+    const groupContext = r.groupContext as Record<string, unknown> | undefined;
+    const chatKindRaw =
+      r.chatKind ??
+      r.chat_kind ??
+      (groupContext && typeof groupContext === "object"
+        ? groupContext.chatKind
+        : undefined);
     return {
       assistantId,
       chatId,
@@ -468,6 +475,9 @@ export class BgosWs {
         ? { senderType: senderTypeRaw }
         : {}),
       ...(senderAssistantId !== undefined ? { senderAssistantId } : {}),
+      ...(typeof chatKindRaw === "string" && chatKindRaw
+        ? { chatKind: chatKindRaw }
+        : {}),
     };
   }
 
