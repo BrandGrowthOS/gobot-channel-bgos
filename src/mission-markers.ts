@@ -21,6 +21,8 @@ const EVIDENCE_MAX = 200;
 const FEED_TEXT_MAX = 200;
 const SUMMARY_MAX = 500;
 const PROGRESS_LABEL_MAX = 40;
+const WAITING_WHO_MAX = 80;
+const WAITING_WHY_MAX = 200;
 
 export interface CreateMissionOp {
   op: "create";
@@ -50,12 +52,29 @@ export interface AbandonMissionOp {
   op: "abandon";
 }
 
+/**
+ * Mark one mini goal as waiting on somebody else, or clear the mark (0.17.3).
+ * A Keep working wake counts the turns that moved nothing and backs off, then
+ * stops, on a mission whose goals wait without a mark (HOAI #3700); the mark
+ * is one of the moves, and it stops the wake asking about that goal.
+ */
+export type WaitingMissionOp =
+  | {
+      op: "waiting";
+      goalId: number;
+      on: "owner" | "agent";
+      who: string;
+      why: string;
+    }
+  | { op: "waiting"; goalId: number; clear: true };
+
 export type MissionOp =
   | CreateMissionOp
   | TickMissionOp
   | ProgressMissionOp
   | CompleteMissionOp
-  | AbandonMissionOp;
+  | AbandonMissionOp
+  | WaitingMissionOp;
 
 export interface MissionDispatchState {
   missionId?: number;
@@ -75,6 +94,7 @@ export type MissionApi = Pick<
   | "updateMissionProgress"
   | "completeMission"
   | "abandonMission"
+  | "setGoalWaiting"
 >;
 
 export type MissionMarkerOp = MissionOp;
@@ -186,6 +206,17 @@ function parseMissionOp(value: unknown): MissionOp | null {
     }
     case "abandon":
       return { op: "abandon" };
+    case "waiting": {
+      const goalId = positiveInteger(value.goalId);
+      if (goalId === undefined) return null;
+      if (value.clear === true) return { op: "waiting", goalId, clear: true };
+      const on = value.on;
+      if (on !== "owner" && on !== "agent") return null;
+      const who = truncateString(value.who, WAITING_WHO_MAX);
+      const why = truncateString(value.why, WAITING_WHY_MAX);
+      if (who === undefined || why === undefined) return null;
+      return { op: "waiting", goalId, on, who, why };
+    }
     default:
       return null;
   }
@@ -355,6 +386,18 @@ async function runMissionOps(
           patchAttempted = true;
           await api.abandonMission(assistantId, attemptedMissionId);
           if (state.missionId === attemptedMissionId) delete state.missionId;
+          break;
+        }
+        case "waiting": {
+          attemptedMissionId = await resolveMissionId(api, assistantId, state);
+          if (attemptedMissionId === undefined) break;
+          patchAttempted = true;
+          await api.setGoalWaiting(
+            assistantId,
+            attemptedMissionId,
+            op.goalId,
+            "clear" in op ? null : { on: op.on, who: op.who, why: op.why },
+          );
           break;
         }
       }

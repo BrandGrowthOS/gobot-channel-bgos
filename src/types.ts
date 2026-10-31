@@ -67,6 +67,17 @@ export interface InboundMessagePayload {
   /** Turn state on a peer side-thread: `expecting_reply` | `more_coming` |
    *  `final`. Present alongside `peerConversationId`. */
   turnState?: string;
+  /**
+   * Who wrote the row, when it was not a person. `'room_agent'`: ANOTHER
+   * AGENT seated in the same group or channel wrote it (its @tag woke this
+   * agent, or it falls in a follow-up window). `userId` then names this
+   * agent's OWNER only because the envelope needs a user; the owner did not
+   * write it. The backend serves such rows only to a daemon at or above the
+   * version that reads this field (0.17.3).
+   */
+  senderType?: string;
+  /** The author agent of a `room_agent` row. */
+  senderAssistantId?: number;
 }
 
 export interface CommandsUpdatedPayload {
