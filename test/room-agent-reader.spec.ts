@@ -259,6 +259,32 @@ describe("room_agent rows (another agent's group message)", () => {
     },
   );
 
+  it("a question card and a tool progress card in a group go through /send-message (third review)", async () => {
+    const { ToolProgressOrchestrator } = await import("../src/tool-progress.js");
+    server.stage("POST", "/api/v1/send-message", 200, { message: { id: 21 } });
+    server.stage("POST", "/api/v1/send-message", 200, { message: { id: 22 } });
+    const api = makeApi(baseUrl);
+    const handler = createInboundHandler({
+      outbound: new BgosOutbound(api),
+      toolProgress: new ToolProgressOrchestrator(api),
+      getRouteForAssistant: () => "general",
+      getDispatch: () => async (args) => {
+        await args.replyHandle.sendToolStart("Bash", "ls");
+        await args.replyHandle.sendAskUserInput("Which one?", [
+          { text: "A", callbackData: "a" },
+        ]);
+      },
+    });
+    await handler(agentRow());
+    const posts = server.requests.filter((r) => r.method === "POST");
+    expect(posts.map((r) => r.url.split("?")[0])).toEqual([
+      "/api/v1/send-message",
+      "/api/v1/send-message",
+    ]);
+    expect(posts[0]!.body).toMatchObject({ messageType: "tool_progress" });
+    expect(posts[1]!.body).toMatchObject({ messageType: "ask_user_input" });
+  });
+
   it("a host loaded through createAdapter gets the marker in meta (review of 3b1e7a2)", async () => {
     const seen: ForkDispatchArgs[] = [];
     const created = createAdapter(

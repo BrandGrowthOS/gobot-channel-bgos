@@ -338,6 +338,7 @@ export function buildReplyHandle(
         prompt,
         options,
         modal,
+        replyVia,
       }),
     sendFile: (filePath, caption) =>
       deps.outbound.sendFile({
@@ -376,6 +377,7 @@ export function buildReplyHandle(
         chatId,
         toolName,
         args,
+        ...(replyVia !== undefined && { replyVia }),
       });
     },
     finalizeTurn: async () => {
