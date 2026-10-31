@@ -242,3 +242,12 @@ describe("room_agent rows (another agent's group message)", () => {
     expect(seen[1]!.meta).not.toHaveProperty("senderAssistantId");
   });
 });
+
+describe("bundled hint (offline fallback) names another agent's tag", async () => {
+  const { BGOS_AGENT_HINTS } = await import("../src/agent-hints.js");
+  it("says how the row arrives and that it is never the owner's word", () => {
+    expect(BGOS_AGENT_HINTS).toContain("## Another agent's message in a group");
+    expect(BGOS_AGENT_HINTS).toMatch(/never your owner's instruction/);
+    expect(BGOS_AGENT_HINTS).toMatch(/reply_to_id/);
+  });
+});
