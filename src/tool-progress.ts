@@ -99,8 +99,11 @@ export class ToolProgressOrchestrator {
     chatId: number;
     toolName: string;
     args?: string;
+    /** `send-message` in a group or a channel: POST /messages refuses an
+     *  agent turn there, the card's first POST included. */
+    replyVia?: "messages" | "send-message";
   }): Promise<void> {
-    const { assistantId, chatId, toolName, args } = params;
+    const { assistantId, chatId, toolName, args, replyVia } = params;
     const entry: ToolProgressEntry = {
       icon: this.iconForToolName(toolName),
       name: toolName,
@@ -123,14 +126,33 @@ export class ToolProgressOrchestrator {
 
     // First tool of the turn — POST a new card.
     try {
-      const created = await this.api.postMessage({
+      const cardPayload = {
         assistantId,
         chatId,
-        sender: "assistant",
+        sender: "assistant" as const,
         text: buildSummary([entry], false),
-        messageType: "tool_progress",
-        toolProgress: { state: "running", tools: [entry] },
-      });
+        messageType: "tool_progress" as const,
+        toolProgress: { state: "running" as const, tools: [entry] },
+      };
+      let created: { id: number };
+      if (replyVia === "send-message") {
+        // /send-message (MessageWrapperDto) has no toolProgress field: the
+        // card is created without it (sent, it is stripped, or refused 400
+        // under VALIDATION_STRICT) and filled by a PATCH at once.
+        const { toolProgress, ...withoutTools } = cardPayload;
+        created = await this.api.sendMessage(withoutTools);
+        // Tracked BEFORE the fill, so a failed PATCH never makes the next
+        // tool post a second card: the next PATCH fills this one.
+        this.cardByChat.set(chatId, {
+          cardId: created.id,
+          tools: [entry],
+          lastPatchAt: Date.now(),
+          pendingFlush: null,
+        });
+        await this.api.patchMessage(created.id, { toolProgress });
+        return;
+      }
+      created = await this.api.postMessage(cardPayload);
       this.cardByChat.set(chatId, {
         cardId: created.id,
         tools: [entry],

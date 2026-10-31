@@ -462,6 +462,8 @@ export class BgosOutbound {
     prompt: string;
     options?: MessageOption[];
     modal?: boolean;
+    /** `send-message` in a group or a channel (POST /messages refuses it). */
+    replyVia?: "messages" | "send-message";
   }): Promise<{ id: number }> {
     if (
       params.options &&
@@ -484,7 +486,7 @@ export class BgosOutbound {
       messageType: "ask_user_input" as OutboundMessagePayload["messageType"],
       options: params.options,
     };
-    return this.deliverMissionAware(payload);
+    return this.deliverMissionAware(payload, params.replyVia);
   }
 
   // -------------------------------------------------------------------
