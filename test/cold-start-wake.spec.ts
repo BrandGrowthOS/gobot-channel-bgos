@@ -334,6 +334,88 @@ describe("cold start replay: one contiguous, bounded range above one cursor", ()
     expect(b.storm()).toBe(0);
   });
 
+  it("a scan that runs out of its page budget replays nothing extra and seeds the TRUE newest id (storm guard off)", async () => {
+    // 30,000 post pairing rows at 200 a page: the 100 page scan stops at id
+    // 20,000, far below the end of history. That is not a complete scan.
+    process.env.GOBOT_BGOS_COLD_START_REPLAY_LIMIT = "10";
+    process.env.GOBOT_BGOS_BACKFILL_STORM_LIMIT = "0";
+    const newest = 30_000;
+    const history = Array.from({ length: newest }, (_, i) => row(i + 1, after(1 + i / 1000)));
+    const { api, sinces } = historyServer(history);
+    const b = bootOn(api, { pairedAt: PAIRED_AT });
+    await b.ws.triggerBackfill({ initial: true });
+    // The reviewer's bound: never more than the limit, never below newest - limit.
+    expect(b.dispatched.length).toBeLessThanOrEqual(10);
+    for (const id of b.dispatched) expect(id).toBeGreaterThan(newest - 10);
+    // Fail safe: nothing extra at all, the cursor is the true newest (not
+    // 20,000, the last id the scan saw), and the seed is finished.
+    expect(b.dispatched).toEqual([]);
+    expect(loadAgentCursor(1)).toBe(newest);
+    expect(isColdStart()).toBe(false);
+    expect(b.storm()).toBe(0);
+    // Finding the newest is a handful of probes, not a page walk to the end.
+    expect(sinces.length).toBeLessThan(100 + 40);
+    // A later poll starts above the true newest and dispatches only new rows.
+    history.push(row(newest + 1, after(60)));
+    await b.ws.triggerBackfill();
+    expect(b.dispatched).toEqual([newest + 1]);
+  });
+
+  it("the same budget cutoff with the default storm guard and sparse ids: no storm, cursor at the true newest", async () => {
+    // Ids with gaps (every 7th), so the newest is found by search, not by
+    // landing on it.
+    const history = Array.from({ length: 30_000 }, (_, i) => row(7 * (i + 1), after(1 + i / 1000)));
+    const newest = 7 * 30_000;
+    const { api } = historyServer(history);
+    const b = bootOn(api, { pairedAt: PAIRED_AT });
+    await b.ws.triggerBackfill({ initial: true });
+    expect(b.dispatched).toEqual([]);
+    expect(b.storm()).toBe(0);
+    expect(loadAgentCursor(1)).toBe(newest);
+    expect(isColdStart()).toBe(false);
+  });
+
+  it("the newest id search finds the true newest from any floor, over sparse and dense histories", async () => {
+    // Deterministic pseudo random histories: dense runs, wide gaps, and ids
+    // one apart at the end (the gap of 1 edge of the halving).
+    let seed = 42;
+    const rand = (n: number) => {
+      seed = (seed * 1103515245 + 12345) % 2 ** 31;
+      return seed % n;
+    };
+    for (let trial = 0; trial < 60; trial++) {
+      const ids: number[] = [];
+      let id = 1 + rand(50);
+      const count = 1 + rand(2000);
+      for (let i = 0; i < count; i++) {
+        ids.push(id);
+        id += rand(5) === 0 ? 1 + rand(100_000) : 1 + rand(3);
+      }
+      const history = ids.map((x) => row(x, after(1)));
+      const { api, sinces } = historyServer(history);
+      const ws = new BgosWs({} as never, api as never);
+      const find = (ws as unknown as { findNewestInboundId(f: number): Promise<number> })
+        .findNewestInboundId.bind(ws);
+      const floor = ids[rand(ids.length)];
+      expect(await find(floor), `trial ${trial} floor ${floor}`).toBe(ids.at(-1));
+      expect(sinces.length).toBeLessThan(120);
+    }
+  });
+
+  it("the clock clamp uses the time of the row that is newest BY ID, not the latest time seen", async () => {
+    // 100, 101, 102 at 10:01, 11:00, 10:02 the same day (a server clock
+    // correction put 101 ahead). The pairing clock is fast and wrote 12:00.
+    // The newest row by id is 102 (10:02), so the threshold is 09:52 and the
+    // cursor is 99: all three replay. Clamping to 11:00 (the latest time)
+    // would put the cursor at 100 and lose message 100 for good.
+    const history = [row(100, after(1)), row(101, after(60)), row(102, after(2))];
+    const { api, sinces } = historyServer(history);
+    const b = bootOn(api, { pairedAt: PAIRED_AT + 120 * 60_000 });
+    await b.ws.triggerBackfill({ initial: true });
+    expect(replayCursor(sinces)).toBe(99);
+    expect(b.dispatched).toEqual([100, 101, 102]);
+  });
+
   it("a history entirely older than the pairing: the clamp keeps only the rows within the slack of the newest row", async () => {
     // The pairing time is past every row, so it is clamped to the newest row's
     // time (the client cannot tell a fast pairing clock from a quiet pairing).
