@@ -207,6 +207,9 @@ export class BGOSAdapter {
     this.ws = new BgosWs(this.cfg, this.api);
     this.ws.setKnownAssistants(() => [...this.assistantToRoute.keys()]);
     this.ws.setIdentityReady(() => this.identityReady);
+    // The cold start replays what was sent after this computer was paired
+    // instead of seeding past it (board row 41654857).
+    this.ws.setPairedAt(() => this.readPairedAt());
     this.outbound = new BgosOutbound(this.api);
     this.approvals = new ApprovalHandler(this.outbound);
     this.commandsSync = new CommandsSync(this.api);
@@ -920,13 +923,27 @@ export class BGOSAdapter {
     return join(root, "secrets");
   }
 
-  private readSecretsFile(): { baseUrl?: string; pairingToken?: string } | null {
+  /** `pairedAt` from the secrets file (written by the pair CLI), epoch ms, or
+   *  null when the file, the field or its value is missing or unreadable. */
+  private readPairedAt(): number | null {
+    const raw = this.readSecretsFile()?.pairedAt;
+    if (typeof raw !== "string") return null;
+    const ms = Date.parse(raw);
+    return Number.isFinite(ms) ? ms : null;
+  }
+
+  private readSecretsFile(): {
+    baseUrl?: string;
+    pairingToken?: string;
+    pairedAt?: unknown;
+  } | null {
     try {
       const path = join(this.resolveSecretsDir(), "bgos.json");
       const raw = readFileSync(path, "utf8");
       const parsed = JSON.parse(raw) as {
         baseUrl?: string;
         pairingToken?: string;
+        pairedAt?: unknown;
       };
       return parsed;
     } catch {
