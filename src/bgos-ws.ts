@@ -6,6 +6,7 @@ import {
   advanceIdleAgents,
   agentCursorIds,
   agentCursorReader,
+  completeColdStart,
   isColdStart,
   pollSince,
   rebaseReexposedAgents,
@@ -62,6 +63,55 @@ function resolveStormLimit(): number {
 }
 
 /**
+ * How many message ids below the newest one a cold start may replay (the rest
+ * of the history is seeded past). Default 10, 0 replays none (the old
+ * behaviour). Never above the storm limit, or the replay poll
+ * would trip the storm guard and drop exactly the messages it was meant to keep.
+ */
+function resolveColdStartReplayLimit(): number {
+  const raw = process.env.GOBOT_BGOS_COLD_START_REPLAY_LIMIT;
+  let n = 10;
+  if (raw !== undefined && raw !== "") {
+    const v = Number(raw);
+    if (Number.isFinite(v) && v >= 0) n = Math.floor(v);
+  }
+  const storm = resolveStormLimit();
+  return storm > 0 ? Math.min(n, storm) : n;
+}
+
+/**
+ * How far before the stored pairing time a row still counts as sent after the
+ * pairing: the pairing time comes from the paired computer's clock and the row
+ * times from the server's, so a pairing clock a few minutes fast must not drop
+ * the messages sent right after it.
+ */
+const COLD_START_PAIRING_SLACK_MS = 10 * 60_000;
+
+/**
+ * How many history pages the cold start scan may read. A scan that runs out
+ * of pages before the end of history is not complete (see `coldStartSeed`).
+ */
+const COLD_START_PAGE_BUDGET = 100;
+
+/** A row's message id, or 0 when absent or unreadable. */
+function rawMessageId(raw: unknown): number {
+  if (!raw || typeof raw !== "object") return 0;
+  const r = raw as Record<string, unknown>;
+  const v = r.messageId ?? r.message_id;
+  if (typeof v === "number" && Number.isFinite(v)) return v;
+  if (typeof v === "string" && /^\d+$/.test(v)) return Number(v);
+  return 0;
+}
+
+/** A row's creation instant in epoch ms, or NaN when absent or unreadable. */
+function rowCreatedAtMs(raw: unknown): number {
+  if (!raw || typeof raw !== "object") return Number.NaN;
+  const r = raw as Record<string, unknown>;
+  const v = r.created_at ?? r.createdAt;
+  return typeof v === "string" ? Date.parse(v) : Number.NaN;
+}
+
+/**
  * Socket.IO client against BGOS. Handshake passes pairingToken as a query
  * param; backend validates via bcrypt and joins the client to
  * pairing:<id> + every assistant:<id> the pairing owns.
@@ -115,6 +165,15 @@ export class BgosWs {
   /** Tell the poll whether the known agents are loaded yet. */
   setIdentityReady(fn: () => boolean): void {
     this.identityReady = fn;
+  }
+
+  /** When this computer was paired (epoch ms), or null when unknown. */
+  private pairedAt: () => number | null = () => null;
+
+  /** Tell the cold start when this computer was paired (`pairedAt` in the
+   *  secrets file). Rows created at or after it are replayed, not skipped. */
+  setPairedAt(fn: () => number | null): void {
+    this.pairedAt = fn;
   }
 
   /** Tell the poll which agents this gateway serves. */
@@ -273,11 +332,16 @@ export class BgosWs {
         rebaseReexposedAgents(returning);
         this.previousKnown = new Set(known);
       }
-      const since = pollSince(known);
+      let since = pollSince(known);
       if (initial && isColdStart()) {
-        await this.coldStartSeed();
-        this.emitter.emit("backfill_ok");
-        return;
+        const replay = await this.coldStartSeed();
+        if (!replay) {
+          this.emitter.emit("backfill_ok");
+          return;
+        }
+        // The seed stopped just below what arrived after pairing: the normal
+        // poll below replays it (dedupe, storm guard, per-agent cursors).
+        since = pollSince(known);
       }
       // Cursors as they were when this fetch was asked for: an agent pinned or a
       // cursor moved while the request is in flight must not change how the rows
@@ -366,14 +430,44 @@ export class BgosWs {
   }
 
   /**
-   * Cold-start seed: page the entire history WITHOUT dispatching, advancing
-   * the disk cursor to the newest id. Bounded iterations to guarantee
+   * Cold-start seed, once per install: page the entire history WITHOUT
+   * dispatching, then pick ONE cursor. Every row above it is replayed by the
+   * normal poll, in id order, so what the seed selects and what is dispatched
+   * are the same set by construction.
+   *
+   * The cursor sits just below the FIRST row (in id order) created at or after
+   * the pairing, less `COLD_START_PAIRING_SLACK_MS` (a pairing clock a little
+   * fast must not lose what was sent right after it). The pairing time is
+   * clamped to the time of the newest row BY ID, so a pairing clock far ahead of the
+   * server still replays the newest rows instead of none. Then the bound: the
+   * cursor never sits more than `resolveColdStartReplayLimit()` ids below the
+   * newest one. Without a readable pairing time, no row has a readable time, or
+   * a bound of 0, the cursor is the newest id (nothing replayed, the old seed).
+   *
+   * A scan that runs out of its page budget before the end of history is not
+   * complete: it replays nothing extra and seeds the TRUE newest id, fetched
+   * directly (`findNewestInboundId`), never the last id it scanned. The bound
+   * therefore always counts down from the true newest id.
+   *
+   * The cursors and the `seeded` marker land in ONE write at the end, so a
+   * crash while paging just pages again next boot, and a finished seed is
+   * never repeated (see `isColdStart`). Bounded iterations to guarantee
    * termination even if the backend paginates oddly.
+   *
+   * Returns true when there is something to replay.
    */
-  private async coldStartSeed(): Promise<void> {
+  private async coldStartSeed(): Promise<boolean> {
     const known = this.knownAssistantIds();
+    const pairedAt = this.pairedAt();
+    const bound = pairedAt === null ? 0 : resolveColdStartReplayLimit();
+    // Every row's id and creation time (NaN when unreadable), in page order.
+    const rows: Array<{ id: number; createdMs: number }> = [];
+    // The creation time of the row that IS the newest by id (not the latest
+    // time seen: after a server clock correction those are different rows).
+    let newestCreatedMs = Number.NaN;
     let cursor = 0;
-    for (let i = 0; i < 100; i++) {
+    let complete = false;
+    for (let i = 0; i < COLD_START_PAGE_BUDGET; i++) {
       const { messages } = await this.api.inboundSince(cursor);
       let maxId = cursor;
       let count = 0;
@@ -381,14 +475,90 @@ export class BgosWs {
         const m = this.normalizeInbound(raw);
         if (!m) continue;
         count++;
-        if (m.messageId > maxId) maxId = m.messageId;
+        const createdMs = rowCreatedAtMs(raw);
+        if (m.messageId > maxId) {
+          maxId = m.messageId;
+          newestCreatedMs = createdMs;
+        } else if (m.messageId === maxId && Number.isNaN(newestCreatedMs)) {
+          newestCreatedMs = createdMs;
+        }
+        rows.push({ id: m.messageId, createdMs });
       }
-      if (count === 0 || maxId <= cursor) break;
-      seedAllCursors(known, maxId);
+      if (count === 0 || maxId <= cursor) {
+        complete = true;
+        break;
+      }
       cursor = maxId;
       // Small terminal page: almost certainly the end of history.
-      if (count < 2) break;
+      if (count < 2) {
+        complete = true;
+        break;
+      }
     }
+    if (!complete) {
+      // The page budget ran out before the end of history: this is NOT a
+      // complete scan, so the rows it saw say nothing about what was sent
+      // after the pairing. Replay nothing extra and seed the TRUE newest id
+      // (never the last scanned one, which would replay a page of old rows).
+      const newestId = await this.findNewestInboundId(cursor);
+      completeColdStart(known, newestId);
+      return false;
+    }
+    const newestId = cursor;
+    let replayFrom = newestId;
+    if (bound > 0 && pairedAt !== null) {
+      // The newest row's time clamps the pairing time; without a readable one
+      // there is nothing to clamp to and the pairing time stands alone.
+      const clampedPairedAt = Number.isFinite(newestCreatedMs)
+        ? Math.min(pairedAt, newestCreatedMs)
+        : pairedAt;
+      const threshold = clampedPairedAt - COLD_START_PAIRING_SLACK_MS;
+      let firstId = Infinity;
+      for (const r of rows) {
+        if (r.createdMs >= threshold && r.id < firstId) firstId = r.id;
+      }
+      if (firstId !== Infinity) {
+        replayFrom = Math.max(firstId - 1, newestId - bound);
+      }
+    }
+    completeColdStart(known, Math.max(0, replayFrom));
+    return replayFrom < newestId;
+  }
+
+  /**
+   * The newest inbound id, found directly with the one query the backend
+   * offers (rows above `since`, ascending, at most `BACKEND_PAGE_SIZE`). A
+   * page that is not full ends history, so its highest id is the newest. A
+   * full page only says the newest is above its highest id; an empty one
+   * says it is at or below `since`. Gallop up from `floor` (an id known to
+   * exist) until a probe is not full, then halve the gap: a few dozen probes
+   * even across a sparse id space, instead of walking every page.
+   */
+  private async findNewestInboundId(floor: number): Promise<number> {
+    let lo = floor; // the newest id is >= lo
+    let hi = Infinity; // the newest id is <= hi
+    let step = BACKEND_PAGE_SIZE;
+    for (let i = 0; i < 200; i++) {
+      if (hi <= lo) return lo;
+      // In [lo, hi): with hi = lo + 1 the probe is lo itself, which tells
+      // whether hi exists (an empty answer means the newest is lo).
+      const probe = hi === Infinity ? lo + step : lo + Math.floor((hi - lo) / 2);
+      const { messages } = await this.api.inboundSince(probe);
+      let maxId = probe;
+      for (const raw of messages) {
+        const id = rawMessageId(raw);
+        if (id > maxId) maxId = id;
+      }
+      if (messages.length === 0 || maxId <= probe) {
+        hi = probe;
+      } else if (messages.length < BACKEND_PAGE_SIZE) {
+        return maxId;
+      } else {
+        lo = maxId;
+        if (hi === Infinity) step *= 2;
+      }
+    }
+    throw new Error("cold start: could not find the newest inbound id");
   }
 
   /**

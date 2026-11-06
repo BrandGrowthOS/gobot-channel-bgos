@@ -71,6 +71,10 @@ import {
   type PluginConfig,
 } from "./types.js";
 
+/** An ISO 8601 instant with a date, a time and a zone, as `toISOString` writes. */
+const ISO_INSTANT =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/;
+
 export interface HostRestartSignalTarget {
   pid: number;
   kill(pid: number, signal: NodeJS.Signals): boolean;
@@ -207,6 +211,9 @@ export class BGOSAdapter {
     this.ws = new BgosWs(this.cfg, this.api);
     this.ws.setKnownAssistants(() => [...this.assistantToRoute.keys()]);
     this.ws.setIdentityReady(() => this.identityReady);
+    // The cold start replays what was sent after this computer was paired
+    // instead of seeding past it.
+    this.ws.setPairedAt(() => this.readPairedAt());
     this.outbound = new BgosOutbound(this.api);
     this.approvals = new ApprovalHandler(this.outbound);
     this.commandsSync = new CommandsSync(this.api);
@@ -920,13 +927,29 @@ export class BGOSAdapter {
     return join(root, "secrets");
   }
 
-  private readSecretsFile(): { baseUrl?: string; pairingToken?: string } | null {
+  /** `pairedAt` from the secrets file (written by the pair CLI), epoch ms, or
+   *  null when the file, the field or its value is missing or unreadable. Only
+   *  the ISO 8601 instant the pair CLI writes is accepted: `Date.parse` alone
+   *  would read values such as "0" as a date. */
+  private readPairedAt(): number | null {
+    const raw = this.readSecretsFile()?.pairedAt;
+    if (typeof raw !== "string" || !ISO_INSTANT.test(raw)) return null;
+    const ms = Date.parse(raw);
+    return Number.isFinite(ms) ? ms : null;
+  }
+
+  private readSecretsFile(): {
+    baseUrl?: string;
+    pairingToken?: string;
+    pairedAt?: unknown;
+  } | null {
     try {
       const path = join(this.resolveSecretsDir(), "bgos.json");
       const raw = readFileSync(path, "utf8");
       const parsed = JSON.parse(raw) as {
         baseUrl?: string;
         pairingToken?: string;
+        pairedAt?: unknown;
       };
       return parsed;
     } catch {

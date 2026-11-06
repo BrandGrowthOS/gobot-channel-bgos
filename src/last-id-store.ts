@@ -19,12 +19,13 @@
  * File location: `$GOBOT_HOME/bgos_last_ids.json` (default
  * `~/.gobot/bgos_last_ids.json`).
  *
- * Format: `{"version":1,"head":<n>,"agents":{"<assistantId>":<n>},"migrating":<n>?}`.
+ * Format: `{"version":1,"head":<n>,"agents":{"<assistantId>":<n>},"migrating":<n>?,"seeded":true?}`.
  *   - `agents` holds each agent's own cursor.
  *   - `head` is the highest id any agent has consumed or been carried past. An
  *     agent exposed LATER starts there (its older rows are history it was not
  *     part of), exactly as the single cursor used to place it.
  *   - `migrating` exists only between the migration and the first poll.
+ *   - `seeded` is written once the cold start has run (see `isColdStart`).
  *
  * MIGRATION: before per-agent cursors the file was `$GOBOT_HOME/bgos_last_id`,
  * a single integer. When `bgos_last_ids.json` does not exist yet, every agent
@@ -52,6 +53,8 @@ interface CursorFile {
   agents: Record<string, number>;
   /** The migrated single cursor, until the first poll hands it to each agent. */
   migrating?: number;
+  /** The cold start has run on this install (even if it found no history). */
+  seeded?: true;
 }
 
 function stateRoot(): string {
@@ -127,6 +130,7 @@ function loadCursors(): CursorFile {
       head: (parsed as CursorFile).head,
       agents,
       ...(isCursor(migrating) ? { migrating } : {}),
+      ...((parsed as CursorFile).seeded === true ? { seeded: true as const } : {}),
     };
   }
   const legacy = readLegacyCursor();
@@ -170,10 +174,18 @@ export function agentCursorIds(): number[] {
   return Object.keys(loadCursors().agents).map(Number);
 }
 
-/** True before any message has ever been consumed or skipped on this install. */
+/**
+ * True before the cold start has run on this install and before any message
+ * has ever been consumed or skipped.
+ *
+ * The `seeded` marker is what makes the cold start a once-per-install event.
+ * Without it a first boot that found an EMPTY history wrote nothing, the head
+ * stayed 0, and the next boot (a computer waking from sleep) was a cold start
+ * again: it seeded past everything sent meanwhile and dispatched none of it.
+ */
 export function isColdStart(): boolean {
   const file = loadCursors();
-  return file.head === 0 && file.migrating === undefined;
+  return file.head === 0 && file.migrating === undefined && file.seeded !== true;
 }
 
 /**
@@ -276,6 +288,20 @@ export function seedAllCursors(
 }
 
 /**
+ * End the cold start: move the head and every given agent to `id` (as
+ * `seedAllCursors` does; `id` 0 moves nothing) and persist the `seeded` marker
+ * in the SAME write, so a restart is never a second cold start and never finds
+ * the marker without the cursors. Rows above `id` are then replayed by the
+ * normal poll.
+ */
+export function completeColdStart(
+  knownAssistantIds: readonly number[],
+  id: number,
+): void {
+  advance(knownAssistantIds, id, true, true);
+}
+
+/**
  * After a poll that returned rows up to `watermark` (every row at or below it
  * is in that response), the agents that had NO row in it have nothing pending
  * at or below it: move them to the watermark. Without this an idle agent's
@@ -294,16 +320,26 @@ function advance(
   assistantIds: readonly number[],
   id: number,
   seed: boolean,
+  markSeeded = false,
 ): void {
-  if (!Number.isFinite(id) || !Number.isInteger(id) || id <= 0) return;
+  const valid = Number.isFinite(id) && Number.isInteger(id) && id > 0;
+  if (!valid && !markSeeded) return;
   try {
     const file = loadCursors();
+    let changed = false;
+    if (markSeeded && file.seeded !== true) {
+      file.seeded = true;
+      changed = true;
+    }
+    if (!valid) {
+      if (changed) writeCursors(file);
+      return;
+    }
     // Clamp against the lowest pending-unknown id so a cursor never strands an
     // unconsumed message above the hole.
     let advanceTo = id;
     const lowest = lowestPendingUnknown();
     if (lowest !== null && advanceTo >= lowest) advanceTo = lowest - 1;
-    let changed = false;
     for (const aid of assistantIds) {
       const key = String(aid);
       if (advanceTo > effective(file, aid)) {
