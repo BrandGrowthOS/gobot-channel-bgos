@@ -63,9 +63,9 @@ function resolveStormLimit(): number {
 }
 
 /**
- * How many of the newest messages sent since this computer was paired a cold
- * start replays (the rest of the history is seeded past). Default 10, 0 replays
- * none (the old behaviour). Never above the storm limit, or the replay poll
+ * How many message ids below the newest one a cold start may replay (the rest
+ * of the history is seeded past). Default 10, 0 replays none (the old
+ * behaviour). Never above the storm limit, or the replay poll
  * would trip the storm guard and drop exactly the messages it was meant to keep.
  */
 function resolveColdStartReplayLimit(): number {
@@ -78,6 +78,14 @@ function resolveColdStartReplayLimit(): number {
   const storm = resolveStormLimit();
   return storm > 0 ? Math.min(n, storm) : n;
 }
+
+/**
+ * How far before the stored pairing time a row still counts as sent after the
+ * pairing: the pairing time comes from the paired computer's clock and the row
+ * times from the server's, so a pairing clock a few minutes fast must not drop
+ * the messages sent right after it.
+ */
+const COLD_START_PAIRING_SLACK_MS = 10 * 60_000;
 
 /** A row's creation instant in epoch ms, or NaN when absent or unreadable. */
 function rowCreatedAtMs(raw: unknown): number {
@@ -407,13 +415,23 @@ export class BgosWs {
 
   /**
    * Cold-start seed, once per install: page the entire history WITHOUT
-   * dispatching. Everything created before this computer was paired is seeded
-   * past; the newest rows created at or after `pairedAt` (at most
-   * `resolveColdStartReplayLimit()` message ids) are left above the cursor for
-   * the normal poll to replay. The cursors and the `seeded` marker land in ONE
-   * write at the end, so a crash while paging just pages again next boot, and a
-   * finished seed is never repeated (see `isColdStart`). Bounded iterations to
-   * guarantee termination even if the backend paginates oddly.
+   * dispatching, then pick ONE cursor. Every row above it is replayed by the
+   * normal poll, in id order, so what the seed selects and what is dispatched
+   * are the same set by construction.
+   *
+   * The cursor sits just below the FIRST row (in id order) created at or after
+   * the pairing, less `COLD_START_PAIRING_SLACK_MS` (a pairing clock a little
+   * fast must not lose what was sent right after it). The pairing time is
+   * clamped to the newest row's time, so a pairing clock far ahead of the
+   * server still replays the newest rows instead of none. Then the bound: the
+   * cursor never sits more than `resolveColdStartReplayLimit()` ids below the
+   * newest one. Without a readable pairing time, no row has a readable time, or
+   * a bound of 0, the cursor is the newest id (nothing replayed, the old seed).
+   *
+   * The cursors and the `seeded` marker land in ONE write at the end, so a
+   * crash while paging just pages again next boot, and a finished seed is
+   * never repeated (see `isColdStart`). Bounded iterations to guarantee
+   * termination even if the backend paginates oddly.
    *
    * Returns true when there is something to replay.
    */
@@ -421,8 +439,9 @@ export class BgosWs {
     const known = this.knownAssistantIds();
     const pairedAt = this.pairedAt();
     const bound = pairedAt === null ? 0 : resolveColdStartReplayLimit();
-    // Distinct ids of rows created at or after pairing, ascending, newest kept.
-    const replayIds: number[] = [];
+    // Every row's id and creation time (NaN when unreadable), in page order.
+    const rows: Array<{ id: number; createdMs: number }> = [];
+    let newestCreatedMs = Number.NEGATIVE_INFINITY;
     let cursor = 0;
     for (let i = 0; i < 100; i++) {
       const { messages } = await this.api.inboundSince(cursor);
@@ -433,22 +452,30 @@ export class BgosWs {
         if (!m) continue;
         count++;
         if (m.messageId > maxId) maxId = m.messageId;
-        if (bound > 0 && pairedAt !== null && rowCreatedAtMs(raw) >= pairedAt) {
-          if (replayIds.at(-1) !== m.messageId) replayIds.push(m.messageId);
-          if (replayIds.length > bound) replayIds.shift();
-        }
+        const createdMs = rowCreatedAtMs(raw);
+        rows.push({ id: m.messageId, createdMs });
+        if (createdMs > newestCreatedMs) newestCreatedMs = createdMs;
       }
       if (count === 0 || maxId <= cursor) break;
       cursor = maxId;
       // Small terminal page: almost certainly the end of history.
       if (count < 2) break;
     }
-    if (replayIds.length > 0) {
-      completeColdStart(known, Math.max(0, replayIds[0]! - 1));
-      return true;
+    const newestId = cursor;
+    let replayFrom = newestId;
+    if (bound > 0 && pairedAt !== null && Number.isFinite(newestCreatedMs)) {
+      const threshold =
+        Math.min(pairedAt, newestCreatedMs) - COLD_START_PAIRING_SLACK_MS;
+      let firstId = Infinity;
+      for (const r of rows) {
+        if (r.createdMs >= threshold && r.id < firstId) firstId = r.id;
+      }
+      if (firstId !== Infinity) {
+        replayFrom = Math.max(firstId - 1, newestId - bound);
+      }
     }
-    completeColdStart(known, cursor);
-    return false;
+    completeColdStart(known, Math.max(0, replayFrom));
+    return replayFrom < newestId;
   }
 
   /**
