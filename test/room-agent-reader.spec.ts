@@ -1,7 +1,7 @@
 /**
  * ANOTHER AGENT'S GROUP ROW (senderType room_agent), 0.17.3.
  *
- * HOAI #3703 (2026-10-31): in a group or a channel an agent's @tag of another
+ * BGOS (2026-10-31): in a group or a channel an agent's @tag of another
  * seated agent wakes it, and the row is handed to the tagged agent marked
  * `senderType: 'room_agent'` with the author's `senderAssistantId`. The
  * backend withholds such rows from a connector that does not read the marker

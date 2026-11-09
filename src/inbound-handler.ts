@@ -542,7 +542,9 @@ export function createInboundHandler(
     // result turns are capped per stretch of silence, not per session.
     // The synthetic boards result turn never passes through this handler
     // (it is a direct dispatch call), so it cannot reset its own guard.
-    deps.boards?.resetLoopGuard(event.chatId);
+    // Another agent's tag does not re-arm it either: two agents tagging
+    // each other would otherwise re-arm each other's guard with every tag.
+    if (!fromRoomAgent) deps.boards?.resetLoopGuard(event.chatId);
 
     // Translate BGOS attachments to local file paths. Failures are
     // surfaced as a single agent_error and the message is still

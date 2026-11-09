@@ -21,6 +21,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { BgosApi } from "../src/bgos-api.js";
+import { BoardsOrchestrator } from "../src/boards-orchestrator.js";
 import { BgosWs } from "../src/bgos-ws.js";
 import { BgosOutbound } from "../src/outbound.js";
 import {
@@ -40,6 +41,14 @@ const SERVER_FRAMED =
   "Ares, an agent seated here and not a person, wrote the message below.\n" +
   "@Echo can you check the build?";
 const UNFRAMED = "@Echo can you check the build?";
+
+/** Chained board result turns the loop guard has counted in the chat. */
+const GUARD_COUNT = 3;
+
+function loopGuard(boards: BoardsOrchestrator): Map<number, number> {
+  return (boards as unknown as { consecutiveResults: Map<number, number> })
+    .consecutiveResults;
+}
 
 const FRAMING_SENTENCE =
   "Ares, an agent seated here and not a person, wrote the message below.";
@@ -71,10 +80,10 @@ function serverFramed(
   );
   if (!shape.noRoster) {
     lines.push(
-      "People here: Kc.",
+      "People here: Ada.",
       "Agents here: Ares, Echo (you).",
       "Said in this group since your last turn, oldest first:",
-      "- Kc: ship it\n  once the checks pass",
+      "- Ada: ship it\n  once the checks pass",
       FRAMING_SENTENCE,
     );
   } else if (shape.followUp) {
@@ -179,6 +188,7 @@ describe("another agent's message in a group or channel wakes the agent", () => 
     lane: Lane,
     chatKind: ChatKind,
     extra: Record<string, unknown>,
+    boards?: BoardsOrchestrator,
   ): Promise<DispatchArgs[]> {
     const ws = new BgosWs({} as never, makeApi(baseUrl));
     const raw = lane === "push" ? pushFrame(chatKind, extra) : pollRow(chatKind, extra);
@@ -193,9 +203,25 @@ describe("another agent's message in a group or channel wakes the agent", () => 
       getDispatch: () => async (args) => {
         seen.push(args);
       },
+      boards,
     });
     await handler(normalized!);
     return seen;
+  }
+
+  /**
+   * The boards orchestrator after GUARD_COUNT chained board result turns in
+   * this chat: its loop guard counts them per stretch of silence, and a real
+   * inbound message re-arms it.
+   */
+  function guardedBoards(): BoardsOrchestrator {
+    const boards = new BoardsOrchestrator({
+      api: makeApi(baseUrl),
+      getTurnContext: () => null,
+      log: () => {},
+    });
+    loopGuard(boards).set(CHAT_ID, GUARD_COUNT);
+    return boards;
   }
 
   /** Hand several rows to ONE handler, in order, the way one gateway gets them. */
@@ -340,6 +366,28 @@ describe("another agent's message in a group or channel wakes the agent", () => 
       expect(seen).toHaveLength(1);
       expect(seen[0]!.text).toContain(text);
       expect(seen[0]!.text).toMatch(/not a person/);
+    });
+
+    it(`${lane}, ${chatKind}: another agent's message does not re-arm the boards loop guard`, async () => {
+      // The guard stops chained board result turns until someone writes.
+      // Another agent's tag is not that: two agents tagging each other would
+      // re-arm each other's guard with every tag.
+      const boards = guardedBoards();
+      const seen = await deliver(
+        lane,
+        chatKind,
+        { text: SERVER_FRAMED, ...roomAgent(OTHER_ASSISTANT_ID) },
+        boards,
+      );
+      expect(seen).toHaveLength(1);
+      expect(loopGuard(boards).get(CHAT_ID)).toBe(GUARD_COUNT);
+    });
+
+    it(`${lane}, ${chatKind}: a person's message re-arms the boards loop guard`, async () => {
+      const boards = guardedBoards();
+      const seen = await deliver(lane, chatKind, { text: "@Echo hi" }, boards);
+      expect(seen).toHaveLength(1);
+      expect(loopGuard(boards).has(CHAT_ID)).toBe(false);
     });
 
     it(`${lane}, ${chatKind}: a person's message wakes the agent unmarked`, async () => {

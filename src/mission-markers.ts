@@ -57,7 +57,7 @@ export interface AbandonMissionOp {
 /**
  * Mark one mini goal as waiting on somebody else, or clear the mark (0.17.3).
  * A Keep working wake counts the turns that moved nothing and backs off, then
- * stops, on a mission whose goals wait without a mark (HOAI #3700); the mark
+ * stops, on a mission whose goals wait without a mark; the mark
  * is one of the moves, and it stops the wake asking about that goal.
  */
 export type WaitingMissionOp =

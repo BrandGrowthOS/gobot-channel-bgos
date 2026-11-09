@@ -1,14 +1,14 @@
 /**
  * THE WAITING MARK ON THE MISSION MARKER (0.17.3).
  *
- * HOAI #3700 (2026-10-31): a Keep working wake now counts the turns that
+ * BGOS (2026-10-31): a Keep working wake now counts the turns that
  * moved nothing; after 6 it backs off to every 3 hours and at the mission's
  * turn cap it stops Keep working. The wake tells the agent to mark a goal
  * that waits on somebody else as waiting, and a waiting mark is one of the
  * moves that resets the count. The marker had no way to send one, so a Gobot
  * agent could only watch its mission stall. Now:
  *
- *   {"op":"waiting","goalId":3,"on":"owner","who":"Kc","why":"approve the spend"}
+ *   {"op":"waiting","goalId":3,"on":"owner","who":"Ada","why":"approve the spend"}
  *   {"op":"waiting","goalId":3,"clear":true}
  *
  * PATCH .../missions/:missionId/goals/:goalId/waiting with
@@ -45,7 +45,7 @@ describe("parse the waiting op", () => {
       op: "waiting",
       goalId: 3,
       on: "owner",
-      who: "Kc",
+      who: "Ada",
       why: "approve the ad spend",
     };
     expect(parseMissionMarkers(`A ${block(op)} B`)).toEqual({
@@ -80,14 +80,14 @@ describe("parse the waiting op", () => {
   });
 
   it.each([
-    ["no goal", { op: "waiting", on: "owner", who: "Kc", why: "x" }],
-    ["an unknown on", { op: "waiting", goalId: 3, on: "board", who: "Kc", why: "x" }],
-    ["no why", { op: "waiting", goalId: 3, on: "owner", who: "Kc" }],
+    ["no goal", { op: "waiting", on: "owner", who: "Ada", why: "x" }],
+    ["an unknown on", { op: "waiting", goalId: 3, on: "board", who: "Ada", why: "x" }],
+    ["no why", { op: "waiting", goalId: 3, on: "owner", who: "Ada" }],
     ["no who", { op: "waiting", goalId: 3, on: "owner", why: "x" }],
     // Refused like the server (parseMissionGoalWaiting), never shortened
     // into a mark the agent did not write (review of 3b1e7a2).
     ["a who over 80", { op: "waiting", goalId: 3, on: "owner", who: "w".repeat(81), why: "x" }],
-    ["a why over 200", { op: "waiting", goalId: 3, on: "owner", who: "Kc", why: "y".repeat(201) }],
+    ["a why over 200", { op: "waiting", goalId: 3, on: "owner", who: "Ada", why: "y".repeat(201) }],
     ["a control character in who", { op: "waiting", goalId: 3, on: "owner", who: "K\u0007c", why: "x" }],
   ])("drops a mark with %s, still stripping it", (_name, op) => {
     expect(parseMissionMarkers(`x${block(op)}y`)).toEqual({
@@ -117,14 +117,14 @@ describe("dispatch the waiting op", () => {
     await dispatchMissionOps(
       makeApi(baseUrl),
       7,
-      [{ op: "waiting", goalId: 3, on: "owner", who: "Kc", why: "approve it" }],
+      [{ op: "waiting", goalId: 3, on: "owner", who: "Ada", why: "approve it" }],
       state,
     );
     expect(server.requests).toHaveLength(1);
     expect(server.requests[0]).toMatchObject({
       method: "PATCH",
       url,
-      body: { waiting: { on: "owner", who: "Kc", why: "approve it" } },
+      body: { waiting: { on: "owner", who: "Ada", why: "approve it" } },
     });
     expect(state.missionId).toBe(91);
   });
