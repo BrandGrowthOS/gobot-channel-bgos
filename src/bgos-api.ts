@@ -576,6 +576,24 @@ export class BgosApi {
     return r.data;
   }
 
+  /**
+   * Mark one mini goal waiting on somebody else, or clear it with null
+   * (0.17.3; HOAI missions that stay true). The server judges the shape:
+   * { on: "owner" | "agent", who (up to 80), why (up to 200) }.
+   */
+  async setGoalWaiting(
+    assistantId: number,
+    missionId: number,
+    goalId: number,
+    waiting: { on: "owner" | "agent"; who: string; why: string } | null,
+  ): Promise<MissionMutationResponse> {
+    const r = await this.http.patch(
+      `integrations/assistants/${assistantId}/missions/${missionId}/goals/${goalId}/waiting`,
+      { waiting },
+    );
+    return r.data;
+  }
+
   /** Record countable progress and an optional worked feed entry. */
   async updateMissionProgress(
     assistantId: number,

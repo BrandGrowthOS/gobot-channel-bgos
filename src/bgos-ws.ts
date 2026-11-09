@@ -441,6 +441,19 @@ export class BgosWs {
     const peerConversationId =
       toInt(r.peerConversationId ?? r.peer_conversation_id) || undefined;
     const turnStateRaw = r.turnState ?? r.turn_state;
+    // Another agent's group row (0.17.3): the live push sends camelCase, the
+    // poll row mixes snake_case keys with a camelCase senderType. Absent on a
+    // person's row, so it stays clean.
+    const senderTypeRaw = r.senderType ?? r.sender_type;
+    const senderAssistantId =
+      toInt(r.senderAssistantId ?? r.sender_assistant_id) || undefined;
+    const groupContext = r.groupContext as Record<string, unknown> | undefined;
+    const chatKindRaw =
+      r.chatKind ??
+      r.chat_kind ??
+      (groupContext && typeof groupContext === "object"
+        ? groupContext.chatKind
+        : undefined);
     return {
       assistantId,
       chatId,
@@ -457,6 +470,13 @@ export class BgosWs {
       ...(peerConversationId !== undefined ? { peerConversationId } : {}),
       ...(typeof turnStateRaw === "string" && turnStateRaw
         ? { turnState: turnStateRaw }
+        : {}),
+      ...(typeof senderTypeRaw === "string" && senderTypeRaw
+        ? { senderType: senderTypeRaw }
+        : {}),
+      ...(senderAssistantId !== undefined ? { senderAssistantId } : {}),
+      ...(typeof chatKindRaw === "string" && chatKindRaw
+        ? { chatKind: chatKindRaw }
         : {}),
     };
   }

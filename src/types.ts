@@ -67,6 +67,24 @@ export interface InboundMessagePayload {
   /** Turn state on a peer side-thread: `expecting_reply` | `more_coming` |
    *  `final`. Present alongside `peerConversationId`. */
   turnState?: string;
+  /**
+   * Who wrote the row, when it was not a person. `'room_agent'`: ANOTHER
+   * AGENT seated in the same group or channel wrote it (its @tag woke this
+   * agent, or it falls in a follow-up window). `userId` then names this
+   * agent's OWNER only because the envelope needs a user; the owner did not
+   * write it. The backend serves such rows only to a connector its table
+   * lists as reading this field; Gobot reads it from 0.17.3.
+   */
+  senderType?: string;
+  /** The author agent of a `room_agent` row. */
+  senderAssistantId?: number;
+  /**
+   * Which kind of chat the row came out of (`room` = a group, `channel`,
+   * ...): the push sends it as `groupContext.chatKind`, the poll as
+   * `chat_kind`. An agent turn in a room or a channel must go through
+   * /send-message: POST /messages refuses it.
+   */
+  chatKind?: string;
 }
 
 export interface CommandsUpdatedPayload {

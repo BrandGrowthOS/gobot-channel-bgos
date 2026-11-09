@@ -98,6 +98,13 @@ export function createAdapter(
         systemPrompt: args.systemPrompt,
         messageType: args.messageType,
         command: args.command,
+        // Another agent's group row (0.17.3): the fork sees who wrote it.
+        ...(args.senderType !== undefined
+          ? { senderType: args.senderType }
+          : {}),
+        ...(args.senderAssistantId !== undefined
+          ? { senderAssistantId: args.senderAssistantId }
+          : {}),
       },
     });
   };

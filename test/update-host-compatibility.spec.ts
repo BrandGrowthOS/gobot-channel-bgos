@@ -8,6 +8,7 @@ describe("manual update host compatibility", () => {
   it.each([
     ["^0.17.0", "0.17.1", true],
     ["^0.17.0", "0.17.2", true],
+    ["^0.17.0", "0.17.3", true],
     ["^0.17.0", "0.18.0", false],
     ["0.17.0", "0.17.1", false],
     ["*", "0.17.1", false],
