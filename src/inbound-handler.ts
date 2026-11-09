@@ -286,7 +286,7 @@ export function buildReplyHandle(
   // A reply handle built outside the inbound dispatch (after a tap, a boards
   // result turn) names no route: in a group or a channel it still goes
   // through /send-message, as the outbound learned from the chat's rows.
-  const replyVia = target.replyVia ?? deps.outbound.replyViaFor(chatId);
+  const replyVia = target.replyVia ?? deps.outbound.replyViaFor?.(chatId);
   return {
     origin: "bgos",
     callOwner: (reason, options) =>
@@ -497,7 +497,7 @@ export function createInboundHandler(
     // Remember the kind of chat, so every reply into it routes right, also
     // one made outside this dispatch. Another agent's row only comes out of a
     // group or a channel.
-    deps.outbound.noteChatKind(
+    deps.outbound.noteChatKind?.(
       event.chatId,
       event.chatKind ?? (fromRoomAgent ? "room" : undefined),
     );
