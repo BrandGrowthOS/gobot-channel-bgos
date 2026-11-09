@@ -38,9 +38,9 @@ const CHAT_ID = 300;
 
 const SERVER_FRAMED =
   "You are in the group Launch.\n" +
-  "Ares, an agent seated here and not a person, wrote the message below.\n" +
-  "@Echo can you check the build?";
-const UNFRAMED = "@Echo can you check the build?";
+  "Testbot, an agent seated here and not a person, wrote the message below.\n" +
+  "@Mockbot can you check the build?";
+const UNFRAMED = "@Mockbot can you check the build?";
 
 /** Chained board result turns the loop guard has counted in the chat. */
 const GUARD_COUNT = 3;
@@ -51,7 +51,7 @@ function loopGuard(boards: BoardsOrchestrator): Map<number, number> {
 }
 
 const FRAMING_SENTENCE =
-  "Ares, an agent seated here and not a person, wrote the message below.";
+  "Testbot, an agent seated here and not a person, wrote the message below.";
 
 /**
  * The server's own framing of another agent's row, as group-context.ts on
@@ -81,7 +81,7 @@ function serverFramed(
   if (!shape.noRoster) {
     lines.push(
       "People here: Ada.",
-      "Agents here: Ares, Echo (you).",
+      "Agents here: Testbot, Mockbot (you).",
       "Said in this group since your last turn, oldest first:",
       "- Ada: ship it\n  once the checks pass",
       FRAMING_SENTENCE,
@@ -252,7 +252,7 @@ describe("another agent's message in a group or channel wakes the agent", () => 
     // The poll serves an agent's row as soon as it exists; the push waits
     // until it has settled and then delivers it, under the same id. The
     // empty read must not make the settled push look like a duplicate.
-    const text = serverFramed("@Echo can you check the build?");
+    const text = serverFramed("@Mockbot can you check the build?");
     const seen = await deliverAll([
       ["poll", { text: serverFramed(""), ...roomAgent(OTHER_ASSISTANT_ID) }],
       ["push", { text, ...roomAgent(OTHER_ASSISTANT_ID) }],
@@ -342,8 +342,8 @@ describe("another agent's message in a group or channel wakes the agent", () => 
       [" as a follow-up", { followUp: true }],
     ] as const) {
       for (const [label, body] of [
-        ["", "@Echo can you check the build?\n\nThe log is attached."],
-        [" that quotes the framing", `@Echo the server writes:\n\n${FRAMING_SENTENCE}`],
+        ["", "@Mockbot can you check the build?\n\nThe log is attached."],
+        [" that quotes the framing", `@Mockbot the server writes:\n\n${FRAMING_SENTENCE}`],
       ] as const) {
         it(`${lane}, ${chatKind}: another agent's message${label} in the server's framing${shapeLabel} wakes the agent with the text unchanged`, async () => {
           const text = serverFramed(body, shape);
@@ -358,7 +358,7 @@ describe("another agent's message in a group or channel wakes the agent", () => 
     }
 
     it(`${lane}, ${chatKind}: another agent's message in the server's framing with no roster wakes the agent`, async () => {
-      const text = serverFramed("@Echo can you check the build?", { noRoster: true });
+      const text = serverFramed("@Mockbot can you check the build?", { noRoster: true });
       const seen = await deliver(lane, chatKind, {
         text,
         ...roomAgent(OTHER_ASSISTANT_ID),
@@ -385,16 +385,16 @@ describe("another agent's message in a group or channel wakes the agent", () => 
 
     it(`${lane}, ${chatKind}: a person's message re-arms the boards loop guard`, async () => {
       const boards = guardedBoards();
-      const seen = await deliver(lane, chatKind, { text: "@Echo hi" }, boards);
+      const seen = await deliver(lane, chatKind, { text: "@Mockbot hi" }, boards);
       expect(seen).toHaveLength(1);
       expect(loopGuard(boards).has(CHAT_ID)).toBe(false);
     });
 
     it(`${lane}, ${chatKind}: a person's message wakes the agent unmarked`, async () => {
-      const seen = await deliver(lane, chatKind, { text: "@Echo hi" });
+      const seen = await deliver(lane, chatKind, { text: "@Mockbot hi" });
       expect(seen).toHaveLength(1);
       expect(seen[0]!.senderType).toBeUndefined();
-      expect(seen[0]!.text).toBe("@Echo hi");
+      expect(seen[0]!.text).toBe("@Mockbot hi");
     });
   }
 });

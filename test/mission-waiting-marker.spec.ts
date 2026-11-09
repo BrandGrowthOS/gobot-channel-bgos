@@ -88,7 +88,7 @@ describe("parse the waiting op", () => {
     // into a mark the agent did not write (review of 3b1e7a2).
     ["a who over 80", { op: "waiting", goalId: 3, on: "owner", who: "w".repeat(81), why: "x" }],
     ["a why over 200", { op: "waiting", goalId: 3, on: "owner", who: "Ada", why: "y".repeat(201) }],
-    ["a control character in who", { op: "waiting", goalId: 3, on: "owner", who: "K\u0007c", why: "x" }],
+    ["a control character in who", { op: "waiting", goalId: 3, on: "owner", who: "Us\u0007er", why: "x" }],
   ])("drops a mark with %s, still stripping it", (_name, op) => {
     expect(parseMissionMarkers(`x${block(op)}y`)).toEqual({
       cleanText: "xy",

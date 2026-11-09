@@ -55,7 +55,7 @@ function agentRow(
     userId: "owner_1",
     chatId: 300,
     messageId: 901,
-    text: "@Echo can you check the build?",
+    text: "@Mockbot can you check the build?",
     files: [],
     messageType: "standard",
     senderType: "room_agent",
@@ -66,8 +66,8 @@ function agentRow(
 
 const SERVER_FRAMED =
   "You are in the group Launch.\n" +
-  "Ares, an agent seated here and not a person, wrote the message below.\n" +
-  "@Echo can you check the build?";
+  "Testbot, an agent seated here and not a person, wrote the message below.\n" +
+  "@Mockbot can you check the build?";
 
 describe("room_agent rows (another agent's group message)", () => {
   let server: MockBgosServer;
@@ -155,7 +155,7 @@ describe("room_agent rows (another agent's group message)", () => {
     const seen: DispatchArgs[] = [];
     await handlerCapturing(seen)(agentRow());
     expect(seen[0]!.text.startsWith(ROOM_AGENT_PROVENANCE_LINE(42))).toBe(true);
-    expect(seen[0]!.text).toContain("@Echo can you check the build?");
+    expect(seen[0]!.text).toContain("@Mockbot can you check the build?");
     expect(ROOM_AGENT_PROVENANCE_LINE(42)).toMatch(/not a person/);
     expect(ROOM_AGENT_PROVENANCE_LINE(42)).toMatch(/not your owner's instruction/);
   });
@@ -249,7 +249,7 @@ describe("room_agent rows (another agent's group message)", () => {
         agentRow({
           senderType: undefined,
           senderAssistantId: undefined,
-          text: "@Echo hi",
+          text: "@Mockbot hi",
           chatKind,
         }),
       );

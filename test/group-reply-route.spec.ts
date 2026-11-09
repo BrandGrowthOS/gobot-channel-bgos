@@ -40,7 +40,7 @@ function personRow(
     userId: "owner_1",
     chatId,
     messageId,
-    text: "@Echo hi",
+    text: "@Mockbot hi",
     files: [],
     messageType: "standard",
     ...(chatKind !== undefined ? { chatKind } : {}),
