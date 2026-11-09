@@ -485,6 +485,15 @@ export function createInboundHandler(
     if (fromRoomAgent && !isOtherAgent(event.senderAssistantId, event.assistantId)) {
       return;
     }
+    // No body yet (the poll can hand over an agent's row before its first
+    // edit): nothing to read, and the framing line alone must not wake it.
+    if (
+      fromRoomAgent &&
+      !(event.text ?? "").trim() &&
+      (event.files?.length ?? 0) === 0
+    ) {
+      return;
+    }
     // Remember the kind of chat, so every reply into it routes right, also
     // one made outside this dispatch. Another agent's row only comes out of a
     // group or a channel.

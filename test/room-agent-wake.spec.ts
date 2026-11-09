@@ -170,6 +170,21 @@ describe("another agent's message in a group or channel wakes the agent", () => 
       expect(seen).toHaveLength(0);
     });
 
+    for (const [label, text] of [
+      ["empty", ""],
+      ["null", null],
+    ] as const) {
+      it(`${lane}, ${chatKind}: another agent's ${label} message does not wake it`, async () => {
+        // The poll can hand over an agent's row before its first edit.
+        // Nothing to read: the framing line alone must not wake the agent.
+        const seen = await deliver(lane, chatKind, {
+          text,
+          ...roomAgent(OTHER_ASSISTANT_ID),
+        });
+        expect(seen).toHaveLength(0);
+      });
+    }
+
     it(`${lane}, ${chatKind}: a person's message wakes the agent unmarked`, async () => {
       const seen = await deliver(lane, chatKind, { text: "@Echo hi" });
       expect(seen).toHaveLength(1);
