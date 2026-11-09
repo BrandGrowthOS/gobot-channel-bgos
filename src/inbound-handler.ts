@@ -201,6 +201,20 @@ export function ROOM_AGENT_PROVENANCE_LINE(senderAssistantId?: number): string {
   );
 }
 
+/**
+ * Is a room_agent row's author a readable agent id other than this agent's?
+ * False for this agent's own row and for an author that is missing or not a
+ * positive whole number.
+ */
+function isOtherAgent(author: number | undefined, self: number): boolean {
+  return (
+    typeof author === "number" &&
+    Number.isSafeInteger(author) &&
+    author > 0 &&
+    author !== self
+  );
+}
+
 /** The agent-visible text of another agent's row. */
 export function frameRoomAgentText(
   text: string,
@@ -459,11 +473,14 @@ export function createInboundHandler(
     // should not cause an infinite replay on restart (matches Hermes).
     saveAgentCursor(event.assistantId, event.messageId);
 
-    // ANOTHER AGENT'S GROUP ROW (0.17.3). Consumed above either way; an
-    // agent's own row is never handed back to it (the server never sends one,
-    // this is the belt).
+    // ANOTHER AGENT'S GROUP ROW (0.17.3). Consumed above either way. The
+    // agent's own row is never handed back to it, and neither is one whose
+    // author cannot be read: it cannot be told apart from the agent's own
+    // (the Claude Code plugin's rule), and waking on it could start a loop.
     const fromRoomAgent = event.senderType === "room_agent";
-    if (fromRoomAgent && event.senderAssistantId === event.assistantId) return;
+    if (fromRoomAgent && !isOtherAgent(event.senderAssistantId, event.assistantId)) {
+      return;
+    }
     deps.onInbound?.();
 
     // A real inbound message re-arms the boards loop guard: chained board
