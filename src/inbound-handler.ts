@@ -282,7 +282,11 @@ export function buildReplyHandle(
     replyToId?: number;
   },
 ): ReplyHandle {
-  const { assistantId, chatId, replyVia, replyToId } = target;
+  const { assistantId, chatId, replyToId } = target;
+  // A reply handle built outside the inbound dispatch (after a tap, a boards
+  // result turn) names no route: in a group or a channel it still goes
+  // through /send-message, as the outbound learned from the chat's rows.
+  const replyVia = target.replyVia ?? deps.outbound.replyViaFor(chatId);
   return {
     origin: "bgos",
     callOwner: (reason, options) =>
@@ -481,6 +485,13 @@ export function createInboundHandler(
     if (fromRoomAgent && !isOtherAgent(event.senderAssistantId, event.assistantId)) {
       return;
     }
+    // Remember the kind of chat, so every reply into it routes right, also
+    // one made outside this dispatch. Another agent's row only comes out of a
+    // group or a channel.
+    deps.outbound.noteChatKind(
+      event.chatId,
+      event.chatKind ?? (fromRoomAgent ? "room" : undefined),
+    );
     deps.onInbound?.();
 
     // A real inbound message re-arms the boards loop guard: chained board

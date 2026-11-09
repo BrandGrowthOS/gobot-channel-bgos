@@ -99,6 +99,28 @@ export class BgosOutbound {
     this.api = api;
   }
 
+  /**
+   * Chats known to be a group (room) or a channel. POST /messages refuses an
+   * agent turn there and names /send-message, so a reply into one of these
+   * that names no route goes through /send-message. Learned from each inbound
+   * row (the inbound handler calls noteChatKind), so a reply handle built
+   * outside the dispatch (after a tap, a boards result turn, an agent_error
+   * card) routes like the dispatch's own.
+   */
+  private readonly groupChats = new Set<number>();
+
+  /** Record the kind of chat an inbound row came out of (when it says). */
+  noteChatKind(chatId: number, chatKind: string | undefined): void {
+    if (typeof chatKind !== "string" || !chatKind) return;
+    if (chatKind === "room" || chatKind === "channel") this.groupChats.add(chatId);
+    else this.groupChats.delete(chatId);
+  }
+
+  /** The route a reply into this chat must take when its caller names none. */
+  replyViaFor(chatId: number): "send-message" | undefined {
+    return this.groupChats.has(chatId) ? "send-message" : undefined;
+  }
+
   /** Wire the WS typing emitter (contract C4). Without it, sendTyping no-ops. */
   setTypingEmitter(
     fn: (p: { chatId: number; assistantId: number }) => void,
@@ -156,7 +178,8 @@ export class BgosOutbound {
    *
    * Default `messages` (POST /api/v1/messages) is the historical path used for
    * every normal reply, proactive send, and `/board` fan-out. `send-message`
-   * (POST /api/v1/send-message) is used ONLY for a2a peer replies.
+   * (POST /api/v1/send-message) is used for a2a peer replies and for every
+   * reply into a chat known to be a group or a channel (replyViaFor).
    *
    * Retry (backoff 1s/5s/25s) applies ONLY to the provably-undelivered
    * network-error class + 429 (see classifyOutboundError), because the backend
@@ -169,6 +192,7 @@ export class BgosOutbound {
     replyVia?: "messages" | "send-message",
     mission?: { assistantId: number; ops: MissionOp[] },
   ): Promise<{ id: number }> {
+    replyVia = replyVia ?? this.replyViaFor(payload.chatId);
     let attempt = 0;
     for (;;) {
       try {
