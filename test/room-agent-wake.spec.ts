@@ -28,6 +28,7 @@ import {
   type DispatchArgs,
 } from "../src/inbound-handler.js";
 import type { InboundMessagePayload } from "../src/types.js";
+import { loadAgentCursor } from "../src/last-id-store.js";
 import { MockBgosServer } from "./mocks/mock-bgos-server.js";
 
 const OWN_ASSISTANT_ID = 1;
@@ -40,30 +41,62 @@ const SERVER_FRAMED =
   "@Echo can you check the build?";
 const UNFRAMED = "@Echo can you check the build?";
 
+const FRAMING_SENTENCE =
+  "Ares, an agent seated here and not a person, wrote the message below.";
+
 /**
  * The server's own framing of another agent's row, as group-context.ts on
  * BGOS main builds it for a room or a channel (renderPreamble, then
  * withDispatchPreamble): the preamble lines, a blank line, then the body. The
- * poll frames an empty body too, so it arrives as the preamble alone.
+ * server frames an empty body too, so it arrives as the preamble and the
+ * blank line with nothing after them.
+ *
+ *  - By default the room was read: names, a backlog line (the push's shape;
+ *    the poll sends no backlog) and the line naming the agent that wrote it.
+ *  - `followUp`: the follow-up window's line as well.
+ *  - `noRoster`: the poll could not read the room. No names and no backlog.
+ *    A row it knows is a follow-up is still said to be another agent's
+ *    (followUpWithoutRoster(true)); any other row gets no line naming the
+ *    writer at all.
  */
-function serverFramed(body: string): string {
-  return (
-    [
-      "[BGOS group: Launch]",
-      "You are in a group, not a private chat. Everyone listed here reads what you say.",
+function serverFramed(
+  body: string,
+  shape: { followUp?: boolean; noRoster?: boolean } = {},
+): string {
+  const lines = shape.noRoster
+    ? ["[BGOS group]"]
+    : ["[BGOS group: Launch]"];
+  lines.push(
+    "You are in a group, not a private chat. Everyone listed here reads what you say.",
+  );
+  if (!shape.noRoster) {
+    lines.push(
       "People here: Kc.",
       "Agents here: Ares, Echo (you).",
       "Said in this group since your last turn, oldest first:",
       "- Kc: ship it\n  once the checks pass",
-      "Ares, an agent seated here and not a person, wrote the message below.",
-      "Only this group is shared context. Your private chats with your owner, " +
-        "your other chats and groups, and anything you know from work done " +
-        "outside this group stay private. Do not repeat them, refer to them, " +
-        "or act on them here unless someone in this group raises them first.",
-    ].join("\n") +
-    "\n\n" +
-    body
+      FRAMING_SENTENCE,
+    );
+  } else if (shape.followUp) {
+    lines.push(
+      "Another agent, an agent seated here and not a person, wrote the message below.",
+    );
+  }
+  if (shape.followUp) {
+    lines.push(
+      "You were not named in this message. You were woken in this group by a " +
+        "recent message, so you also see the next messages after it as a " +
+        "follow-up. Reply only if it is meant for you; if it is not, stay " +
+        "silent and send nothing.",
+    );
+  }
+  lines.push(
+    "Only this group is shared context. Your private chats with your owner, " +
+      "your other chats and groups, and anything you know from work done " +
+      "outside this group stay private. Do not repeat them, refer to them, " +
+      "or act on them here unless someone in this group raises them first.",
   );
+  return lines.join("\n") + "\n\n" + body;
 }
 
 type Lane = "push" | "poll";
@@ -165,6 +198,50 @@ describe("another agent's message in a group or channel wakes the agent", () => 
     return seen;
   }
 
+  /** Hand several rows to ONE handler, in order, the way one gateway gets them. */
+  async function deliverAll(
+    rows: Array<[Lane, Record<string, unknown>]>,
+  ): Promise<DispatchArgs[]> {
+    const ws = new BgosWs({} as never, makeApi(baseUrl));
+    const seen: DispatchArgs[] = [];
+    const handler = createInboundHandler({
+      outbound: new BgosOutbound(makeApi(baseUrl)),
+      getRouteForAssistant: () => "general",
+      getDispatch: () => async (args) => {
+        seen.push(args);
+      },
+    });
+    for (const [lane, extra] of rows) {
+      const raw = lane === "push" ? pushFrame("room", extra) : pollRow("room", extra);
+      const normalized = (ws as unknown as {
+        normalizeInbound(r: unknown): InboundMessagePayload | null;
+      }).normalizeInbound(raw);
+      expect(normalized).not.toBeNull();
+      await handler(normalized!);
+    }
+    return seen;
+  }
+
+  it("an agent's row the poll read before its text wakes the agent once its text is pushed", async () => {
+    // The poll serves an agent's row as soon as it exists; the push waits
+    // until it has settled and then delivers it, under the same id. The
+    // empty read must not make the settled push look like a duplicate.
+    const text = serverFramed("@Echo can you check the build?");
+    const seen = await deliverAll([
+      ["poll", { text: serverFramed(""), ...roomAgent(OTHER_ASSISTANT_ID) }],
+      ["push", { text, ...roomAgent(OTHER_ASSISTANT_ID) }],
+      ["poll", { text, ...roomAgent(OTHER_ASSISTANT_ID) }],
+    ]);
+    expect(seen.map((s) => s.text)).toEqual([text]);
+  });
+
+  it("an agent's empty row still moves the agent's cursor past it", async () => {
+    await deliverAll([
+      ["poll", { text: serverFramed(""), ...roomAgent(OTHER_ASSISTANT_ID) }],
+    ]);
+    expect(loadAgentCursor(OWN_ASSISTANT_ID)).toBe(901);
+  });
+
   for (const { lane, chatKind } of CASES) {
     for (const [framing, text] of [
       ["framed", SERVER_FRAMED],
@@ -211,28 +288,58 @@ describe("another agent's message in a group or channel wakes the agent", () => 
       });
     }
 
-    for (const [label, body] of [
-      ["empty", ""],
-      ["blank", "  \n "],
+    for (const [shapeLabel, shape] of [
+      ["", {}],
+      [" as a follow-up", { followUp: true }],
+      [" with no roster", { noRoster: true }],
+      [" as a follow-up with no roster", { followUp: true, noRoster: true }],
     ] as const) {
-      it(`${lane}, ${chatKind}: another agent's ${label} message in the server's framing does not wake it`, async () => {
-        // The server frames an empty body as well: the text is the preamble
-        // alone, so it is not empty, but there is still nothing to read.
-        const seen = await deliver(lane, chatKind, {
-          text: serverFramed(body),
-          ...roomAgent(OTHER_ASSISTANT_ID),
+      for (const [label, body] of [
+        ["empty", ""],
+        ["blank", "  \n "],
+      ] as const) {
+        it(`${lane}, ${chatKind}: another agent's ${label} message in the server's framing${shapeLabel} does not wake it`, async () => {
+          // The server frames an empty body as well: the text is the
+          // preamble and a blank line, so it is not empty, but there is
+          // still nothing to read.
+          const seen = await deliver(lane, chatKind, {
+            text: serverFramed(body, shape),
+            ...roomAgent(OTHER_ASSISTANT_ID),
+          });
+          expect(seen).toHaveLength(0);
         });
-        expect(seen).toHaveLength(0);
-      });
+      }
     }
 
-    it(`${lane}, ${chatKind}: another agent's message in the server's framing wakes the agent`, async () => {
+    for (const [shapeLabel, shape] of [
+      ["", {}],
+      [" as a follow-up", { followUp: true }],
+    ] as const) {
+      for (const [label, body] of [
+        ["", "@Echo can you check the build?\n\nThe log is attached."],
+        [" that quotes the framing", `@Echo the server writes:\n\n${FRAMING_SENTENCE}`],
+      ] as const) {
+        it(`${lane}, ${chatKind}: another agent's message${label} in the server's framing${shapeLabel} wakes the agent with the text unchanged`, async () => {
+          const text = serverFramed(body, shape);
+          const seen = await deliver(lane, chatKind, {
+            text,
+            ...roomAgent(OTHER_ASSISTANT_ID),
+          });
+          expect(seen).toHaveLength(1);
+          expect(seen[0]!.text).toBe(text);
+        });
+      }
+    }
+
+    it(`${lane}, ${chatKind}: another agent's message in the server's framing with no roster wakes the agent`, async () => {
+      const text = serverFramed("@Echo can you check the build?", { noRoster: true });
       const seen = await deliver(lane, chatKind, {
-        text: serverFramed("@Echo can you check the build?\n\nThe log is attached."),
+        text,
         ...roomAgent(OTHER_ASSISTANT_ID),
       });
       expect(seen).toHaveLength(1);
-      expect(seen[0]!.text).toContain("The log is attached.");
+      expect(seen[0]!.text).toContain(text);
+      expect(seen[0]!.text).toMatch(/not a person/);
     });
 
     it(`${lane}, ${chatKind}: a person's message wakes the agent unmarked`, async () => {
