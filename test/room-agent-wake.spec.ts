@@ -40,6 +40,32 @@ const SERVER_FRAMED =
   "@Echo can you check the build?";
 const UNFRAMED = "@Echo can you check the build?";
 
+/**
+ * The server's own framing of another agent's row, as group-context.ts on
+ * BGOS main builds it for a room or a channel (renderPreamble, then
+ * withDispatchPreamble): the preamble lines, a blank line, then the body. The
+ * poll frames an empty body too, so it arrives as the preamble alone.
+ */
+function serverFramed(body: string): string {
+  return (
+    [
+      "[BGOS group: Launch]",
+      "You are in a group, not a private chat. Everyone listed here reads what you say.",
+      "People here: Kc.",
+      "Agents here: Ares, Echo (you).",
+      "Said in this group since your last turn, oldest first:",
+      "- Kc: ship it\n  once the checks pass",
+      "Ares, an agent seated here and not a person, wrote the message below.",
+      "Only this group is shared context. Your private chats with your owner, " +
+        "your other chats and groups, and anything you know from work done " +
+        "outside this group stay private. Do not repeat them, refer to them, " +
+        "or act on them here unless someone in this group raises them first.",
+    ].join("\n") +
+    "\n\n" +
+    body
+  );
+}
+
 type Lane = "push" | "poll";
 type ChatKind = "room" | "channel";
 const LANES: Lane[] = ["push", "poll"];
@@ -184,6 +210,30 @@ describe("another agent's message in a group or channel wakes the agent", () => 
         expect(seen).toHaveLength(0);
       });
     }
+
+    for (const [label, body] of [
+      ["empty", ""],
+      ["blank", "  \n "],
+    ] as const) {
+      it(`${lane}, ${chatKind}: another agent's ${label} message in the server's framing does not wake it`, async () => {
+        // The server frames an empty body as well: the text is the preamble
+        // alone, so it is not empty, but there is still nothing to read.
+        const seen = await deliver(lane, chatKind, {
+          text: serverFramed(body),
+          ...roomAgent(OTHER_ASSISTANT_ID),
+        });
+        expect(seen).toHaveLength(0);
+      });
+    }
+
+    it(`${lane}, ${chatKind}: another agent's message in the server's framing wakes the agent`, async () => {
+      const seen = await deliver(lane, chatKind, {
+        text: serverFramed("@Echo can you check the build?\n\nThe log is attached."),
+        ...roomAgent(OTHER_ASSISTANT_ID),
+      });
+      expect(seen).toHaveLength(1);
+      expect(seen[0]!.text).toContain("The log is attached.");
+    });
 
     it(`${lane}, ${chatKind}: a person's message wakes the agent unmarked`, async () => {
       const seen = await deliver(lane, chatKind, { text: "@Echo hi" });

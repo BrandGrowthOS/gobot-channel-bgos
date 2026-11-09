@@ -215,6 +215,20 @@ function isOtherAgent(author: number | undefined, self: number): boolean {
   );
 }
 
+/**
+ * The body of another agent's row, without the server's framing. The server
+ * puts its preamble (the framing sentence among its lines), then a blank
+ * line, then the body (group-context.ts withDispatchPreamble), and it frames
+ * an empty body too. Unframed text is its own body.
+ */
+function roomAgentBody(text: string): string {
+  const at = text.indexOf(SERVER_AGENT_FRAMING);
+  if (at < 0) return text;
+  const rest = text.slice(at + SERVER_AGENT_FRAMING.length);
+  const gap = rest.indexOf("\n\n");
+  return gap >= 0 ? rest.slice(gap + 2) : rest;
+}
+
 /** The agent-visible text of another agent's row. */
 export function frameRoomAgentText(
   text: string,
@@ -487,9 +501,11 @@ export function createInboundHandler(
     }
     // No body yet (the poll can hand over an agent's row before its first
     // edit): nothing to read, and the framing line alone must not wake it.
+    // The body is read inside the server's framing, which wraps an empty
+    // body as well.
     if (
       fromRoomAgent &&
-      !(event.text ?? "").trim() &&
+      !roomAgentBody(event.text ?? "").trim() &&
       (event.files?.length ?? 0) === 0
     ) {
       return;
