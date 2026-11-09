@@ -54,6 +54,21 @@ import type {
 /** Backend rejects inline messages with >6 options. */
 const INLINE_OPTION_LIMIT = 6;
 
+/** The server's words when POST /messages refuses an agent turn in a group
+ *  or a channel (message.service.ts, 'not-on-this-route'). */
+const GROUP_ROUTE_REFUSAL = "Agent messages into a group must use /send-message";
+
+function isGroupRouteRefusal(err: unknown): boolean {
+  const response = (err as {
+    response?: { status?: number; data?: { message?: unknown } };
+  } | null)?.response;
+  return (
+    response?.status === 400 &&
+    typeof response.data?.message === "string" &&
+    response.data.message.includes(GROUP_ROUTE_REFUSAL)
+  );
+}
+
 export class BgosOutbound {
   /** Public read-only handle on the underlying REST client; consumers
    *  occasionally need it (e.g. inbound-handler routes uploadFile through
@@ -143,13 +158,22 @@ export class BgosOutbound {
     this.sleepFn = fn;
   }
 
-  private rawSend(
+  private async rawSend(
     payload: OutboundMessagePayload,
     replyVia?: "messages" | "send-message",
   ): Promise<{ id: number }> {
-    return replyVia === "send-message"
-      ? this.api.sendMessage(payload)
-      : this.api.postMessage(payload);
+    if (replyVia === "send-message") return this.api.sendMessage(payload);
+    try {
+      return await this.api.postMessage(payload);
+    } catch (err) {
+      // The chat is a group or a channel this process has not seen a row
+      // from yet (after a restart, a tap on a card asked before it, a
+      // proactive send). The server refuses before writing anything, so
+      // sending it once through /send-message cannot duplicate it.
+      if (!isGroupRouteRefusal(err)) throw err;
+      this.groupChats.add(payload.chatId);
+      return this.api.sendMessage(payload);
+    }
   }
 
   private queueMissionOps(assistantId: number, ops: MissionOp[]): void {

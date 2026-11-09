@@ -140,6 +140,36 @@ describe("every reply into a group or a channel goes through /send-message", () 
     expect(post?.body).toMatchObject({ messageType: "agent_error" });
   });
 
+  it("after a restart (no row seen yet) a reply refused by /messages for a group is sent once through /send-message and the chat is remembered", async () => {
+    // Nothing has arrived since the daemon started, so the outbound does not
+    // know the chat is a group: the server's refusal tells it.
+    server.stage("POST", "/api/v1/messages", 400, {
+      statusCode: 400,
+      message: "Agent messages into a group must use /send-message",
+    });
+    server.stage("POST", "/api/v1/send-message", 200, { message: { id: 41 } });
+    server.stage("POST", "/api/v1/send-message", 200, { message: { id: 42 } });
+    const handle = adapter.makeReplyHandle(ASSISTANT_ID, GROUP_CHAT);
+    await handle.sendText("Picked A.");
+    await handle.sendText("Done.");
+    expect(
+      server.requests.filter((r) => r.method === "POST").map((r) => r.url.split("?")[0]),
+    ).toEqual(["/api/v1/messages", "/api/v1/send-message", "/api/v1/send-message"]);
+  });
+
+  it("another refusal from /messages is not resent through /send-message", async () => {
+    server.stage("POST", "/api/v1/messages", 400, {
+      statusCode: 400,
+      message: "text must be shorter than or equal to 32000 characters",
+    });
+    await expect(
+      adapter.makeReplyHandle(ASSISTANT_ID, DM_CHAT).sendText("x"),
+    ).rejects.toBeTruthy();
+    expect(
+      server.requests.filter((r) => r.method === "POST").map((r) => r.url.split("?")[0]),
+    ).toEqual(["/api/v1/messages"]);
+  });
+
   it("a direct chat with the owner keeps POST /messages", async () => {
     await receive(personRow(DM_CHAT, 905));
     stageBothRoutes();
